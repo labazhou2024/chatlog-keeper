@@ -41,6 +41,41 @@ grouped by conversation and day — the way you remember it).
 - **WeChat** — export your local WeChat chat history
 - **WeChat images** — restore local `.dat` images back to `jpg` / `png`
 
+## Supported versions
+
+| Source | Supported | Page-key derivation | How the key is obtained |
+|---|---|---|---|
+| WeChat ≤ 4.0.x | ✅ | raw-key (`enc_key` used directly) | passive memory scan |
+| WeChat 4.1.10.31+ (2026-05) | ✅ | password mode — `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | one-time debugger (key no longer kept in plaintext memory) |
+| QQ NTQQ 9.9.x | ✅ | per-DB passphrase | passive scan |
+
+On **WeChat 4.1.10.31** (released 2026-05-27) the plaintext key was moved out of
+the process heap, so a passive memory scan — what most existing tools rely on —
+no longer finds it on those builds. chatlog-keeper falls back to a one-time
+debugger extraction for them (see [Account-ban risk](#account-ban-risk)).
+
+## How it compares
+
+A factual snapshot of similar open-source tools (**as of 2026-06**; star counts
+and maintenance status change over time — please check each repo yourself):
+
+| Tool | Stars | Last update | WeChat | QQ | Platform | Notes |
+|---|---|---|---|---|---|---|
+| **chatlog-keeper** (this) | — | 2026-06 | ≤4.0 **+ 4.1.10.31+** | ✅ NTQQ | Windows | passive scan + debugger fallback |
+| [WeChatMsg / 留痕](https://github.com/LC044/WeChatMsg) | 41k+ | 2025-12 | ≤4.0 | ❌ | Windows | feature-rich GUI; author states it is **no longer updated** |
+| [PyWxDump](https://github.com/xaoyaoo/PyWxDump) | 9k+ | 2025-10 | 3.x–4.0 | ❌ | Windows | repo description now reads "删库"; inactive |
+| [chatlog](https://github.com/sjzar/chatlog) | 9k+ | 2025-10 | ≤4.0 | ❌ | cross-platform | Go; HTTP/MCP API |
+| [ylytdeng/wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) | 4k+ | 2026-06 | 4.0 | ❌ | Win/macOS/Linux | active; memory-scan only |
+
+Where chatlog-keeper differs: it is the one here that handles **WeChat
+4.1.10.31+** (where the key left plaintext memory) and that also exports **QQ
+(NTQQ)**, not just WeChat.
+
+What it is **not**: it is **Windows-only**, a young project, and deliberately
+CLI-first (JSON/HTML, no GUI or built-in analytics). If you want a polished GUI
+or cross-platform support today, the tools above are more mature — this one's
+niche is *newest-WeChat compatibility + QQ, with a clear legal stance*.
+
 ## Install
 
 Requires **Python 3.9+**.

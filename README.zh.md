@@ -40,6 +40,37 @@
 - **微信**：导出 WeChat 本地聊天记录
 - **微信图片**：把本地 `.dat` 加密图片还原成 `jpg` / `png`
 
+## 支持的版本
+
+| 来源 | 支持 | page-key 派生 | 怎么拿 key |
+|---|---|---|---|
+| 微信 ≤ 4.0.x | ✅ | raw-key（`enc_key` 直接用） | 被动内存扫描 |
+| 微信 4.1.10.31+（2026-05） | ✅ | password 模式 —— `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | 调试器取一次（key 不再以明文留在内存） |
+| QQ NTQQ 9.9.x | ✅ | 每库口令 | 被动扫描 |
+
+**微信 4.1.10.31**（2026-05-27 发布）把明文 key 移出了进程堆，因此被动内存扫描
+——多数现有工具依赖的方式——在这些版本上**取不到 key**。chatlog-keeper 会对这些
+版本自动回退到“取一次”的调试器方式（见[封号风险](#封号风险)）。
+
+## 与同类工具对比
+
+一份客观的快照（**截至 2026-06**；star 数与维护状态会随时间变化，请以各仓库实际为准）：
+
+| 工具 | Star | 最近更新 | 微信 | QQ | 平台 | 备注 |
+|---|---|---|---|---|---|---|
+| **chatlog-keeper**（本项目） | — | 2026-06 | ≤4.0 **+ 4.1.10.31+** | ✅ NTQQ | Windows | 被动扫描 + 调试器兜底 |
+| [WeChatMsg / 留痕](https://github.com/LC044/WeChatMsg) | 41k+ | 2025-12 | ≤4.0 | ❌ | Windows | 功能丰富的 GUI；作者声明**不再更新** |
+| [PyWxDump](https://github.com/xaoyaoo/PyWxDump) | 9k+ | 2025-10 | 3.x–4.0 | ❌ | Windows | 仓库描述现为“删库”；已停更 |
+| [chatlog](https://github.com/sjzar/chatlog) | 9k+ | 2025-10 | ≤4.0 | ❌ | 跨平台 | Go；提供 HTTP/MCP API |
+| [ylytdeng/wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) | 4k+ | 2026-06 | 4.0 | ❌ | Win/macOS/Linux | 活跃；仅内存扫描 |
+
+chatlog-keeper 的不同之处：它是这里唯一能处理 **微信 4.1.10.31+**（key 已离开
+明文内存）、并且**同时导出 QQ（NTQQ）**而不只是微信的工具。
+
+它**不追求**的：**仅 Windows**、是个新项目、刻意以 CLI 为先（JSON/HTML，无 GUI、
+无内置分析）。如果你现在就想要成熟的 GUI 或跨平台支持，上面那些工具更成熟——
+本项目的定位是*兼容最新版微信 + 支持 QQ，且法律边界清晰*。
+
 ## 安装
 
 需要 **Python 3.9+**。
