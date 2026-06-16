@@ -1,0 +1,42 @@
+# ============================================================================
+#  NEVER commit your own chat data, keys, or database copies.
+#  This .gitignore is deliberately strict so a clone of this repo can never
+#  accidentally publish someone's private messages.
+# ============================================================================
+
+# --- decrypted output / exported chat data ---
+/out/
+/output/
+*_messages.json
+*_messages.html
+
+# --- decryption keys & secrets ---
+*.key
+/secrets/
+/data/
+.env
+
+# --- copies of chat databases / encrypted media ---
+*.db
+*.db-wal
+*.db-shm
+*.dat
+nt_msg.db
+message_*.db
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

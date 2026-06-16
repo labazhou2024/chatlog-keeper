@@ -1,0 +1,11 @@
+# Core decryption dependencies (required)
+pycryptodome>=3.18      # AES-CBC / AES-ECB for the local database & image decryption
+numpy>=1.21             # fast scan for the on-disk key when first obtaining it
+zstandard>=0.20         # some message blobs are zstd-compressed
+
+# --- Optional (install only if you need them) -------------------------------
+# WeChat image (.dat) decryption / transcoding:
+#   pip install "chatlog-keeper[images]"        (adds Pillow)
+#   plus a system ffmpeg on PATH for wxgf -> jpg
+# OCR over decrypted images:
+#   pip install "chatlog-keeper[ocr]"           (adds rapidocr-onnxruntime)
