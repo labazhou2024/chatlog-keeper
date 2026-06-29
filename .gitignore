@@ -40,3 +40,7 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+
+# PyInstaller build artifacts — NEVER commit (build_pyi .toc / dist_exe carry build-host path)
+build_pyi/
+dist_exe/

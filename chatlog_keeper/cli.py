@@ -39,15 +39,30 @@ def _print_json(obj: dict) -> int:
 # ─── QQ ──────────────────────────────────────────────────────────────────────
 
 def _probe_qq() -> dict:
+    """Lightweight status probe — NEVER scans process memory.
+
+    A status probe must be instant. It reports what is *locatable* (a QQ data
+    root + live ``nt_msg.db``) and whether a working key is *already cached* — it
+    must NOT run the passive memory scan (a multi-GB ``QQ.exe`` heap can take
+    minutes per pid). Acquiring a key is the separate, explicit ``extract-key``
+    step. ``available`` is true only when a cached key exists, so the GUI 检测
+    button stays sub-second; "running but no key yet" surfaces as
+    ``available=False`` + ``needs_key=True`` so the UI guides the user to
+    「自动获取密钥」 instead of hanging on a scan.
+    """
     try:
-        reader = qq_db.QQDBReader()
-        ok = reader.initialize()
+        running = bool(qq_db._get_qq_pids())
+        root = qq_db.find_qq_data_root()
+        db = qq_db.find_msg_database(root) if root else None
+        has_key = bool(qq_db.load_cached_key())
         return {
             "source": "qq",
-            "available": bool(ok and reader.key),
+            "available": has_key,
+            "client_running": running,
             "account": qq_db.detect_current_qq_account(),
-            "db_path": str(reader.db_path) if reader.db_path else None,
-            "key_present": bool(reader.key),
+            "db_path": str(db) if db else None,
+            "key_present": has_key,
+            "needs_key": bool(running and db and not has_key),
         }
     except Exception as e:  # noqa: BLE001
         return {"source": "qq", "available": False, "error": f"{type(e).__name__}:{e}"}
@@ -100,15 +115,28 @@ def _wx_msg_to_dict(m, self_wxid: str = "") -> dict:
 
 
 def _probe_wechat() -> dict:
+    """Lightweight status probe — NEVER scans process memory.
+
+    Mirror of :func:`_probe_qq`. WeChat 4.1.10.31+ keeps no plaintext key in the
+    heap, so a passive scan there always burns its full per-pid budget and finds
+    nothing — catastrophic latency for a status probe (this was the "检测微信
+    检测不到" hang). We report ``available`` only when a cached master key already
+    unlocks the DBs; "running but no key" → ``needs_key=True`` so the GUI guides
+    the user to 「自动获取密钥」 (which runs the scan/debugger explicitly).
+    """
     try:
-        reader = wechat_db.WeChatDBReader()
-        reader.initialize()
-        enc = getattr(reader, "enc_keys", None)
+        running = bool(wechat_db._get_weixin_pids())
+        root = wechat_db.find_weixin_data_root()
+        wxid_dirs = wechat_db.find_wxid_dirs(root) if root else []
+        cached = wechat_db.load_cached_wechat_key()
+        has_key = bool(cached and len(cached) == 32)
         return {
             "source": "wechat",
-            "available": bool(enc),
-            "wxid_dir": str(reader.wxid_dir) if getattr(reader, "wxid_dir", None) else None,
-            "enc_keys_present": bool(enc),
+            "available": has_key,
+            "client_running": running,
+            "wxid_dir": str(wxid_dirs[0]) if wxid_dirs else None,
+            "enc_keys_present": has_key,
+            "needs_key": bool(running and wxid_dirs and not has_key),
         }
     except Exception as e:  # noqa: BLE001
         return {"source": "wechat", "available": False, "error": f"{type(e).__name__}:{e}"}

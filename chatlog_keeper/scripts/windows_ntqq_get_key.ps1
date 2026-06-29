@@ -899,10 +899,13 @@ function Get-InstalledQQInfo {
     $versionDir = $null
 
     if ($version) {
-        $versionDir = Join-Path $versionsDir $version
-        if (-not (Test-Path $versionDir)) {
-            Write-Verbose "Version directory $versionDir not found, trying alternatives"
-            $versionDir = $null
+        # 目录名常用 '9.9.31-49738' (横线), 注册表常给 '9.9.31.49738' (点) — 两种写法都试, 且必须真含 wrapper.node。
+        foreach ($cand in @($version, ($version -replace '\.(\d+)$', '-$1'))) {
+            $p = Join-Path $versionsDir $cand
+            if (Test-Path (Join-Path $p 'resources\app\wrapper.node')) { $versionDir = $p; $version = $cand; break }
+        }
+        if (-not $versionDir) {
+            Write-Verbose "Version directory for '$version' not found, trying alternatives"
         }
     }
 
@@ -925,19 +928,20 @@ function Get-InstalledQQInfo {
     }
 
     if (-not $versionDir -or -not (Test-Path $versionDir)) {
-        # Fall back to single directory in versions folder
+        # 多版本残留时不再 throw: 选最新且真含 wrapper.node 的版本目录 (对齐 WeChat 脚本的健壮策略)。
         if (Test-Path $versionsDir) {
-            $dirs = @(Get-ChildItem -Path $versionsDir -Directory -ErrorAction SilentlyContinue)
-            if ($dirs.Count -eq 1) {
-                $versionDir = $dirs[0].FullName
-                $version = $dirs[0].Name
-                Write-Verbose "Using single version directory: $versionDir"
-            }
-            elseif ($dirs.Count -gt 1) {
-                throw "Multiple version directories found in $versionsDir. Please specify WrapperNodePath manually."
+            $dirs = @(Get-ChildItem -Path $versionsDir -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path (Join-Path $_.FullName 'resources\app\wrapper.node') })
+            if ($dirs.Count -ge 1) {
+                # 纯版本目录 (形如 9.9.31-49738) 优先, 按数值版本降序取最新; 退化时按名降序。
+                $pref = @($dirs | Where-Object { $_.Name -match '^\d+(\.\d+){1,3}(-\d+)?$' } | Sort-Object -Descending -Property @{ Expression = { [version](($_.Name -split '-')[0]) } }, @{ Expression = { $p = $_.Name -split '-'; if ($p.Count -gt 1) { [int]$p[1] } else { 0 } } })
+                $pick = if ($pref.Count -ge 1) { $pref[0] } else { ($dirs | Sort-Object Name -Descending)[0] }
+                $versionDir = $pick.FullName
+                $version = $pick.Name
+                Write-Verbose "Auto-picked newest version directory with wrapper.node: $versionDir"
             }
             else {
-                throw "No version directories found in $versionsDir"
+                throw "No version directory containing resources\app\wrapper.node under $versionsDir"
             }
         }
         else {

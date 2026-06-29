@@ -1630,15 +1630,37 @@ class WeChatDBReader:
         # a key for any DB, try it FIRST for subsequent DBs. This collapses the
         # repeated "Key extraction failed" spam to a couple of attempts.
         working_pid = None
-        # Bound the passive scan per pid (mirrors qq_db); on timeout fall back
-        # to cache / `extract-key`.
-        scan_budget = float(os.environ.get("CHATLOG_WECHAT_SCAN_TIMEOUT_S", "120"))
+        # WeChat 4.1.10.31+ keeps no plaintext key in the heap, so a passive scan
+        # there finds nothing and burns its whole budget. TWO bounds keep this
+        # from hanging the caller: a PER-pid budget (single scan) AND a TOTAL
+        # budget across the entire DB×pid nested loop — without the latter, N DBs
+        # × M pids multiply a 120s scan into many minutes (this was the "微信
+        # passive 超时" hang). On exhaustion, enc_keys stays empty → `extract-key
+        # --method auto` falls back to the active (debugger) path, and a status
+        # probe never reaches here at all (it is cache-first, no scan). Older
+        # builds whose key IS in the heap hit working_pid on the first DB in a
+        # second or two, well within budget, so they are unaffected.
+        import time as _time  # local import (mirrors the scan helpers above)
+        scan_budget = float(os.environ.get("CHATLOG_WECHAT_SCAN_TIMEOUT_S", "10"))
+        total_budget = float(os.environ.get("CHATLOG_WECHAT_SCAN_TOTAL_S", "25"))
+        scan_start = _time.monotonic()
         for db in remaining:
+            if _time.monotonic() - scan_start >= total_budget:
+                left = sum(1 for d in remaining if d not in self.enc_keys)
+                logger.warning(
+                    "WeChat passive scan total budget %.0fs exhausted; %d DB(s) "
+                    "left unscanned — likely 4.1.10.31+ (key not in heap). Use "
+                    "`extract-key --method active` or `set-key`.", total_budget, left)
+                break
             tried_pids = []
             ordered_pids = ([working_pid] if working_pid else []) + [p for p in pids if p != working_pid]
             for pid in ordered_pids:
+                elapsed = _time.monotonic() - scan_start
+                if elapsed >= total_budget:
+                    break
                 tried_pids.append(pid)
-                key = extract_key_from_weixin(pid, db_path=db, timeout_s=scan_budget)
+                eff_timeout = min(scan_budget, total_budget - elapsed)
+                key = extract_key_from_weixin(pid, db_path=db, timeout_s=eff_timeout)
                 # A truthiness check is insufficient for crypto bytes: also
                 # validate the length is 32 (AES-256).
                 if key and isinstance(key, (bytes, bytearray)) and len(key) == 32:
