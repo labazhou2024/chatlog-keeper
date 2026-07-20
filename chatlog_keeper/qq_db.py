@@ -59,8 +59,74 @@ class QQMessage:
 
 # ─── QQ Process helpers ───────────────────────────────────────────────────────
 
+def _qq_process_creation_ticks(pid: int) -> Optional[int]:
+    """Return a Windows process creation timestamp suitable for ordering.
+
+    NTQQ starts one root ``QQ.exe`` before its GPU/network/renderer helpers.
+    The database passphrase lives in the logged-in client process, while a
+    helper-first scan can consume the whole timeout without ever reaching it.
+    ``GetProcessTimes`` is local, fast, and does not require WMI/PowerShell.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        open_process.restype = wt.HANDLE
+        get_process_times = kernel32.GetProcessTimes
+        get_process_times.argtypes = [
+            wt.HANDLE,
+            ctypes.POINTER(wt.FILETIME),
+            ctypes.POINTER(wt.FILETIME),
+            ctypes.POINTER(wt.FILETIME),
+            ctypes.POINTER(wt.FILETIME),
+        ]
+        get_process_times.restype = wt.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wt.HANDLE]
+        close_handle.restype = wt.BOOL
+
+        handle = open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            created = wt.FILETIME()
+            exited = wt.FILETIME()
+            kernel = wt.FILETIME()
+            user = wt.FILETIME()
+            if not get_process_times(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            return (created.dwHighDateTime << 32) | created.dwLowDateTime
+        finally:
+            close_handle(handle)
+    except Exception:
+        return None
+
+
+def _rank_qq_pids(pids: List[int]) -> List[int]:
+    """Put the earliest (root) NTQQ process before later helper processes."""
+    unique = list(dict.fromkeys(pids))
+    observed_index = {pid: index for index, pid in enumerate(unique)}
+    creation = {pid: _qq_process_creation_ticks(pid) for pid in unique}
+    return sorted(
+        unique,
+        key=lambda pid: (
+            creation[pid] is None,
+            creation[pid] if creation[pid] is not None else observed_index[pid],
+            observed_index[pid],
+        ),
+    )
+
+
 def _get_qq_pids() -> list:
-    """Return list of QQ.exe PIDs."""
+    """Return QQ.exe PIDs with the root client before Chromium helpers."""
     try:
         r = subprocess.run(
             ["tasklist", "/FO", "CSV", "/FI", "IMAGENAME eq QQ.exe"],
@@ -75,7 +141,7 @@ def _get_qq_pids() -> list:
                     pids.append(int(parts[1]))
                 except ValueError:
                     pass
-        return sorted(pids, reverse=True)
+        return _rank_qq_pids(pids)
     except Exception as e:
         logger.warning(f"PID lookup failed: {e}")
         return []
@@ -547,8 +613,7 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
                                 seen.add(candidate)
                                 if db_raw and _verify_key_qq(candidate, db_raw):
                                     logger.info(
-                                        f"Passphrase verified at PID={pid} "
-                                        f"len={run_len} preview={candidate[:4]!r}…"
+                                        f"Passphrase verified at PID={pid} len={run_len}"
                                     )
                                     found = candidate
                                     break
@@ -583,12 +648,7 @@ def extract_key_from_qq(pid: int, db_path: Path = None,
     logger.info(f"Attempting passphrase extraction from QQ PID {pid}")
     key = _scan_memory_for_key(pid, db_path=db_path, timeout_s=timeout_s)
     if key:
-        # Don't log full passphrase; log length + first 4 chars
-        try:
-            preview = key.decode("ascii", errors="replace")[:4]
-        except Exception:
-            preview = "<binary>"
-        logger.info(f"Passphrase extracted: len={len(key)} preview={preview!r}…")
+        logger.info(f"Passphrase extracted: len={len(key)}")
     else:
         logger.warning("Passphrase extraction failed")
     return key
@@ -1656,6 +1716,7 @@ class QQDBReader:
         self.data_root = None
         self.db_path = None
         self.key = None
+        self.key_source = None  # "live" | "cache"; never contains key material
         self._initialized = False
     
     def initialize(self) -> bool:
@@ -1692,18 +1753,34 @@ class QQDBReader:
             if cached:
                 logger.info("Using cached key from data/secrets/qq_db.key (fast path)")
                 self.key = cached
+                self.key_source = "cache"
 
         # 1. Try live extraction if no cached key OR force_live
         if not self.key:
             pids = _get_qq_pids()
             if pids:
-                # Bound the passive scan — a large QQ.exe heap (multiple GB) can
-                # take many minutes; on timeout fall back to cache / `extract-key`.
-                scan_budget = float(os.environ.get("CHATLOG_QQ_SCAN_TIMEOUT_S", "120"))
+                # Bound the complete passive scan, not every QQ helper. The
+                # earliest/root process is attempted first; later helpers only
+                # receive the remaining wall-clock budget.
+                import time as _time
+                per_process_budget = max(
+                    0.1, float(os.environ.get("CHATLOG_QQ_SCAN_TIMEOUT_S", "120"))
+                )
+                total_budget = max(
+                    0.1, float(os.environ.get("CHATLOG_QQ_SCAN_TOTAL_S", "120"))
+                )
+                deadline = _time.monotonic() + total_budget
                 for pid in pids:
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 0:
+                        logger.warning(
+                            f"QQ passive scan exhausted total {total_budget:.0f}s budget"
+                        )
+                        break
                     self.key = extract_key_from_qq(pid, db_path=self.db_path,
-                                                   timeout_s=scan_budget)
+                                                   timeout_s=min(per_process_budget, remaining))
                     if self.key:
+                        self.key_source = "live"
                         if save_cached_key(self.key):
                             logger.info("Key extracted from QQ.exe and cached to data/secrets/qq_db.key")
                         break
@@ -1711,13 +1788,19 @@ class QQDBReader:
                     logger.warning("QQ running but key extraction failed (try Admin or different PID).")
 
         # 2. Final fallback (already tried above unless force_live)
-        if not self.key:
+        require_live = os.environ.get("CHATLOG_QQ_REQUIRE_LIVE_KEY", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if not self.key and not require_live:
             cached = load_cached_key()
             if cached:
                 logger.info("Using cached key from data/secrets/qq_db.key (fallback)")
                 self.key = cached
+                self.key_source = "cache"
             else:
                 logger.warning("No key available (QQ.exe not running and no cached key).")
+        elif not self.key:
+            logger.warning("A fresh live QQ key was required; cached-key fallback is disabled.")
 
         self._initialized = True
         return self.db_path is not None
