@@ -240,8 +240,8 @@ def _wechat_message_db_for_active(data_root: str | None = None) -> str | None:
     """Resolve the HMAC oracle DB for the active WeChat debugger.
 
     The PowerShell debugger accepts ``-DbPath`` rather than ``--data-root``.
-    Resolve that path in Python so relocated WeChat profiles such as
-    ``D:\\xwechat_files`` work the same way for export and active key extraction.
+    Resolve that path in Python so a profile relocated directly under any drive
+    root works the same way for export and active key extraction.
     """
 
     roots: list[Path] = []

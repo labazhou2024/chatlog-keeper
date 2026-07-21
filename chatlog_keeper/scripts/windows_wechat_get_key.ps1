@@ -837,9 +837,15 @@ function Get-DbPage1 {
 }
 
 function Find-WeixinMessageDb {
-    $roots = @('C:\wechat files\xwechat_files', 'D:\wechat files\xwechat_files',
-        (Join-Path $env:USERPROFILE 'Documents\xwechat_files'),
-        (Join-Path $env:USERPROFILE 'Documents\WeChat Files'))
+    $roots = @()
+    foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+        $roots += (Join-Path $drive.Root 'wechat files\xwechat_files')
+        $roots += (Join-Path $drive.Root 'xwechat_files')
+        $roots += (Join-Path $drive.Root 'WeChat Files')
+    }
+    $roots += (Join-Path $env:USERPROFILE 'Documents\xwechat_files')
+    $roots += (Join-Path $env:USERPROFILE 'Documents\WeChat Files')
+    $roots = @($roots | Select-Object -Unique)
     foreach ($root in $roots) {
         if (-not (Test-Path $root)) { continue }
         foreach ($wx in (Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue)) {

@@ -76,7 +76,7 @@ chatlog-keeper 的不同之处：它是这里唯一能处理 **微信 4.1.10.31+
 需要 **Python 3.9+**。
 
 ```bash
-git clone <仓库地址>
+git clone https://github.com/labazhou2024/chatlog-keeper.git
 cd chatlog-keeper
 pip install -r requirements.txt
 ```
@@ -116,6 +116,9 @@ python -m chatlog_keeper.cli extract-key --source wechat --method passive
 
 # 只用调试器取 key（能取新版，封号风险更高——见“封号风险”；需管理员+登录一次）
 python -m chatlog_keeper.cli extract-key --source wechat --method active
+
+# 如果移动过微信数据目录，可显式指定 xwechat_files 文件夹
+python -m chatlog_keeper.cli extract-key --source wechat --method active --data-root "E:\xwechat_files"
 
 # 手动粘贴（你用其它工具拿到 key 之后）
 python -m chatlog_keeper.cli set-key --source wechat --key <64位十六进制>

@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from chatlog_keeper import cli
+from chatlog_keeper import cli, wechat_db
+from chatlog_keeper.core import _paths
 
 
 def _mk_message_db(root: Path) -> Path:
@@ -39,3 +40,13 @@ def test_wechat_active_passes_db_path_to_debugger(monkeypatch, tmp_path):
     assert result["ok"] is True
     assert result["db_path"] == str(db)
     assert seen["db_path"] == str(db)
+
+
+def test_wechat_data_root_discovers_root_level_relocation(monkeypatch, tmp_path):
+    relocated = tmp_path / "xwechat_files"
+    relocated.mkdir()
+    monkeypatch.delenv("CHATLOG_WECHAT_DATA_ROOT", raising=False)
+    monkeypatch.setattr(_paths, "all_drive_roots", lambda: [tmp_path])
+    monkeypatch.setattr(_paths, "candidate_documents_roots", lambda: [])
+
+    assert wechat_db.find_weixin_data_root() == relocated
