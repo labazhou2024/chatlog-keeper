@@ -102,7 +102,11 @@ footer { text-align: center; color: #b0b0b5; font-size: 12px;
 def _fmt_day(ts: float) -> str:
     if not ts:
         return "（未知日期）"
-    return datetime.fromtimestamp(ts).strftime("%Y 年 %m 月 %d 日")
+    # Python 3.9 on an English Windows locale can ask the locale codec to encode
+    # the whole strftime format string, which rejects the Chinese separators.
+    # Format only numeric fields in Python so the result is locale-independent.
+    dt = datetime.fromtimestamp(ts)
+    return f"{dt.year:04d} 年 {dt.month:02d} 月 {dt.day:02d} 日"
 
 
 def _fmt_clock(ts: float) -> str:
