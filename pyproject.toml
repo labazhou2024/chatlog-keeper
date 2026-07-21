@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatlog-keeper"
-version = "0.1.0"
+version = "0.1.1"
 description = "Decrypt and export your own local QQ / WeChat chat history for personal backup and nostalgia. Local-only; nothing is uploaded."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -41,8 +41,8 @@ ocr = ["rapidocr-onnxruntime>=1.3"]    # optional OCR over decrypted images
 chatlog-keeper = "chatlog_keeper.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/labazhou2024/chatlog-keeper-oss"
-Source = "https://github.com/labazhou2024/chatlog-keeper-oss"
+Homepage = "https://github.com/labazhou2024/chatlog-keeper"
+Source = "https://github.com/labazhou2024/chatlog-keeper"
 
 [tool.setuptools.packages.find]
 include = ["chatlog_keeper*"]

@@ -117,13 +117,14 @@ def _get_weixin_pids() -> list:
 def find_weixin_data_root() -> Optional[Path]:
     """Locate the Weixin/WeChat user-data root, machine-neutrally.
 
-    The 4.x default is ``<drive>/wechat files/xwechat_files`` (user-relocatable to
-    any drive); 3.x used ``<Documents>/WeChat Files``. No drive letter is assumed.
+    The 4.x default is ``<drive>/wechat files/xwechat_files`` and users can also
+    relocate it directly to ``<drive>/xwechat_files``; 3.x used
+    ``<Documents>/WeChat Files``. No drive letter is assumed.
 
     Discovery order (nothing hardcoded):
       1. ``CHATLOG_WECHAT_DATA_ROOT`` env var (explicit override)
       2. every logical drive root: ``<drive>/wechat files/xwechat_files`` +
-         ``<drive>/WeChat Files``
+         ``<drive>/xwechat_files`` + ``<drive>/WeChat Files``
       3. real Documents + OneDrive variants
     """
     from chatlog_keeper.core._paths import all_drive_roots, candidate_documents_roots
@@ -134,6 +135,7 @@ def find_weixin_data_root() -> Optional[Path]:
         candidates.append(Path(env))
     for drive in all_drive_roots():
         candidates.append(drive / "wechat files" / "xwechat_files")
+        candidates.append(drive / "xwechat_files")
         candidates.append(drive / "WeChat Files")
     for doc in candidate_documents_roots():
         candidates.append(doc / "xwechat_files")

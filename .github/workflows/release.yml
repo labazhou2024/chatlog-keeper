@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install build and test dependencies
+        run: python -m pip install --disable-pip-version-check . pytest pyinstaller==6.20.0
+      - name: Verify tag matches package version
+        shell: pwsh
+        run: |
+          $version = python -c "import chatlog_keeper; print(chatlog_keeper.__version__)"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match package version $version"
+          }
+      - name: Test
+        run: python -m pytest -q
+      - name: Build standalone executable
+        run: python -m PyInstaller packaging/chatlog_keeper.spec --noconfirm --clean --distpath dist_exe
+      - name: Smoke-test and checksum executable
+        shell: pwsh
+        run: |
+          .\dist_exe\chatlog-keeper.exe --help
+          $hash = (Get-FileHash -LiteralPath .\dist_exe\chatlog-keeper.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  chatlog-keeper.exe" | Set-Content -LiteralPath .\dist_exe\chatlog-keeper.exe.sha256 -Encoding ascii -NoNewline
+      - name: Publish immutable GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            .\dist_exe\chatlog-keeper.exe `
+            .\dist_exe\chatlog-keeper.exe.sha256 `
+            --repo "${{ github.repository }}" `
+            --verify-tag `
+            --title "chatlog-keeper ${{ github.ref_name }}" `
+            --generate-notes

@@ -81,7 +81,7 @@ niche is *newest-WeChat compatibility + QQ, with a clear legal stance*.
 Requires **Python 3.9+**.
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/labazhou2024/chatlog-keeper.git
 cd chatlog-keeper
 pip install -r requirements.txt
 ```
@@ -128,6 +128,9 @@ python -m chatlog_keeper.cli extract-key --source wechat --method passive
 # Debugger only (gets the key on the newest builds; higher ban risk — see
 #   "Account-ban risk"; needs Administrator + you log in once)
 python -m chatlog_keeper.cli extract-key --source wechat --method active
+
+# If you relocated WeChat data, pass its xwechat_files folder explicitly.
+python -m chatlog_keeper.cli extract-key --source wechat --method active --data-root "E:\xwechat_files"
 
 # Paste it yourself (after obtaining the key with any tool)
 python -m chatlog_keeper.cli set-key --source wechat --key <64-hex>

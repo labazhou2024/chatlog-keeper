@@ -236,7 +236,44 @@ def _set_key(source: str, key: str) -> dict:
 
 # ─── automatic key extraction (passive memory scan / active debugger) ─────────
 
-def _extract_key(source: str, method: str) -> dict:
+def _wechat_message_db_for_active(data_root: str | None = None) -> str | None:
+    """Resolve the HMAC oracle DB for the active WeChat debugger.
+
+    The PowerShell debugger accepts ``-DbPath`` rather than ``--data-root``.
+    Resolve that path in Python so a profile relocated directly under any drive
+    root works the same way for export and active key extraction.
+    """
+
+    roots: list[Path] = []
+    if data_root:
+        roots.append(Path(data_root).expanduser())
+    else:
+        root = wechat_db.find_weixin_data_root()
+        if root:
+            roots.append(root)
+
+    for root in roots:
+        try:
+            wxid_dirs = [root] if (root / "db_storage" / "message").exists() else wechat_db.find_wxid_dirs(root)
+        except OSError:
+            continue
+        for wxid_dir in wxid_dirs:
+            exact = wxid_dir / "db_storage" / "message" / "message_0.db"
+            try:
+                if exact.exists():
+                    return str(exact)
+                for db in wechat_db.find_msg_databases(wxid_dir):
+                    if db.name.lower() == "message_0.db":
+                        return str(db)
+                dbs = wechat_db.find_msg_databases(wxid_dir)
+                if dbs:
+                    return str(dbs[0])
+            except OSError:
+                continue
+    return None
+
+
+def _extract_key(source: str, method: str, data_root: str | None = None) -> dict:
     """Acquire a decryption key and cache it for later cache-first exports.
 
     ``method="passive"`` (default) scans the live client's process memory — low
@@ -246,15 +283,18 @@ def _extract_key(source: str, method: str) -> dict:
     freshly-launched client, but works on the newest builds. Active is opt-in:
     you accept the higher risk by choosing it explicitly.
     """
+    force_extract = os.environ.get("CHATLOG_FORCE_EXTRACT", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
     if method == "auto":
         # Try passive first (low ban risk); fall back to active (newer builds)
         # ONLY if passive finds nothing. Export stays cache-first and never
         # triggers active on its own — active only runs inside this command,
         # which the user invoked deliberately.
-        r = _extract_key(source, "passive")
+        r = _extract_key(source, "passive", data_root=data_root)
         if r.get("ok"):
             return r
-        r = _extract_key(source, "active")
+        r = _extract_key(source, "active", data_root=data_root)
         if isinstance(r, dict):
             r["fell_back_from_passive"] = True
         return r
@@ -263,27 +303,43 @@ def _extract_key(source: str, method: str) -> dict:
             key = active_key.extract_qq_key_active()
             if key and qq_db.save_cached_key(key):
                 return {"source": "qq", "method": "active", "ok": True,
-                        "key_len": len(key), "saved_to": str(qq_db._key_cache_path())}
+                        "key_len": len(key), "saved_to": str(qq_db._key_cache_path()),
+                        "fresh_extraction": True}
             return {"source": "qq", "method": "active", "ok": False,
                     "error": "active extraction got no key (not logged into the popped-up QQ / "
                              "UAC declined / unsupported build)"}
         reader = qq_db.QQDBReader()
         reader.initialize()  # cache → passive (timeout-bounded) → cache fallback
+        key_source = getattr(reader, "key_source", None)
+        if force_extract and key_source != "live":
+            return {"source": "qq", "method": "passive", "ok": False,
+                    "error": "fresh extraction was required but no live QQ key was obtained"}
         if reader.key and qq_db.save_cached_key(reader.key):
             return {"source": "qq", "method": "passive", "ok": True,
-                    "key_len": len(reader.key), "saved_to": str(qq_db._key_cache_path())}
+                    "key_len": len(reader.key), "saved_to": str(qq_db._key_cache_path()),
+                    "fresh_extraction": key_source == "live"}
         return {"source": "qq", "method": "passive", "ok": False,
                 "error": "passive scan found no key (QQ not running, or a newer build — "
                          "try `--method active` or `set-key`)"}
     if source == "wechat":
         if method == "active":
-            key = active_key.extract_wechat_key_active()
+            db_path = _wechat_message_db_for_active(data_root)
+            key = active_key.extract_wechat_key_active(db_path=db_path)
             if key and wechat_db.save_cached_wechat_key(key):
                 return {"source": "wechat", "method": "active", "ok": True,
-                        "key_len": len(key), "saved_to": str(wechat_db._wechat_key_cache_path())}
+                        "key_len": len(key), "saved_to": str(wechat_db._wechat_key_cache_path()),
+                        "db_path": db_path, "fresh_extraction": True}
+            if not db_path:
+                return {"source": "wechat", "method": "active", "ok": False,
+                        "error": "active extraction could not locate message_0.db for HMAC "
+                                 "verification (set --data-root to the xwechat_files folder)"}
             return {"source": "wechat", "method": "active", "ok": False,
                     "error": "active extraction got no key (not logged into the popped-up WeChat / "
-                             "UAC declined / unsupported build)"}
+                             "UAC declined / unsupported build)",
+                    "db_path": db_path}
+        if force_extract:
+            return {"source": "wechat", "method": "passive", "ok": False,
+                    "error": "fresh WeChat extraction requires --method active"}
         reader = wechat_db.WeChatDBReader()
         reader.initialize()
         enc = getattr(reader, "enc_keys", None)
@@ -365,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "set-key":
         return _print_json(_set_key(args.source, args.key))
     if args.cmd == "extract-key":
-        return _print_json(_extract_key(args.source, args.method))
+        return _print_json(_extract_key(args.source, args.method, data_root=getattr(args, "data_root", None)))
     return 2
 
 
