@@ -11,19 +11,22 @@ builds, but:
 * **QQ NT** keeps a 16-char passphrase in the heap, but the process can hold
   1+ GB, so a full scan can take many minutes.
 
-For those cases this module drives two bundled PowerShell debugger scripts
+On Windows this module drives two bundled PowerShell debugger scripts
 (``scripts/windows_ntqq_get_key.ps1`` / ``scripts/windows_wechat_get_key.ps1``).
 Each one is a pure .NET/Win32 debugger — ``CreateProcessW(DEBUG_ONLY_THIS_PROCESS)``
 launches a *fresh* client, sets an INT3 software breakpoint on the SQLCipher
-key-set function, and reads the key from registers when it fires. The key is
-verified by an HMAC oracle against your own DB's page 1, so a wrong guess can
-never be returned. No DLL injection, no third-party binary, nothing uploaded.
+key-set function, and reads the key from registers when it fires.
 
-This needs Administrator rights (a debugger has to attach) and you have to log
-into the freshly-launched client once. After that the key is cached and every
-later export reads the cache — no scan, no debugger, no login.
+On macOS the original signed app is left untouched. An isolated copy under the
+tool's Application Support directory is ad-hoc signed with
+``com.apple.security.get-task-allow``, launched separately, and scanned through
+a bundled read-only Mach helper after explicit administrator authorization.
+SIP is never disabled and nothing is injected into either client.
 
-Everything here is Windows-only and operates on **your own** logged-in client.
+Every candidate on either platform is verified by an HMAC oracle against your
+own DB page 1 before it can be returned or cached. The active flow requires
+administrator authorization and may require logging into the isolated client
+once. Later exports use the private local cache.
 """
 from __future__ import annotations
 
@@ -254,6 +257,7 @@ def _run_active(script: Path, args: List[str], timeout: int,
 # ─── public API ───────────────────────────────────────────────────────────────
 
 def extract_qq_key_active(*, wrapper_node: Optional[str] = None,
+                          db_path: Optional[str] = None,
                           analyze_only: bool = False,
                           timeout: int = 600) -> Optional[bytes]:
     """Extract the QQ NT 16-char passphrase via the debugger script.
@@ -263,6 +267,48 @@ def extract_qq_key_active(*, wrapper_node: Optional[str] = None,
     not launch/debug QQ) — useful to verify the script runs on this machine
     without closing or restarting the user's QQ.
     """
+    if sys.platform == "darwin":
+        if analyze_only:
+            from chatlog_keeper.macos_key import ensure_helper
+            ensure_helper()
+            return None
+        from chatlog_keeper import qq_db
+        from chatlog_keeper.macos_debug_app import launch_debug_copy
+        from chatlog_keeper.macos_key import extract_verified
+        resolved = Path(db_path) if db_path else None
+        if not resolved:
+            root = qq_db.find_qq_data_root()
+            resolved = qq_db.find_msg_database(root) if root else None
+        if not resolved or not resolved.is_file():
+            return None
+        debug_pid = launch_debug_copy("qq")
+        if not debug_pid:
+            # The daily signed client does not carry get-task-allow. Falling
+            # back to it would only trigger an administrator prompt followed
+            # by a guaranteed SIP/taskgated denial.
+            return None
+        # A first login/checkpoint can replace page 1 while the helper scans.
+        # Verify against a stable pre-scan oracle, then re-read and confirm on
+        # the current DB family before returning a cacheable key.  Retry once
+        # on a real checkpoint race; never accept a stale-page-only match.
+        for _attempt in range(2):
+            db_raw = qq_db._read_qq_verification_bytes(resolved)
+            if not db_raw:
+                return None
+            key = extract_verified(
+                "qq", debug_pid,
+                lambda candidate: qq_db._verify_key_qq(candidate, db_raw),
+                primary_verify=lambda candidate: qq_db._verify_key_qq_with_algo(
+                    candidate, db_raw, "sha512", "sha1", 48
+                ),
+                elevate=True, timeout=timeout,
+            )
+            if not key:
+                return None
+            latest = qq_db._read_qq_verification_bytes(resolved)
+            if latest and qq_db._verify_key_qq(key, latest):
+                return key
+        return None
     if os.name != "nt":
         logger.warning("active QQ extraction is Windows-only")
         return None
@@ -294,6 +340,41 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
     Returns the 32-byte master key, or None. ``analyze_only`` runs static
     analysis only (``-NoDebugForKey``) and never launches/restarts WeChat.
     """
+    if sys.platform == "darwin":
+        if analyze_only:
+            from chatlog_keeper.macos_key import ensure_helper
+            ensure_helper()
+            return None
+        from chatlog_keeper import wechat_db
+        from chatlog_keeper.macos_debug_app import launch_debug_copy
+        from chatlog_keeper.macos_key import extract_verified
+        resolved = Path(db_path) if db_path else None
+        if not resolved or not resolved.is_file():
+            return None
+        debug_pid = launch_debug_copy("wechat")
+        if not debug_pid:
+            # See the QQ branch above: no fallback to the SIP-protected daily
+            # app when the isolated debug copy did not remain alive.
+            return None
+        # A first-login checkpoint can replace page 1 while the helper scans.
+        # Verify against a stable page before the scan and re-read it after the
+        # candidate is found. Retry once if the DB family changed in between;
+        # never cache a candidate tied only to a stale page.
+        for _attempt in range(2):
+            db_page1 = wechat_db._read_stable_page1(resolved)
+            if not db_page1:
+                continue
+            key = extract_verified(
+                "wechat", debug_pid,
+                lambda candidate: wechat_db._verify_key_v4(candidate, db_page1),
+                elevate=True, timeout=timeout,
+            )
+            if not key:
+                return None
+            latest_page1 = wechat_db._read_stable_page1(resolved)
+            if latest_page1 and wechat_db._verify_key_v4(key, latest_page1):
+                return key
+        return None
     if os.name != "nt":
         logger.warning("active WeChat extraction is Windows-only")
         return None

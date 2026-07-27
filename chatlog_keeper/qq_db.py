@@ -1,4 +1,4 @@
-"""
+r"""
 qq_db.py — QQ NT (QQNT) local message database reader.
 
 Based on wechat_db.py architecture but adapted for QQ NT parameters:
@@ -23,6 +23,7 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -127,6 +128,9 @@ def _rank_qq_pids(pids: List[int]) -> List[int]:
 
 def _get_qq_pids() -> list:
     """Return QQ.exe PIDs with the root client before Chromium helpers."""
+    if sys.platform == "darwin":
+        from chatlog_keeper.core._macos import process_pids
+        return process_pids(("QQ",))
     try:
         r = subprocess.run(
             ["tasklist", "/FO", "CSV", "/FI", "IMAGENAME eq QQ.exe"],
@@ -170,6 +174,10 @@ def find_qq_data_root() -> Optional[Path]:
     env = os.environ.get("CHATLOG_QQ_DATA_ROOT", "").strip()
     if env:
         candidates.append(Path(env))
+    if sys.platform == "darwin":
+        from chatlog_keeper.core._macos import qq_container_roots
+        for container in qq_container_roots():
+            candidates.append(container / "Library" / "Application Support" / "QQ")
     for doc in candidate_documents_roots():
         candidates.append(doc / "Tencent Files")
     for drive in all_drive_roots():
@@ -191,9 +199,13 @@ def find_qq_data_root() -> Optional[Path]:
             if not c.exists():
                 continue
             for sub in c.iterdir():
-                if not (sub.is_dir() and sub.name.isdigit()):
+                if not sub.is_dir():
+                    continue
+                if not sub.name.isdigit() and sys.platform != "darwin":
                     continue
                 db = sub / "nt_qq" / "nt_db" / "nt_msg.db"
+                if not db.exists():
+                    db = sub / "nt_db" / "nt_msg.db"
                 if db.exists() and db.stat().st_size > 0:
                     logger.info(f"Found QQ data root (live): {c} (account={sub.name})")
                     return c
@@ -212,11 +224,21 @@ def find_qq_data_root() -> Optional[Path]:
 
 
 def find_qq_number_dirs(data_root: Path) -> List[Path]:
-    """Return list of QQ number directories inside data_root."""
+    """Return account directories inside data_root.
+
+    Windows names these folders with the numeric QQ account.  Current macOS QQ
+    uses an opaque account directory, so accept a non-numeric directory only
+    when it contains the expected ``nt_db/nt_msg.db`` layout.
+    """
     dirs = []
     try:
         for item in data_root.iterdir():
-            if item.is_dir() and item.name.isdigit():
+            if not item.is_dir():
+                continue
+            if item.name.isdigit() or (
+                sys.platform == "darwin"
+                and (item / "nt_db" / "nt_msg.db").is_file()
+            ):
                 dirs.append(item)
     except OSError as e:
         logger.warning(f"Failed to scan data root: {e}")
@@ -267,7 +289,7 @@ def find_msg_database(data_root: Path) -> Optional[Path]:
 
 # ─── Current-account auto-detection ───────────────────────────────────────────
 
-def detect_current_qq_account() -> Optional[int]:
+def detect_current_qq_account():
     """Detect which QQ account is currently logged in / has live nt_msg.db.
 
     By design, callers must NOT depend on a hardcoded env/CLI value for the
@@ -286,10 +308,10 @@ def detect_current_qq_account() -> Optional[int]:
     root = find_qq_data_root()
     if not root:
         return None
-    best: Optional[Tuple[float, int]] = None
+    best: Optional[Tuple[float, object]] = None
     for qq_dir in find_qq_number_dirs(root):
         try:
-            qid = int(qq_dir.name)
+            qid = int(qq_dir.name) if qq_dir.name.isdigit() else qq_dir.name
         except ValueError:
             continue
         db = qq_dir / "nt_qq" / "nt_db" / "nt_msg.db"
@@ -401,19 +423,12 @@ def save_cached_key(key) -> bool:
     if isinstance(key, str):
         key = key.encode("ascii")
     p = _key_cache_path()
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        if len(key) in (16, 32) and all(0x20 <= b <= 0x7E for b in key):
-            # ASCII passphrase format (NTQQ 9.9.x)
-            p.write_text(key.decode("ascii"), encoding="utf-8")
-            return True
-        if len(key) == 32:
-            # Legacy raw 32-byte key (hex-encoded)
-            p.write_text(key.hex(), encoding="utf-8")
-            return True
-        return False
-    except OSError:
-        return False
+    from chatlog_keeper.core._secrets import write_secret_text
+    if len(key) in (16, 32) and all(0x20 <= b <= 0x7E for b in key):
+        return write_secret_text(p, key.decode("ascii"))
+    if len(key) == 32:
+        return write_secret_text(p, key.hex())
+    return False
 
 
 # ─── Key extraction from QQ process memory ────────────────────────────────────
@@ -511,6 +526,16 @@ def _verify_key_qq(passphrase, db_raw_or_page1) -> bool:
     return False
 
 
+def _read_qq_verification_bytes(db_path: Path) -> Optional[bytes]:
+    """Read only NTQQ's 1024-byte header plus encrypted 4096-byte page 1."""
+    from chatlog_keeper.core._snapshot import read_stable_prefix
+
+    try:
+        return read_stable_prefix(Path(db_path), 1024 + 4096)
+    except OSError:
+        return None
+
+
 def _is_printable_ascii(b: int) -> bool:
     """0x20..0x7E inclusive, the printable ASCII range."""
     return 0x20 <= b <= 0x7E
@@ -530,6 +555,24 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
 
     Returns the passphrase as bytes (preserving original ASCII string) or None.
     """
+    if sys.platform == "darwin":
+        if not db_path or not Path(db_path).is_file():
+            return None
+        db_raw = _read_qq_verification_bytes(Path(db_path))
+        if not db_raw:
+            return None
+        from chatlog_keeper.macos_key import extract_verified
+        return extract_verified(
+            "qq",
+            pid,
+            lambda candidate: _verify_key_qq(candidate, db_raw),
+            primary_verify=lambda candidate: _verify_key_qq_with_algo(
+                candidate, db_raw, "sha512", "sha1", 48
+            ),
+            elevate=False,
+            timeout=max(1, int(timeout_s or 120)),
+        )
+
     kernel32 = ctypes.windll.kernel32
     PROCESS_VM_READ = 0x0010
     PROCESS_QUERY_INFORMATION = 0x0400
@@ -541,11 +584,7 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
 
     db_raw = None
     if db_path and db_path.exists():
-        try:
-            with open(db_path, "rb") as f:
-                db_raw = f.read(1024 + 4096)
-        except Exception:
-            pass
+        db_raw = _read_qq_verification_bytes(Path(db_path))
 
     class MBI64(ctypes.Structure):
         _fields_ = [
@@ -662,19 +701,32 @@ def _skip_header(db_path: Path, output_path: Path) -> bool:
     QQ NT adds a 1024-byte header before the actual SQLCipher data.
     """
     try:
-        # Stream the copy in chunks (skipping the 1024-byte header) to bound memory.
-        with open(db_path, "rb") as f:
-            f.seek(0, 2)
-            if f.tell() < 1024 + 4096:
-                logger.warning(f"File too small: {db_path}")
-                return False
-            f.seek(1024)
-            with open(output_path, "wb") as out:
-                while True:
-                    chunk = f.read(1 << 20)
-                    if not chunk:
-                        break
-                    out.write(chunk)
+        import shutil
+        from chatlog_keeper.core._snapshot import snapshot_db_family
+        with snapshot_db_family(db_path) as snapshot:
+            # Stream the copy in chunks (skipping the 1024-byte header) to bound memory.
+            with open(snapshot, "rb") as f:
+                f.seek(0, 2)
+                if f.tell() < 1024 + 4096:
+                    logger.warning(f"File too small: {db_path}")
+                    return False
+                f.seek(1024)
+                with open(output_path, "wb") as out:
+                    while True:
+                        chunk = f.read(1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+            # Preserve the same stable WAL/SHM generation beside the stripped
+            # main DB.  SQLCipher WAL pages do not carry QQ's 1024-byte wrapper
+            # header and are copied verbatim for authenticated recovery after
+            # the main pages are decrypted.
+            for suffix in ("-wal", "-shm"):
+                source = snapshot.with_name(snapshot.name + suffix)
+                destination = output_path.with_name(output_path.name + suffix)
+                destination.unlink(missing_ok=True)
+                if source.is_file():
+                    shutil.copy2(source, destination)
         logger.info(f"Header removed (streaming): {db_path.name} -> {output_path.name}")
         return True
     except Exception as e:
@@ -682,11 +734,73 @@ def _skip_header(db_path: Path, output_path: Path) -> bool:
         return False
 
 
+def _resolve_qq_cipher(key_bytes: bytes, first_page: bytes):
+    """Return the HMAC-verified SQLCipher parameter tuple for page 1."""
+    raw = b"\0" * 1024 + first_page
+    for kdf, hmac_algo, reserve in _VERIFY_COMBOS:
+        if _verify_key_qq_with_algo(
+            key_bytes, raw, kdf, hmac_algo, reserve
+        ):
+            return kdf, hmac_algo, reserve
+    return None
+
+
+def _decrypt_qq_page(
+    page: bytes,
+    *,
+    page_no: int,
+    salt: bytes,
+    aes_key: bytes,
+    mac_key: bytes,
+    hmac_algo: str,
+    reserve: int,
+) -> Optional[bytes]:
+    """Authenticate and decrypt one current/legacy NTQQ SQLCipher page."""
+    try:
+        from Crypto.Cipher import AES
+    except ImportError:
+        try:
+            from Cryptodome.Cipher import AES
+        except ImportError:
+            return None
+    if len(page) != 4096 or page_no <= 0:
+        return None
+    if hmac_algo == "sha1":
+        hash_func = hashlib.sha1
+        digest_len = 20
+    elif hmac_algo == "sha512":
+        hash_func = hashlib.sha512
+        digest_len = 64
+    else:
+        return None
+    prefix = 16 if page_no == 1 else 0
+    if prefix and page[:16] != salt:
+        return None
+    body = page[prefix:4096 - reserve]
+    iv_start = 4096 - reserve
+    iv = page[iv_start:iv_start + 16]
+    stored_tag = page[
+        iv_start + 16:iv_start + 16 + digest_len
+    ]
+    computed = hmac_mod.new(
+        mac_key,
+        body + iv + struct.pack("<I", page_no),
+        hash_func,
+    ).digest()
+    if not hmac_mod.compare_digest(computed, stored_tag):
+        return None
+    plain = AES.new(aes_key, AES.MODE_CBC, iv).decrypt(body)
+    if page_no == 1:
+        return b"SQLite format 3\x00" + plain + page[4096 - reserve:]
+    return plain + page[4096 - reserve:]
+
+
 def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
     """Decrypt NTQQ nt_msg.db (post-1024-header-strip) to plain SQLite.
 
-    Uses the verified kdf=SHA-512 + hmac=SHA-1 + reserve=48 combo for
-    NTQQ 9.9.x.
+    Resolves the DB's HMAC-verified current/legacy cipher tuple from page 1,
+    authenticates every main page, then validates and applies committed WAL
+    frames through the copied WAL-index ``mxFrame``.
 
     NTQQ 9.9.x parameters (confirmed by passphrase verify):
       - Key:       16-char ASCII passphrase ({XXXXX...) — wrapper.node sqlite3_key_v2
@@ -696,15 +810,6 @@ def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
       - Reserve:   48 (16 IV + 20 HMAC + 12 padding) — HMAC-SHA1 default
       - HMAC:      SHA-1 (only for verify, not decrypt)
     """
-    try:
-        from Crypto.Cipher import AES
-    except ImportError:
-        try:
-            from Cryptodome.Cipher import AES
-        except ImportError:
-            logger.warning("pycryptodome not installed — cannot decrypt DB")
-            return False
-
     if isinstance(key, str):
         key_bytes = key.encode("ascii")
     else:
@@ -712,7 +817,6 @@ def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
 
     PAGE_SZ = 4096
     SALT_SZ = 16
-    RESERVE = 48  # NTQQ 9.9.x: 16 IV + 20 HMAC-SHA1 + 12 padding
     KEY_SZ = 32
 
     try:
@@ -723,30 +827,88 @@ def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
         with open(db_path, "rb") as f, open(output_path, "wb") as out:
             first = f.read(PAGE_SZ)
             if len(first) < PAGE_SZ:
-                out.write(first)
                 logger.warning(f"DB too small to decrypt: {db_path.name}")
                 return False
             salt = first[:SALT_SZ]
-            enc_key = hashlib.pbkdf2_hmac("sha512", key_bytes, salt, 4000, dklen=KEY_SZ)
-            # Page 1: salt at beginning, then encrypted body
-            iv = first[PAGE_SZ - RESERVE:PAGE_SZ - RESERVE + 16]
-            dec = AES.new(enc_key, AES.MODE_CBC, iv).decrypt(first[SALT_SZ:PAGE_SZ - RESERVE])
-            out.write(b"SQLite format 3\x00" + dec + first[PAGE_SZ - RESERVE:])
+            resolved = _resolve_qq_cipher(key_bytes, first)
+            if resolved is None:
+                raise OSError("page-1 HMAC does not match the supplied key")
+            kdf, hmac_algo, reserve = resolved
+            aes_key = hashlib.pbkdf2_hmac(
+                kdf, key_bytes, salt, 4000, dklen=KEY_SZ
+            )
+            mac_salt = bytes(value ^ 0x3A for value in salt)
+            mac_key = hashlib.pbkdf2_hmac(
+                kdf, aes_key, mac_salt, 2, dklen=KEY_SZ
+            )
+            plain = _decrypt_qq_page(
+                first,
+                page_no=1,
+                salt=salt,
+                aes_key=aes_key,
+                mac_key=mac_key,
+                hmac_algo=hmac_algo,
+                reserve=reserve,
+            )
+            if plain is None:
+                raise OSError("page 1 authentication failed")
+            out.write(plain)
             pages = 1
             while True:
                 page = f.read(PAGE_SZ)
-                if len(page) < PAGE_SZ:
-                    if page:
-                        out.write(page)
+                if not page:
                     break
-                iv = page[PAGE_SZ - RESERVE:PAGE_SZ - RESERVE + 16]
-                dec = AES.new(enc_key, AES.MODE_CBC, iv).decrypt(page[:PAGE_SZ - RESERVE])
-                out.write(dec + page[PAGE_SZ - RESERVE:])
+                if len(page) != PAGE_SZ:
+                    raise OSError("encrypted DB has a truncated trailing page")
+                page_no = pages + 1
+                plain = _decrypt_qq_page(
+                    page,
+                    page_no=page_no,
+                    salt=salt,
+                    aes_key=aes_key,
+                    mac_key=mac_key,
+                    hmac_algo=hmac_algo,
+                    reserve=reserve,
+                )
+                if plain is None:
+                    raise OSError(f"page {page_no} authentication failed")
+                out.write(plain)
                 pages += 1
 
-        logger.info(f"Decrypted {pages} pages reserve={RESERVE} (streaming) -> {output_path}")
+        from chatlog_keeper.core._wal import apply_wal
+        wal_path = db_path.with_name(db_path.name + "-wal")
+        shm_path = db_path.with_name(db_path.name + "-shm")
+        wal_frames = apply_wal(
+            wal_path,
+            output_path,
+            lambda page, page_no: _decrypt_qq_page(
+                page,
+                page_no=page_no,
+                salt=salt,
+                aes_key=aes_key,
+                mac_key=mac_key,
+                hmac_algo=hmac_algo,
+                reserve=reserve,
+            ),
+            shm_path=shm_path,
+            expected_page_size=PAGE_SZ,
+        )
+        logger.info(
+            "Decrypted %d main pages + %d committed WAL frames "
+            "kdf=%s hmac=%s reserve=%d (streaming) -> %s",
+            pages,
+            wal_frames,
+            kdf,
+            hmac_algo,
+            reserve,
+            output_path,
+        )
         return True
     except Exception as e:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         logger.warning(f"Decryption failed for {db_path.name}: {e}")
         return False
 
@@ -1835,7 +1997,6 @@ class QQDBReader:
         if hours is not None:
             days = max(1, int(hours / 24) or 1)
 
-        import shutil
         tmp_dir = tempfile.mkdtemp(prefix="qq_db_")
 
         try:
@@ -1859,17 +2020,16 @@ class QQDBReader:
                 group_src = nt_db_dir / "group_info.db"
                 tmp_path = Path(tmp_dir)
                 if profile_src.exists():
-                    # Copy first (some NTQQ dbs are locked while QQ.exe runs)
-                    profile_copy = tmp_path / "profile_info_src.db"
-                    shutil.copy2(profile_src, profile_copy)
-                    profile_dec = _decrypt_aux_db(profile_copy, self.key, tmp_path)
+                    profile_dec = _decrypt_aux_db(
+                        profile_src, self.key, tmp_path
+                    )
                     if profile_dec:
                         buddy_map = _build_buddy_name_map(profile_dec)
                         logger.info(f"buddy_map loaded: {len(buddy_map)} entries")
                 if group_src.exists():
-                    group_copy = tmp_path / "group_info_src.db"
-                    shutil.copy2(group_src, group_copy)
-                    group_dec = _decrypt_aux_db(group_copy, self.key, tmp_path)
+                    group_dec = _decrypt_aux_db(
+                        group_src, self.key, tmp_path
+                    )
                     if group_dec:
                         group_map = _build_group_member_map(group_dec)
                         logger.info(f"group_member_map loaded: {len(group_map)} entries")
@@ -1985,7 +2145,7 @@ class QQDBReader:
             "db_path": str(self.db_path) if self.db_path else None,
             "qq_pids": list(pids),
             "key_extracted": self.key is not None,
-            "key_hex": self.key.hex() if self.key else None,
+            "key_length": len(self.key) if self.key else 0,
         }
 
 

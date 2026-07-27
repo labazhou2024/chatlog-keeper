@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .core._secrets import private_text_writer
+
 __all__ = ["export_json", "export_html"]
 
 
@@ -57,8 +59,7 @@ def _is_self(m: Dict[str, Any]) -> bool:
 def export_json(messages: List[Dict[str, Any]], path) -> int:
     """Write the raw message list to ``path`` as pretty UTF-8 JSON. Returns count."""
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f:
+    with private_text_writer(p) as f:
         json.dump(messages, f, ensure_ascii=False, indent=2)
     return len(messages)
 
@@ -123,8 +124,6 @@ def export_html(messages: List[Dict[str, Any]], path, *,
     separators. Your own messages sit on the right (green bubble), like the app.
     """
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-
     # group by conversation, each ordered by time
     chats: Dict[str, List[Dict[str, Any]]] = {}
     for m in messages:
@@ -176,6 +175,6 @@ def export_html(messages: List[Dict[str, Any]], path, *,
                  "Generated locally by chatlog-keeper — nothing was ever uploaded.</footer>")
     parts.append("</div></body></html>")
 
-    with open(p, "w", encoding="utf-8") as f:
+    with private_text_writer(p) as f:
         f.write("".join(parts))
     return len(messages)

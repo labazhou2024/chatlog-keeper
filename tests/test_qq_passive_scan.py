@@ -1,5 +1,6 @@
 import inspect
 import time
+from pathlib import Path
 
 from chatlog_keeper import qq_db
 
@@ -54,3 +55,18 @@ def test_qq_passive_logs_never_include_key_preview():
     source = inspect.getsource(qq_db)
     assert "preview={candidate" not in source
     assert "Passphrase extracted: len={len(key)} preview=" not in source
+
+
+def test_qq_verification_read_is_bounded(monkeypatch, tmp_path):
+    db = tmp_path / "nt_msg.db"
+    db.write_bytes(b"H" * 5120 + b"unrelated trailing database pages")
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda self: (_ for _ in ()).throw(
+            AssertionError("whole-file read is forbidden")
+        ),
+    )
+
+    value = qq_db._read_qq_verification_bytes(db)
+    assert value == b"H" * 5120
