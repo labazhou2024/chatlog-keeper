@@ -21,6 +21,7 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
@@ -80,6 +81,10 @@ def _get_weixin_pids() -> list:
     the SQLCipher enc_keys in heap. This avoids the repeated "Key extraction
     failed" log spam that happens when descending order tries worker pids first.
     """
+    if sys.platform == "darwin":
+        from chatlog_keeper.core._macos import process_pids
+        return process_pids(("WeChat", "Weixin"))
+
     # A 5s tasklist timeout was too tight on loaded systems (caused a false
     # "Weixin.exe not running" when many Weixin instances + concurrent Python
     # processes saturated the tasklist response). Use 30s + retry once on
@@ -133,13 +138,17 @@ def find_weixin_data_root() -> Optional[Path]:
     env = os.environ.get("CHATLOG_WECHAT_DATA_ROOT", "").strip()
     if env:
         candidates.append(Path(env))
-    for drive in all_drive_roots():
-        candidates.append(drive / "wechat files" / "xwechat_files")
-        candidates.append(drive / "xwechat_files")
-        candidates.append(drive / "WeChat Files")
-    for doc in candidate_documents_roots():
-        candidates.append(doc / "xwechat_files")
-        candidates.append(doc / "WeChat Files")
+    if sys.platform == "darwin":
+        from chatlog_keeper.core._macos import wechat_data_roots
+        candidates.extend(wechat_data_roots())
+    else:
+        for drive in all_drive_roots():
+            candidates.append(drive / "wechat files" / "xwechat_files")
+            candidates.append(drive / "xwechat_files")
+            candidates.append(drive / "WeChat Files")
+        for doc in candidate_documents_roots():
+            candidates.append(doc / "xwechat_files")
+            candidates.append(doc / "WeChat Files")
 
     seen: set = set()
     for c in candidates:
@@ -324,12 +333,18 @@ def save_cached_wechat_key(key: bytes) -> bool:
     if not key or len(key) != 32:
         return False
     p = _wechat_key_cache_path()
+    from chatlog_keeper.core._secrets import write_secret_text
+    return write_secret_text(p, bytes(key).hex())
+
+
+def _read_stable_page1(db_path: Path) -> Optional[bytes]:
+    """Return a checkpoint-safe SQLCipher page 1, or ``None`` if still busy."""
+    from chatlog_keeper.core._snapshot import read_stable_prefix
+
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(bytes(key).hex(), encoding="utf-8")
-        return True
+        return read_stable_prefix(Path(db_path), 4096)
     except OSError:
-        return False
+        return None
 
 
 def _scan_memory_for_key(pid: int, db_path: Path = None,
@@ -341,6 +356,21 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
     in process heap as plain ASCII.  We scan all readable regions for this
     pattern and validate each candidate with HMAC-SHA512 against db_path page 1.
     """
+    if sys.platform == "darwin":
+        if not db_path or not Path(db_path).is_file():
+            return None
+        db_page1 = _read_stable_page1(Path(db_path))
+        if not db_page1:
+            return None
+        from chatlog_keeper.macos_key import extract_verified
+        return extract_verified(
+            "wechat",
+            pid,
+            lambda candidate: _verify_key_v4(candidate, db_page1),
+            elevate=False,
+            timeout=max(1, int(timeout_s or 120)),
+        )
+
     kernel32 = ctypes.windll.kernel32
     PROCESS_VM_READ = 0x0010
     PROCESS_QUERY_INFORMATION = 0x0400
@@ -457,11 +487,7 @@ def extract_key_from_weixin(pid: int, db_path: Path = None,
     """
     db_page1 = None
     if db_path and Path(db_path).exists():
-        try:
-            with open(db_path, "rb") as f:
-                db_page1 = f.read(4096)
-        except OSError:
-            db_page1 = None
+        db_page1 = _read_stable_page1(Path(db_path))
 
     # 1. Cache fast-path (self-healing: only used if it HMAC-verifies the live DB).
     if db_page1:
@@ -487,6 +513,18 @@ def extract_key_from_weixin(pid: int, db_path: Path = None,
 # ─── Database decryption ──────────────────────────────────────────────────────
 
 def _decrypt_db_v4(db_path: Path, enc_key: bytes, output_path: Path) -> bool:
+    """Snapshot the live DB family, then decrypt main DB and committed WAL."""
+    from chatlog_keeper.core._snapshot import snapshot_db_family
+
+    try:
+        with snapshot_db_family(db_path) as snapshot:
+            return _decrypt_db_v4_snapshot(snapshot, enc_key, output_path)
+    except OSError as exc:
+        logger.warning("Could not snapshot %s: %s", Path(db_path).name, exc)
+        return False
+
+
+def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) -> bool:
     """
     Decrypt a Weixin 4.x SQLCipher DB to plain SQLite.
 
@@ -542,11 +580,76 @@ def _decrypt_db_v4(db_path: Path, enc_key: bytes, output_path: Path) -> bool:
                 out.write(dec + page[PAGE_SZ - RESERVE:])
                 pages += 1
 
-        logger.info(f"Decrypted {pages} pages (streaming) → {output_path}")
+        wal_frames = _apply_wechat_wal(
+            db_path.with_name(db_path.name + "-wal"),
+            page_key,
+            first[:SALT_SZ],
+            output_path,
+        )
+        logger.info(
+            "Decrypted %d main pages + %d committed WAL frames (streaming) → %s",
+            pages,
+            wal_frames,
+            output_path,
+        )
         return True
     except Exception as e:
         logger.warning(f"Decryption failed for {db_path.name}: {e}")
         return False
+
+
+def _decrypt_wal_page(page: bytes, page_key: bytes, salt: bytes, page_no: int) -> Optional[bytes]:
+    """HMAC-verify and decrypt one SQLCipher-4 WAL page image."""
+    try:
+        from Crypto.Cipher import AES
+    except ImportError:
+        try:
+            from Cryptodome.Cipher import AES
+        except ImportError:
+            return None
+    page_size = 4096
+    reserve = 80
+    if len(page) != page_size or page_no <= 0:
+        return None
+    mac_salt = bytes(b ^ 0x3A for b in salt)
+    mac_key = hashlib.pbkdf2_hmac("sha512", page_key, mac_salt, 2, dklen=32)
+    prefix = 16 if page_no == 1 else 0
+    hm = hmac_mod.new(mac_key, page[prefix: page_size - 64], hashlib.sha512)
+    hm.update(struct.pack("<I", page_no))
+    if not hmac_mod.compare_digest(hm.digest(), page[page_size - 64:]):
+        return None
+    iv = page[page_size - reserve: page_size - 64]
+    body = AES.new(page_key, AES.MODE_CBC, iv).decrypt(
+        page[prefix: page_size - reserve]
+    )
+    if page_no == 1:
+        return b"SQLite format 3\x00" + body + page[page_size - reserve:]
+    return body + page[page_size - reserve:]
+
+
+def _apply_wechat_wal(
+    wal_path: Path,
+    page_key: bytes,
+    salt: bytes,
+    output_path: Path,
+) -> int:
+    """Apply structurally-valid, HMAC-valid frames through ``mxFrame``."""
+    from chatlog_keeper.core._wal import apply_wal
+
+    shm_path = wal_path.with_name(
+        wal_path.name[:-4] + "-shm"
+        if wal_path.name.endswith("-wal")
+        else wal_path.name + "-shm"
+    )
+    return apply_wal(
+        wal_path,
+        output_path,
+        lambda page, page_no: _decrypt_wal_page(
+            page, page_key, salt, page_no
+        ),
+        shm_path=shm_path,
+        expected_page_size=4096,
+    )
 
 
 # ─── Message reading ──────────────────────────────────────────────────────────
@@ -1602,10 +1705,8 @@ class WeChatDBReader:
         cached = load_cached_wechat_key()
         if cached and len(cached) == 32:
             for db in db_files:
-                try:
-                    with open(db, "rb") as f:
-                        page1 = f.read(4096)
-                except OSError:
+                page1 = _read_stable_page1(db)
+                if not page1:
                     continue
                 if _verify_key_v4(cached, page1):
                     self.enc_keys[db] = cached
@@ -1754,7 +1855,7 @@ class WeChatDBReader:
             if db_key is None:
                 logger.warning(f"Skipping {db_file.name}: no enc_key in self.enc_keys")
                 continue
-            logger.info(f"Querying {db_file.name} (key={db_key.hex()[:16]}...) ...")
+            logger.info("Querying %s with a verified cached key", db_file.name)
             msgs = query_messages_by_date(db_file, target_date, db_key)
             all_messages.extend(msgs)
 
@@ -1817,10 +1918,9 @@ class WeChatDBReader:
             "wxid_dir": str(self.wxid_dir) if self.wxid_dir else None,
             "weixin_pids": list(pids),
             "key_extracted": self.enc_key is not None,
-            "key_hex": self.enc_key.hex() if self.enc_key else None,
+            "key_length": len(self.enc_key) if self.enc_key else 0,
             "db_files_found": [str(f) for f in db_files],
             "per_db_keys_count": len(self.enc_keys),  # 2026-04-30
-            "per_db_keys": {db.name: k.hex()[:16] + "..." for db, k in self.enc_keys.items()},
         }
 
 

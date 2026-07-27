@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 from chatlog_keeper import active_key, qq_db, wechat_db, wechat_image
+from chatlog_keeper.core._secrets import private_binary_writer
 from chatlog_keeper.export import export_html, export_json
 
 
@@ -34,6 +35,14 @@ def _print_json(obj: dict) -> int:
         pass
     print(json.dumps(obj, ensure_ascii=False, indent=2))
     return 0 if obj.get("available", True) and not obj.get("error") else 1
+
+
+def _prepare_output_dir(path: Path) -> None:
+    """Create a new export directory owner-only without altering an existing one."""
+    existed = path.exists()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not existed and os.name != "nt":
+        path.chmod(0o700)
 
 
 # ─── QQ ──────────────────────────────────────────────────────────────────────
@@ -81,7 +90,7 @@ def _export_qq(days: int, out_dir: str) -> dict:
     for m in msgs:
         m["is_self"] = bool(self_qq and m.get("sender_qq") == self_qq)
     out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    _prepare_output_dir(out)
     export_json(msgs, out / "qq_messages.json")
     export_html(msgs, out / "qq_messages.html", title="QQ 聊天记录留存", source="qq")
     return {"source": "qq", "available": True, "n_messages": len(msgs), "days": days,
@@ -158,7 +167,7 @@ def _export_wechat(days: int, out_dir: str) -> dict:
         if d.get("content"):
             msgs.append(d)
     out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    _prepare_output_dir(out)
     export_json(msgs, out / "wechat_messages.json")
     export_html(msgs, out / "wechat_messages.html", title="微信聊天记录留存", source="wechat")
     return {"source": "wechat", "available": True, "n_messages": len(msgs), "days": days,
@@ -184,7 +193,7 @@ def _img_ext(b: bytes) -> str:
 def _decrypt_images(src_dir: str, out_dir: str) -> dict:
     src = Path(src_dir)
     out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    _prepare_output_dir(out)
     n_ok = n_fail = 0
     for dat in src.rglob("*.dat"):
         try:
@@ -198,7 +207,8 @@ def _decrypt_images(src_dir: str, out_dir: str) -> dict:
                 jpg = wechat_image.wxgf_to_jpeg(raw)
                 if jpg:
                     raw, ext = jpg, ".jpg"
-            (out / (dat.stem + ext)).write_bytes(raw)
+            with private_binary_writer(out / (dat.stem + ext)) as handle:
+                handle.write(raw)
             n_ok += 1
         except Exception:  # noqa: BLE001
             n_fail += 1
@@ -278,14 +288,38 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
 
     ``method="passive"`` (default) scans the live client's process memory — low
     ban risk, no debugger; works on older builds, may find nothing on newer
-    WeChat. ``method="active"`` runs the bundled debugger script — higher ban
-    risk (it attaches a debugger), needs Administrator and you logging into the
-    freshly-launched client, but works on the newest builds. Active is opt-in:
-    you accept the higher risk by choosing it explicitly.
+    WeChat. ``method="active"`` runs the platform helper — a debugger
+    breakpoint on Windows or an isolated debug-enabled app copy plus a
+    read-only Mach scan on macOS. It needs administrator authorization and may
+    require logging into the separately-launched client. Active is opt-in.
     """
     force_extract = os.environ.get("CHATLOG_FORCE_EXTRACT", "").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+    def _active_failure(default: str) -> str:
+        if sys.platform != "darwin":
+            return default
+        try:
+            from chatlog_keeper.macos_key import last_error
+            reason = last_error()
+        except Exception:
+            reason = ""
+        if reason == "authorization_cancelled":
+            return "macOS administrator authorization was cancelled"
+        if reason == "authorization_interaction_unavailable":
+            return (
+                "macOS could not show the administrator authorization prompt in this "
+                "session; run the command from the logged-in Mac desktop"
+            )
+        if reason == "process_access_denied":
+            return (
+                "macOS denied read-only process access even after authorization "
+                "(SIP/hardened-runtime policy); the client was not modified"
+            )
+        if reason:
+            return f"macOS key helper failed: {reason}"
+        return "macOS memory scan produced no DB-verified key candidate"
     if method == "auto":
         # Try passive first (low ban risk); fall back to active (newer builds)
         # ONLY if passive finds nothing. Export stays cache-first and never
@@ -306,8 +340,10 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
                         "key_len": len(key), "saved_to": str(qq_db._key_cache_path()),
                         "fresh_extraction": True}
             return {"source": "qq", "method": "active", "ok": False,
-                    "error": "active extraction got no key (not logged into the popped-up QQ / "
-                             "UAC declined / unsupported build)"}
+                    "error": _active_failure(
+                        "active extraction got no key (not logged into the popped-up QQ / "
+                        "UAC declined / unsupported build)"
+                    )}
         reader = qq_db.QQDBReader()
         reader.initialize()  # cache → passive (timeout-bounded) → cache fallback
         key_source = getattr(reader, "key_source", None)
@@ -334,8 +370,10 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
                         "error": "active extraction could not locate message_0.db for HMAC "
                                  "verification (set --data-root to the xwechat_files folder)"}
             return {"source": "wechat", "method": "active", "ok": False,
-                    "error": "active extraction got no key (not logged into the popped-up WeChat / "
-                             "UAC declined / unsupported build)",
+                    "error": _active_failure(
+                        "active extraction got no key (not logged into the popped-up WeChat / "
+                        "UAC declined / unsupported build)"
+                    ),
                     "db_path": db_path}
         if force_extract:
             return {"source": "wechat", "method": "passive", "ok": False,
@@ -386,17 +424,23 @@ def main(argv: list[str] | None = None) -> int:
 
     p_sk = sub.add_parser("set-key", help="manually supply a key when auto-extract can't get it")
     p_sk.add_argument("--source", choices=["qq", "wechat"], required=True)
-    p_sk.add_argument("--key", type=str, required=True,
-                      help="QQ: 16/32-char passphrase; WeChat: 64-hex master key")
+    key_input = p_sk.add_mutually_exclusive_group(required=True)
+    key_input.add_argument("--key", type=str,
+                           help="QQ: 16/32-char passphrase; WeChat: 64-hex master key")
+    key_input.add_argument(
+        "--key-stdin",
+        action="store_true",
+        help="read the key from standard input so it is not exposed in the process list",
+    )
 
     p_ek = sub.add_parser("extract-key",
                           help="acquire + cache a decryption key automatically")
     p_ek.add_argument("--source", choices=["qq", "wechat"], required=True)
     p_ek.add_argument("--method", choices=["auto", "passive", "active"], default="auto",
                       help="auto (default): passive first, fall back to active only if "
-                           "passive finds nothing. passive: scan live process memory - low "
-                           "ban risk, older builds. active: bundled debugger breakpoint - "
-                           "higher ban risk, needs Administrator + login, newest builds.")
+                           "passive finds nothing. passive: read-only scan of the running "
+                           "client. active: Windows debugger or isolated macOS debug copy; "
+                           "needs administrator authorization and may need a separate login.")
     p_ek.add_argument("--data-root", type=str, default=None,
                       help="override the data folder (else auto-detected)")
 
@@ -419,7 +463,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "images":
         return _print_json(_decrypt_images(args.src, args.out))
     if args.cmd == "set-key":
-        return _print_json(_set_key(args.source, args.key))
+        supplied = sys.stdin.read() if args.key_stdin else args.key
+        return _print_json(_set_key(args.source, supplied))
     if args.cmd == "extract-key":
         return _print_json(_extract_key(args.source, args.method, data_root=getattr(args, "data_root", None)))
     return 2

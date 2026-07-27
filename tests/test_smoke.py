@@ -7,6 +7,7 @@ client and your own local data, so it is intentionally out of scope here.
 Run:  python -m pytest -q   (or simply  python tests/test_smoke.py)
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -41,6 +42,9 @@ def test_export_json_and_html(tmp_path):
 
     data = json.loads((tmp_path / "m.json").read_text(encoding="utf-8"))
     assert len(data) == 3
+    if os.name != "nt":
+        assert (tmp_path / "m.json").stat().st_mode & 0o777 == 0o600
+        assert (tmp_path / "m.html").stat().st_mode & 0o777 == 0o600
 
     html = (tmp_path / "m.html").read_text(encoding="utf-8")
     assert "bubble" in html
@@ -57,6 +61,26 @@ def test_img_ext():
     assert _img_ext(b"GIF89a\x00\x00") == ".gif"
     assert _img_ext(b"RIFF\x00\x00\x00\x00WEBP") == ".webp"
     assert _img_ext(b"not-an-image") == ".bin"
+
+
+def test_image_export_creates_private_outputs(monkeypatch, tmp_path):
+    from chatlog_keeper import cli
+
+    src = tmp_path / "source"
+    src.mkdir()
+    (src / "photo.dat").write_bytes(b"encrypted")
+    monkeypatch.setattr(
+        cli.wechat_image, "decrypt_wechat_dat", lambda _path: b"\xff\xd8\xffpayload"
+    )
+
+    out = tmp_path / "private-images"
+    result = cli._decrypt_images(str(src), str(out))
+    image = out / "photo.jpg"
+    assert result["decrypted"] == 1
+    assert image.read_bytes() == b"\xff\xd8\xffpayload"
+    if os.name != "nt":
+        assert out.stat().st_mode & 0o777 == 0o700
+        assert image.stat().st_mode & 0o777 == 0o600
 
 
 if __name__ == "__main__":

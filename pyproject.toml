@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatlog-keeper"
-version = "0.1.1"
+version = "0.2.0"
 description = "Decrypt and export your own local QQ / WeChat chat history for personal backup and nostalgia. Local-only; nothing is uploaded."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -16,6 +16,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -49,4 +50,4 @@ include = ["chatlog_keeper*"]
 
 [tool.setuptools.package-data]
 # Bundle the PowerShell debugger scripts used by `extract-key --method active`.
-chatlog_keeper = ["scripts/*.ps1"]
+chatlog_keeper = ["scripts/*.ps1", "scripts/*.c"]

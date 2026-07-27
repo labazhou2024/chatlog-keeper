@@ -46,6 +46,7 @@ def test_wechat_data_root_discovers_root_level_relocation(monkeypatch, tmp_path)
     relocated = tmp_path / "xwechat_files"
     relocated.mkdir()
     monkeypatch.delenv("CHATLOG_WECHAT_DATA_ROOT", raising=False)
+    monkeypatch.setattr(wechat_db.sys, "platform", "win32")
     monkeypatch.setattr(_paths, "all_drive_roots", lambda: [tmp_path])
     monkeypatch.setattr(_paths, "candidate_documents_roots", lambda: [])
 

@@ -39,14 +39,17 @@
 - **QQ**：导出 NTQQ 本地聊天记录
 - **微信**：导出 WeChat 本地聊天记录
 - **微信图片**：把本地 `.dat` 加密图片还原成 `jpg` / `png`
+- **Windows + macOS**：Windows 11 与 Apple Silicon Mac 使用同一套 CLI 和导出格式
 
 ## 支持的版本
 
-| 来源 | 支持 | page-key 派生 | 怎么拿 key |
+| 平台 | 来源 / 实测客户端 | page-key 派生 | 取 key 方式 |
 |---|---|---|---|
-| 微信 ≤ 4.0.x | ✅ | raw-key（`enc_key` 直接用） | 被动内存扫描 |
-| 微信 4.1.10.31+（2026-05） | ✅ | password 模式 —— `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | 调试器取一次（key 不再以明文留在内存） |
-| QQ NTQQ 9.9.x | ✅ | 每库口令 | 被动扫描 |
+| Windows | 微信 ≤ 4.0.x | raw-key（`enc_key` 直接用） | 被动内存扫描 |
+| Windows | 微信 4.1.10.31+ | password 模式 —— `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | 一次性调试器 |
+| Windows | QQ NTQQ 9.9.x | 每库口令 | 被动扫描或一次性调试器 |
+| macOS arm64 | 微信 4.1.9（build 268575） | 由 page-1 HMAC 自动选择 raw/password 模式 | 被动扫描或隔离调试副本 |
+| macOS arm64 | QQ 6.9.95（build 36385） | 每库口令 | 被动扫描或隔离调试副本 |
 
 **微信 4.1.10.31**（2026-05-27 发布）把明文 key 移出了进程堆，因此被动内存扫描
 ——多数现有工具依赖的方式——在这些版本上**取不到 key**。chatlog-keeper 会对这些
@@ -58,7 +61,7 @@
 
 | 工具 | Star | 最近更新 | 微信 | QQ | 平台 | 备注 |
 |---|---|---|---|---|---|---|
-| **chatlog-keeper**（本项目） | — | 2026-06 | ≤4.0 **+ 4.1.10.31+** | ✅ NTQQ | Windows | 被动扫描 + 调试器兜底 |
+| **chatlog-keeper**（本项目） | — | 2026-07 | ≤4.0 **+ 4.1.x** | ✅ NTQQ | Windows + macOS arm64 | 被动扫描 + 隔离主动流程兜底 |
 | [WeChatMsg / 留痕](https://github.com/LC044/WeChatMsg) | 41k+ | 2025-12 | ≤4.0 | ❌ | Windows | 功能丰富的 GUI；作者声明**不再更新** |
 | [PyWxDump](https://github.com/xaoyaoo/PyWxDump) | 9k+ | 2025-10 | 3.x–4.0 | ❌ | Windows | 仓库描述现为“删库”；已停更 |
 | [chatlog](https://github.com/sjzar/chatlog) | 9k+ | 2025-10 | ≤4.0 | ❌ | 跨平台 | Go；提供 HTTP/MCP API |
@@ -67,9 +70,9 @@
 chatlog-keeper 的不同之处：它是这里唯一能处理 **微信 4.1.10.31+**（key 已离开
 明文内存）、并且**同时导出 QQ（NTQQ）**而不只是微信的工具。
 
-它**不追求**的：**仅 Windows**、是个新项目、刻意以 CLI 为先（JSON/HTML，无 GUI、
-无内置分析）。如果你现在就想要成熟的 GUI 或跨平台支持，上面那些工具更成熟——
-本项目的定位是*兼容最新版微信 + 支持 QQ，且法律边界清晰*。
+它仍是一个新项目，并且刻意以 CLI 为先（JSON/HTML，无内置分析）；macOS 独立包目前
+只覆盖 Apple Silicon。本项目的定位是*在两个桌面平台兼容当前微信 + QQ，且本地与法律
+边界清晰*。
 
 ## 安装
 
@@ -78,8 +81,12 @@ chatlog-keeper 的不同之处：它是这里唯一能处理 **微信 4.1.10.31+
 ```bash
 git clone https://github.com/labazhou2024/chatlog-keeper.git
 cd chatlog-keeper
-pip install -r requirements.txt
+python -m pip install .
 ```
+
+正式 tag 还提供 Windows `chatlog-keeper.exe` 和 Apple Silicon
+`chatlog-keeper-macos-arm64` 独立文件。Mac 独立包已经内置只读 Mach helper；源码安装
+会在首次取 key 时编译这段可审计的 C helper，因此需要 Xcode Command Line Tools。
 
 ## 使用
 
@@ -114,18 +121,28 @@ python -m chatlog_keeper.cli extract-key --source wechat
 # 只用被动扫描（封号风险最低；新版微信 4.1.10.31+ 可能取不到）
 python -m chatlog_keeper.cli extract-key --source wechat --method passive
 
-# 只用调试器取 key（能取新版，封号风险更高——见“封号风险”；需管理员+登录一次）
+# 只走主动流程（新版；需系统管理员授权，隔离客户端可能要再登录一次）
 python -m chatlog_keeper.cli extract-key --source wechat --method active
 
-# 如果移动过微信数据目录，可显式指定 xwechat_files 文件夹
+# 如果移动过微信数据目录，可显式指定 xwechat_files 文件夹（Windows 示例）
 python -m chatlog_keeper.cli extract-key --source wechat --method active --data-root "E:\xwechat_files"
+
+# macOS 示例
+python -m chatlog_keeper.cli extract-key --source wechat --method active \
+  --data-root "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
 
 # 手动粘贴（你用其它工具拿到 key 之后）
 python -m chatlog_keeper.cli set-key --source wechat --key <64位十六进制>
 python -m chatlog_keeper.cli set-key --source qq --key <16位口令>
 ```
 
-取到的 key 会缓存在本机（`%LOCALAPPDATA%\chatlog-keeper\data\secrets\`），之后导出直接复用，无需重复获取。
+取到的 key 会缓存在本机，之后导出直接复用：
+
+- Windows：`%LOCALAPPDATA%\chatlog-keeper\data\secrets\`
+- macOS：`~/Library/Application Support/chatlog-keeper/secrets/`
+
+macOS 上 secrets 目录权限为 `0700`，每个 key 文件为 `0600`。详细见
+[macOS 安全与排障说明](docs/macos.zh.md)。
 
 ## 封号风险
 
@@ -137,7 +154,8 @@ python -m chatlog_keeper.cli set-key --source qq --key <16位口令>
 |---|---|---|
 | 读本地数据库文件 | 极低（≈0） | 纯文件读取，不碰网络，服务器无从感知 |
 | 被动内存扫描取 key（默认） | 低 | 只读进程内存（不注入、不 hook、不附加调试器）；社区主流工具长期采用，未见因此被封的实证 |
-| 调试器断点取 key（`--method active`） | 中–偏高 | 会附加调试器到客户端进程，是唯一有实证检测机制的路径（客户端可能检测“被调试 / 加载非白名单模块”）。仅在被动取不到时再用，自行权衡 |
+| Windows 主动取 key | 中–偏高 | 启动独立受调试客户端，在密码边界读取 key；仅在被动方式失败时使用 |
+| macOS 主动取 key | 权限较高 / 兼容性敏感 | 不修改原应用、不关闭 SIP；启动私有 ad-hoc 签名副本，经管理员授权做只读 Mach 扫描 |
 
 降低风险：优先用默认的被动方式；能用缓存就不重复取 key；取到 key 后甚至可以退出客户端、离线解密；**绝不**用本工具做任何服务器侧自动化操作（那才是真正的封号高发区）。
 
@@ -152,6 +170,9 @@ python -m chatlog_keeper.cli set-key --source qq --key <16位口令>
 
 > 解密采用逐页流式处理（峰值内存约等于一个 4 KB 内存页），即使是好几个 GB 的数据库，
 > 也不会被整个读进内存。
+
+对正在使用的数据库，工具会先一致性快照 `db`、`-wal`、`-shm` 文件族；APFS 上使用
+clone-copy。微信已提交的 WAL frame 会先逐页通过 HMAC 校验，再写入解密副本。
 
 ## 法律与免责
 
