@@ -296,25 +296,33 @@ def test_wechat_plaintext_cache_is_private_and_expires_without_next_read(tmp_pat
         wechat_db._decrypt_cache_clear()
 
 
-def test_wechat_plaintext_cache_hit_refreshes_idle_expiry(tmp_path):
+def test_wechat_plaintext_cache_hit_refreshes_idle_expiry(monkeypatch, tmp_path):
     wechat_db._decrypt_cache_clear()
+    timer_type, timers = _manual_timer_type()
+    monkeypatch.setattr(wechat_db.threading, "Timer", timer_type)
+    now = [100.0]
+    monkeypatch.setattr(wechat_db._time, "monotonic", lambda: now[0])
     key = bytes(range(32))
     salt = bytes(range(16))
     encrypted = tmp_path / "message.db"
     encrypted.write_bytes(_encrypted_page(key, salt, 1, b"A"))
 
     try:
-        first = wechat_db._decrypt_with_cache(encrypted, key, ttl=0.12)
+        first = wechat_db._decrypt_with_cache(encrypted, key, ttl=10)
         assert first is not None
-        time.sleep(0.07)
-        second = wechat_db._decrypt_with_cache(encrypted, key, ttl=0.12)
+        first_timer = timers[-1]
+        now[0] += 6
+        second = wechat_db._decrypt_with_cache(encrypted, key, ttl=10)
         assert second == first
-        time.sleep(0.07)
-        assert first.exists()
+        assert first_timer.cancelled is True
 
-        deadline = time.monotonic() + 2
-        while first.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
+        # A callback already queued before cancel() cannot expire the refreshed
+        # generation.  Its replacement remains alive until ten idle seconds
+        # after the cache hit, independent of runner scheduling latency.
+        first_timer.fire()
+        assert first.exists()
+        now[0] += 11
+        timers[-1].fire()
         assert not first.exists()
     finally:
         wechat_db._decrypt_cache_clear()

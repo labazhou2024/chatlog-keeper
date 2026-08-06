@@ -9,7 +9,6 @@ that non-hardened private copy, before automatic login begins.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import fcntl
 import hashlib
 import os
 import plistlib
@@ -25,6 +24,11 @@ from pathlib import Path
 from typing import BinaryIO, Optional
 
 from chatlog_keeper.core._path_resolver import data_dir
+
+try:  # pragma: no cover - Windows imports this module for shared CLI dispatch.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised by Windows CI collection.
+    fcntl = None  # type: ignore[assignment]
 
 _APPS = {
     "wechat": (Path("/Applications/WeChat.app"), "WeChat"),
@@ -911,6 +915,8 @@ def _wait_for_stable_pid(
 
 
 def _acquire_launch_lock(root: Path, source: str) -> Optional[BinaryIO]:
+    if fcntl is None:
+        return None
     root.mkdir(parents=True, exist_ok=True)
     root.chmod(0o700)
     lock_path = root / f".{source}-active.lock"
@@ -930,10 +936,11 @@ def _acquire_launch_lock(root: Path, source: str) -> Optional[BinaryIO]:
 def _release_launch_lock(handle: Optional[BinaryIO]) -> None:
     if handle is None:
         return
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
     try:
         handle.close()
     except OSError:
