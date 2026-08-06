@@ -327,37 +327,73 @@ def test_qq_sender_zero_uses_stable_uid_and_never_merges_distinct_people() -> No
 
 
 @pytest.mark.parametrize("include_uid_column", [False, True])
-def test_qq_sender_zero_without_stable_uid_fails_closed(
+def test_qq_sender_zero_without_stable_uid_uses_one_anonymous_bucket(
     include_uid_column: bool,
 ) -> None:
     connection = sqlite3.connect(":memory:")
     uid_column = ', "40020" TEXT' if include_uid_column else ""
     connection.execute(
         'CREATE TABLE group_msg_table ('
-        f'"40021" INTEGER, "40033" INTEGER, "40090" TEXT{uid_column})'
+        f'"40021" INTEGER, "40033" INTEGER, "40090" TEXT, '
+        f'"40800" BLOB{uid_column})'
     )
     if include_uid_column:
-        connection.execute(
+        connection.executemany(
             'INSERT INTO group_msg_table '
-            '("40021", "40033", "40090", "40020") '
-            "VALUES (888, 0, '', NULL)"
+            '("40021", "40033", "40090", "40800", "40020") '
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (888, 0, "", b"private-system-a", None),
+                (888, 0, "Must not become identity", b"private-system-b", ""),
+                (888, 10001, "Known", b"private-known", None),
+            ],
         )
     else:
-        connection.execute(
-            'INSERT INTO group_msg_table ("40021", "40033", "40090") '
-            "VALUES (888, 0, '')"
+        connection.executemany(
+            'INSERT INTO group_msg_table '
+            '("40021", "40033", "40090", "40800") VALUES (?, ?, ?, ?)',
+            [
+                (888, 0, "", b"private-system-a"),
+                (888, 0, "Must not become identity", b"private-system-b"),
+                (888, 10001, "Known", b"private-known"),
+            ],
         )
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
 
-    with pytest.raises(participant_protocol.ParticipantProtocolError) as raised:
-        participant_directory._qq_observed_senders(
-            connection,
-            conversation_id="888",
-            conversation_type="group",
-            profile_identities={},
-            group_labels={},
-        )
+    rows = participant_directory._qq_observed_senders(
+        connection,
+        conversation_id="888",
+        conversation_type="group",
+        profile_identities={},
+        group_labels={},
+    )
 
-    assert raised.value.code == "bad_schema"
+    by_id = {item["participant_id"]: item for item in rows}
+    assert set(by_id) == {
+        participant_directory._QQ_UNATTRIBUTED_SENDER_ID,
+        "10001",
+    }
+    assert by_id[participant_directory._QQ_UNATTRIBUTED_SENDER_ID] == {
+        "participant_id": participant_directory._QQ_UNATTRIBUTED_SENDER_ID,
+        "label": "",
+        "label_provenance": "anonymous",
+        "observed_message_count": 2,
+    }
+    assert by_id["10001"]["observed_message_count"] == 1
+    page = participant_protocol.build_page(
+        participant_protocol.parse_request(_request(view="sender")),
+        rows,
+        coverage="observed_senders_complete",
+    )
+    assert len(page["participants"]) == 2
+    selects = "\n".join(
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+    )
+    assert "40800" not in selects
+    assert "private-system" not in selects
 
 
 def test_wechat_current_members_require_proven_join_and_keep_no_nickname() -> None:

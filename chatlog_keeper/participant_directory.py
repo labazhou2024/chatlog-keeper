@@ -16,6 +16,9 @@ from chatlog_keeper import participant_protocol, qq_db, wechat_db
 from chatlog_keeper.core._snapshot import snapshot_db_families
 
 
+_QQ_UNATTRIBUTED_SENDER_ID = "qq:unattributed-sender:v1"
+
+
 def _single_line(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()[: participant_protocol.MAX_LABEL_CHARS]
 
@@ -123,15 +126,6 @@ def _qq_observed_senders(
     ).fetchone()
     if missing and int(missing[0] or 0) > 0:
         raise participant_protocol.ParticipantProtocolError("bad_schema")
-    missing_stable_identity = connection.execute(
-        f'SELECT COUNT(*) FROM "{table}" '
-        f'WHERE "{conversation_column}" = ? '
-        f'AND CAST("{qq_db._NTQQ_COL_SENDER_UIN}" AS INTEGER) = 0 '
-        f'AND {sender_uid_expression} IS NULL',
-        (conversation_id,),
-    ).fetchone()
-    if missing_stable_identity and int(missing_stable_identity[0] or 0) > 0:
-        raise participant_protocol.ParticipantProtocolError("bad_schema")
     rows = connection.execute(
         f'SELECT "{qq_db._NTQQ_COL_SENDER_UIN}", '
         f'CASE WHEN CAST("{qq_db._NTQQ_COL_SENDER_UIN}" AS INTEGER) = 0 '
@@ -152,14 +146,18 @@ def _qq_observed_senders(
             raise participant_protocol.ParticipantProtocolError("bad_schema")
         if numeric_uin < 0:
             raise participant_protocol.ParticipantProtocolError("bad_schema")
+        normalized_uid = str(raw_uid or "").strip()
+        unattributed = numeric_uin == 0 and not normalized_uid
         participant_id = (
-            str(numeric_uin)
-            if numeric_uin != 0
-            else str(raw_uid or "").strip()
+            _QQ_UNATTRIBUTED_SENDER_ID
+            if unattributed
+            else str(numeric_uin) if numeric_uin != 0 else normalized_uid
         )
-        if not participant_id:
-            raise participant_protocol.ParticipantProtocolError("bad_schema")
-        label = _single_line(raw_name)
+        # NTQQ persists system/unattributed rows with the explicit UIN zero
+        # sentinel and no stable UID.  They prove an observed anonymous sender
+        # bucket, not a malformed person identity.  Never promote an optional
+        # display name into an identifier or merge it with a known sender.
+        label = "" if unattributed else _single_line(raw_name)
         label_provenance = "historical_message" if label else "anonymous"
         if (
             numeric_uin != 0

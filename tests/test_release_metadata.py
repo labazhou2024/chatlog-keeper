@@ -24,16 +24,16 @@ SPEC.loader.exec_module(release_metadata)
 
 def test_version_contract_requires_tag_module_and_installed_metadata_agreement() -> None:
     assert release_metadata.validate_version_contract(
-        tag="v0.3.1",
-        module_version="0.3.1",
-        metadata_version="0.3.1",
-    ) == "0.3.1"
+        tag="v0.3.2",
+        module_version="0.3.2",
+        metadata_version="0.3.2",
+    ) == "0.3.2"
 
     with pytest.raises(release_metadata.ReleaseMetadataError, match="differ"):
         release_metadata.validate_version_contract(
-            tag="v0.3.1",
-            module_version="0.3.1",
-            metadata_version="0.3.0",
+            tag="v0.3.2",
+            module_version="0.3.2",
+            metadata_version="0.3.1",
         )
 
 
