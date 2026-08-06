@@ -54,7 +54,11 @@ param(
     # the user already has QQ open (the common case). Default $true → close any
     # running QQ first. Pass -KillExisting:$false to keep the old behavior.
     [Parameter()]
-    [bool]$KillExisting = $true
+    [bool]$KillExisting = $true,
+
+    [Parameter()]
+    [ValidateRange(1, 3600)]
+    [int]$TimeoutSeconds = 600
 )
 
 Set-StrictMode -Version 2.0
@@ -69,6 +73,26 @@ $ErrorActionPreference = 'Stop'
 # `exit $LASTEXITCODE` re-ran the whole script (twice-launched debugged QQ).
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 #endregion
+
+function Resolve-TencentSignedFile {
+    [CmdletBinding()] [OutputType([string])] param(
+        [Parameter(Mandatory = $true)] [string]$LiteralPath,
+        [Parameter(Mandatory = $true)] [string]$Label
+    )
+    $resolved = (Resolve-Path -LiteralPath $LiteralPath -ErrorAction Stop).Path
+    $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "$Label is not a trusted regular file"
+    }
+    $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $resolved
+    if (-not $signature -or $signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or -not $signature.SignerCertificate) {
+        throw "$Label has no valid Authenticode signature"
+    }
+    if (([string]$signature.SignerCertificate.Subject) -notmatch '(?i)(Tencent|腾讯)') {
+        throw "$Label is not signed by Tencent"
+    }
+    return $resolved
+}
 
 #region P/Invoke Definitions for Debugging
 
@@ -331,6 +355,7 @@ namespace DebugApi
         private readonly ulong _functionRva;
         private readonly Action<string> _log;
         private readonly Action<string> _logVerbose;
+        private readonly DateTime _deadlineUtc;
 
         private IntPtr _hProcess = IntPtr.Zero;
         private IntPtr _hThread = IntPtr.Zero;
@@ -341,12 +366,13 @@ namespace DebugApi
         private bool _breakpointActive;
         private Dictionary<uint, ulong> _steppingThreads = new Dictionary<uint, ulong>();
 
-        public KeyExtractor(string qqExePath, ulong functionRva, Action<string> log, Action<string> logVerbose)
+        public KeyExtractor(string qqExePath, ulong functionRva, Action<string> log, Action<string> logVerbose, int timeoutSeconds)
         {
             _qqExePath = qqExePath;
             _functionRva = functionRva;
             _log = log ?? (s => { });
             _logVerbose = logVerbose ?? (s => { });
+            _deadlineUtc = DateTime.UtcNow.AddSeconds(Math.Max(1, timeoutSeconds));
         }
 
         public string ExtractKey()
@@ -488,8 +514,14 @@ namespace DebugApi
 
             while (shouldContinue)
             {
-                // Wait for debug event with 10 second timeout (like Rust implementation)
-                if (!Native.WaitForDebugEvent(out debugEvent, 10000))
+                double remainingMs = (_deadlineUtc - DateTime.UtcNow).TotalMilliseconds;
+                if (remainingMs <= 0)
+                {
+                    _log("等待登录/密钥超时，已安全结束调试实例");
+                    break;
+                }
+                uint waitMs = (uint)Math.Max(1, Math.Min(10000, remainingMs));
+                if (!Native.WaitForDebugEvent(out debugEvent, waitMs))
                 {
                     int error = Marshal.GetLastWin32Error();
                     // Timeout (ERROR_SEM_TIMEOUT = 121) is normal, continue waiting
@@ -959,6 +991,13 @@ function Get-InstalledQQInfo {
         throw "QQ.exe not found at: $qqExe"
     }
 
+    $qqExe = Resolve-TencentSignedFile -LiteralPath $qqExe -Label 'QQ.exe'
+    $wrapperNode = Resolve-TencentSignedFile -LiteralPath $wrapperNode -Label 'wrapper.node'
+    $root = [IO.Path]::GetFullPath($installDir).TrimEnd('\') + '\'
+    if (-not ([IO.Path]::GetFullPath($wrapperNode).StartsWith($root, [StringComparison]::OrdinalIgnoreCase))) {
+        throw 'wrapper.node is outside the trusted QQ installation root'
+    }
+
     return @{
         InstallDir      = $installDir
         Version         = $version
@@ -971,18 +1010,21 @@ function Get-InstalledQQInfo {
 
 #region Main Script
 
-# Detect installed QQ if no path specified
-$qqInfo = $null
-if (-not $WrapperNodePath) {
-    Write-Host "正在自动检测已安装的QQ..." -ForegroundColor Yellow
-    $qqInfo = Get-InstalledQQInfo
-    $WrapperNodePath = $qqInfo.WrapperNodePath
-    Write-Host "找到QQ安装信息:" -ForegroundColor Green
-    Write-Host "  安装目录: $($qqInfo.InstallDir)" -ForegroundColor Cyan
-    Write-Host "  版本: $($qqInfo.Version)" -ForegroundColor Cyan
-    Write-Host "  wrapper.node: $WrapperNodePath" -ForegroundColor Cyan
-    Write-Host ""
+# Detect the trusted installation independently of caller-controlled paths.
+Write-Host "正在自动检测已安装的QQ..." -ForegroundColor Yellow
+$qqInfo = Get-InstalledQQInfo
+if ($WrapperNodePath) {
+    $requestedWrapper = (Resolve-Path -LiteralPath $WrapperNodePath -ErrorAction Stop).Path
+    if (-not [string]::Equals($requestedWrapper, $qqInfo.WrapperNodePath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw '显式 wrapper.node 与可信 QQ 安装不匹配'
+    }
 }
+$WrapperNodePath = $qqInfo.WrapperNodePath
+Write-Host "找到QQ安装信息:" -ForegroundColor Green
+Write-Host "  安装目录: $($qqInfo.InstallDir)" -ForegroundColor Cyan
+Write-Host "  版本: $($qqInfo.Version)" -ForegroundColor Cyan
+Write-Host "  wrapper.node: $WrapperNodePath" -ForegroundColor Cyan
+Write-Host ""
 
 # Resolve the path
 $resolvedPath = Resolve-Path -Path $WrapperNodePath -ErrorAction Stop
@@ -1225,10 +1267,6 @@ if (-not ([System.Management.Automation.PSTypeName]'DebugApi.KeyExtractor').Type
     Add-Type -TypeDefinition $DebugApiCode -Language CSharp
 }
 
-if (-not $qqInfo) {
-    $qqInfo = Get-InstalledQQInfo
-}
-
 # NOTE: close any running QQ BEFORE launching the debugged instance.
 # QQ is single-instance, so a new DEBUG_ONLY_THIS_PROCESS QQ.exe would be killed
 # by the existing instance's singleton guard before the breakpoint fires. Kill,
@@ -1265,7 +1303,8 @@ $extractor = New-Object DebugApi.KeyExtractor(
     $qqInfo.QQExePath,
     [uint64]$functionBeginRVA,
     $logAction,
-    $logVerboseAction
+    $logVerboseAction,
+    $TimeoutSeconds
 )
 
 try {

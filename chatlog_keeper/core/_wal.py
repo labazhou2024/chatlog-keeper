@@ -16,10 +16,15 @@ from typing import Callable, Optional
 _WAL_MAGIC_LITTLE_CHECKSUM = 0x377F0682
 _WAL_MAGIC_BIG_CHECKSUM = 0x377F0683
 _WAL_VERSION = 3007000
+_IGNORE_WAL_INDEX = object()
 
 
 class WalValidationError(OSError):
     """The WAL family cannot be proven structurally consistent."""
+
+
+class WalIndexValidationError(WalValidationError):
+    """The rebuildable ``-shm`` header itself cannot be trusted."""
 
 
 @dataclass(frozen=True)
@@ -71,12 +76,14 @@ def _read_shm_state(
         with shm_path.open("rb") as handle:
             raw = handle.read(96)
     except OSError as exc:
-        raise WalValidationError(f"cannot read WAL index: {type(exc).__name__}") from exc
+        raise WalIndexValidationError(
+            f"cannot read WAL index: {type(exc).__name__}"
+        ) from exc
     if len(raw) < 96:
-        raise WalValidationError("WAL index header is truncated")
+        raise WalIndexValidationError("WAL index header is truncated")
     first, second = raw[:48], raw[48:96]
     if first != second:
-        raise WalValidationError("WAL index header copies disagree")
+        raise WalIndexValidationError("WAL index header copies disagree")
 
     native = "<" if sys.byteorder == "little" else ">"
     version = struct.unpack_from(f"{native}I", first, 0)[0]
@@ -93,21 +100,23 @@ def _read_shm_state(
     )
 
     if version != _WAL_VERSION or first[4:8] != b"\0\0\0\0":
-        raise WalValidationError("unsupported WAL index version")
+        raise WalIndexValidationError("unsupported WAL index version")
     if is_init not in (0, 1):
-        raise WalValidationError("invalid WAL index initialization flag")
+        raise WalIndexValidationError("invalid WAL index initialization flag")
     if index_page_size != page_size:
-        raise WalValidationError("WAL index page size mismatch")
+        raise WalIndexValidationError("WAL index page size mismatch")
     expected_big = int(magic == _WAL_MAGIC_BIG_CHECKSUM)
     if big_end_checksum != expected_big:
-        raise WalValidationError("WAL index checksum byte order mismatch")
+        raise WalIndexValidationError("WAL index checksum byte order mismatch")
     if first[32:40] != wal_header[16:24]:
-        raise WalValidationError("WAL index salt mismatch")
+        raise WalIndexValidationError("WAL index salt mismatch")
     if computed_checksum != stored_checksum:
-        raise WalValidationError("WAL index header checksum mismatch")
+        raise WalIndexValidationError("WAL index header checksum mismatch")
     if not is_init:
         if mx_frame != 0:
-            raise WalValidationError("uninitialized WAL index has committed frames")
+            raise WalIndexValidationError(
+                "uninitialized WAL index has committed frames"
+            )
         return _ShmState(0, 0, (0, 0))
     return _ShmState(mx_frame, n_page, frame_checksum)
 
@@ -157,17 +166,20 @@ def inspect_wal(
 
         frame_size = 24 + page_size
         physical_frames = max(0, (stat.st_size - 32) // frame_size)
-        resolved_shm = shm_path or wal_path.with_name(
-            wal_path.name[:-4] + "-shm"
-            if wal_path.name.endswith("-wal")
-            else wal_path.name + "-shm"
-        )
-        shm = _read_shm_state(
-            Path(resolved_shm),
-            wal_header=header,
-            magic=magic,
-            page_size=page_size,
-        )
+        if shm_path is _IGNORE_WAL_INDEX:
+            shm = None
+        else:
+            resolved_shm = shm_path or wal_path.with_name(
+                wal_path.name[:-4] + "-shm"
+                if wal_path.name.endswith("-wal")
+                else wal_path.name + "-shm"
+            )
+            shm = _read_shm_state(
+                Path(resolved_shm),
+                wal_header=header,
+                magic=magic,
+                page_size=page_size,
+            )
         scan_limit = shm.mx_frame if shm is not None else physical_frames
         if scan_limit > physical_frames:
             raise WalValidationError("WAL index references missing frames")
@@ -287,3 +299,43 @@ def apply_wal(
     if final_signature != plan.file_signature:
         raise WalValidationError("WAL snapshot changed during recovery")
     return applied
+
+
+def _inspect_wal_without_index(
+    wal_path: Path,
+    *,
+    expected_page_size: Optional[int] = None,
+) -> WalPlan:
+    """Inspect the recoverable WAL boundary without trusting ``-shm``."""
+
+    return inspect_wal(
+        wal_path,
+        shm_path=_IGNORE_WAL_INDEX,  # type: ignore[arg-type]
+        expected_page_size=expected_page_size,
+    )
+
+
+def _apply_wal_without_index(
+    wal_path: Path,
+    output_path: Path,
+    decrypt_page: Callable[[bytes, int], Optional[bytes]],
+    *,
+    expected_page_size: Optional[int] = None,
+) -> int:
+    """Recover from WAL alone after a caller proves its copied index is stale.
+
+    This is intentionally private: normal callers must validate ``-shm`` when
+    it is present.  Snapshot readers may use this only after indexed inspection
+    fails or a WAL-only scan proves that the index lags a complete commit.
+    ``inspect_wal`` still verifies the WAL header, salts, cumulative checksums,
+    and last complete commit; ``apply_wal`` still authenticates each SQLCipher
+    page before mutating the plaintext output.
+    """
+
+    return apply_wal(
+        wal_path,
+        output_path,
+        decrypt_page,
+        shm_path=_IGNORE_WAL_INDEX,  # type: ignore[arg-type]
+        expected_page_size=expected_page_size,
+    )

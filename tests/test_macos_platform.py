@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,6 +64,36 @@ def test_macos_exact_executable_pid_match(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(stdout=stdout),
     )
     assert _macos.process_pids_for_executable(exact) == [7]
+
+
+def test_macos_checked_exact_enumeration_distinguishes_ps_failure(monkeypatch):
+    monkeypatch.setattr(_macos, "is_macos", lambda: True)
+    exact = Path("/tmp/WeChat-copy.app/Contents/MacOS/WeChat")
+    monkeypatch.setattr(
+        _macos.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("ps", 5)
+        ),
+    )
+
+    assert _macos._process_pids_for_executable_checked(exact) == (False, [])
+    assert _macos.process_pids_for_executable(exact) == []
+
+
+def test_macos_checked_exact_enumeration_rejects_nonzero_ps(monkeypatch):
+    monkeypatch.setattr(_macos, "is_macos", lambda: True)
+    exact = Path("/tmp/WeChat-copy.app/Contents/MacOS/WeChat")
+    monkeypatch.setattr(
+        _macos.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+        ),
+    )
+
+    assert _macos._process_pids_for_executable_checked(exact) == (False, [])
 
 
 def test_macos_container_candidates_are_bounded():

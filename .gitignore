@@ -44,3 +44,11 @@ Thumbs.db
 # PyInstaller build artifacts — NEVER commit (build_pyi .toc / dist_exe carry build-host path)
 build_pyi/
 dist_exe/
+build_pyi*/
+dist_exe*/
+dist_macos*/
+dist_source*/
+dist_metadata*/
+
+# Local cross-device acceptance harnesses can contain machine-specific paths.
+.tmp_windows_chat_acceptance.py

@@ -32,6 +32,8 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+from chatlog_keeper.core._secrets import read_secret_text, write_secret_text
+
 logger = logging.getLogger(__name__)
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -86,16 +88,20 @@ def derive_v2_xor_key(attach_root: Path) -> Optional[int]:
 
     # Tier 1: cached UIN file → deterministic xor_key = uin & 0xFF
     uin_path = _V2_UIN_CACHE_PATH_FN()
-    if uin_path.exists():
+    uin_text = read_secret_text(uin_path, max_bytes=128)
+    if uin_text is not None:
         try:
-            uin_str = uin_path.read_text(encoding="utf-8").strip()
+            uin_str = uin_text.strip()
             if uin_str.isdigit():
                 uin = int(uin_str)
                 xor_key = uin & 0xFF
                 _V2_XOR_KEY_OVERRIDE = xor_key
-                logger.debug(f"derive_v2_xor_key tier1: uin={uin} → xor=0x{xor_key:02x}")
+                logger.debug(
+                    "derive_v2_xor_key tier1: cached UIN produced xor=0x%02x",
+                    xor_key,
+                )
                 return xor_key
-        except (OSError, ValueError):
+        except ValueError:
             pass
 
     if not attach_root.exists():
@@ -320,13 +326,10 @@ def load_cached_v2_key() -> Optional[bytes]:
     Cache file format (preferred): 16-char lowercase hex ASCII string.
     Back-compat: 32-char hex (raw 16-byte binary representation).
     """
-    p = _V2_KEY_CACHE_PATH_FN()
-    if not p.exists():
+    s = read_secret_text(_V2_KEY_CACHE_PATH_FN(), max_bytes=128)
+    if s is None:
         return None
-    try:
-        s = p.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
+    s = s.strip()
     # Strip UTF-8 BOM if present (PowerShell Set-Content may add it)
     if s.startswith("﻿"):
         s = s.lstrip("﻿")
@@ -351,21 +354,16 @@ def save_cached_v2_key(key: bytes) -> bool:
     Prefer 16-byte ASCII (e.g. md5-hex-prefix derived from UIN+wxid) since that's
     the WeChat 4.x native format. Falls back to 32-char hex for binary keys.
     """
-    p = _V2_KEY_CACHE_PATH_FN()
     if not isinstance(key, (bytes, bytearray)) or len(key) != 16:
         logger.warning(f"save_cached_v2_key: invalid key (type={type(key).__name__}, "
                        f"len={len(key) if hasattr(key, '__len__') else '?'}); expected 16 bytes")
         return False
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # If key bytes are all printable ASCII (alphanumeric incl. hex), save as-is
-        if all(0x30 <= b <= 0x7A for b in key) and bytes(key).isalnum():
-            p.write_text(bytes(key).decode("ascii"), encoding="utf-8")
-        else:
-            p.write_text(bytes(key).hex(), encoding="utf-8")
-        return True
-    except OSError:
-        return False
+    # If key bytes are all printable ASCII (alphanumeric incl. hex), save as-is.
+    if all(0x30 <= b <= 0x7A for b in key) and bytes(key).isalnum():
+        text = bytes(key).decode("ascii")
+    else:
+        text = bytes(key).hex()
+    return write_secret_text(_V2_KEY_CACHE_PATH_FN(), text)
 
 
 _BLANK_NONWHITE_RATIO = 0.01  # < 1% non-white pixels → treat as blank placeholder frame

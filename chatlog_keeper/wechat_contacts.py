@@ -30,12 +30,65 @@ import logging
 import sqlite3
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 _CONTACT_DB_REL = Path("db_storage") / "contact" / "contact.db"
+
+
+def _clean_wechat_display_name(value) -> str:
+    """把微信资料字段收敛为适合本机 UI 的单行短文本。"""
+
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).strip()[:120]
+
+
+@dataclass(frozen=True)
+class WeChatContactIdentity:
+    """微信联系人或群聊的本机备注、昵称与微信号。"""
+
+    username: str = ""
+    alias: str = ""
+    remark: str = ""
+    nickname: str = ""
+
+    @property
+    def preferred_name(self) -> str:
+        """聊天正文优先使用本机备注，其次昵称、微信号和内部账号标识。"""
+
+        return self.remark or self.nickname or self.alias or self.username
+
+    @property
+    def directory_label(self) -> str:
+        """生成与 QQ 一致、能区分备注和昵称的会话目录标签。"""
+
+        if self.remark and self.nickname and self.remark != self.nickname:
+            return f"备注：{self.remark} · 昵称：{self.nickname}"
+        if self.remark and self.nickname:
+            return f"备注/昵称：{self.remark}"
+        if self.remark:
+            return f"备注：{self.remark}"
+        if self.nickname:
+            return f"昵称：{self.nickname}"
+        if self.alias:
+            return f"微信号：{self.alias}"
+        return self.username
+
+    @property
+    def account_directory_label(self) -> str:
+        """生成账号选择器标签，始终明确展示可用的微信号。"""
+
+        wechat_id = self.alias or self.username
+        if not wechat_id:
+            return ""
+        label = f"微信号：{wechat_id}"
+        if self.nickname and self.nickname != wechat_id:
+            label += f" · 昵称：{self.nickname}"
+        return label
 
 
 class WeChatContactResolver:
@@ -45,6 +98,7 @@ class WeChatContactResolver:
         """reader: WeChatDBReader (must be .initialize()'d)."""
         self.reader = reader
         self._wxid_to_display: dict = {}
+        self._wxid_to_identity: dict[str, WeChatContactIdentity] = {}
         self._group_wxids: set = set()
         self._chatroom_owner: dict = {}
         self._loaded = False
@@ -64,11 +118,29 @@ class WeChatContactResolver:
         return p if p.exists() else None
 
     def _extract_contact_key(self) -> Optional[bytes]:
-        """Try every Weixin pid until contact.db key found. Returns 32-byte key or None."""
-        from chatlog_keeper.wechat_db import _get_weixin_pids, extract_key_from_weixin
+        """Resolve the contact DB key cache-first, then try live Weixin pids."""
+        from chatlog_keeper.wechat_db import (
+            _get_weixin_pids,
+            _read_stable_page1,
+            _verify_key_v4,
+            extract_key_from_weixin,
+            load_cached_wechat_key,
+            load_cached_wechat_key_for_account,
+        )
 
         db = self._contact_db_path()
         if db is None:
+            return None
+        account_id = str(getattr(self.reader, "account_id", "") or "").strip()
+        cached = (
+            load_cached_wechat_key_for_account(account_id)
+            if account_id
+            else load_cached_wechat_key()
+        )
+        page1 = _read_stable_page1(db) if cached else None
+        if cached and page1 and _verify_key_v4(cached, page1):
+            return cached
+        if not getattr(self.reader, "_allow_live_key_extract", True):
             return None
         for pid in _get_weixin_pids():
             k = extract_key_from_weixin(pid, db_path=db)
@@ -120,13 +192,14 @@ class WeChatContactResolver:
                 for username, local_type, alias, remark, nick_name in cur.fetchall():
                     if not username:
                         continue
-                    display = (
-                        (remark or "").strip()
-                        or (nick_name or "").strip()
-                        or (alias or "").strip()
-                        or username
+                    identity = WeChatContactIdentity(
+                        username=_clean_wechat_display_name(username),
+                        alias=_clean_wechat_display_name(alias),
+                        remark=_clean_wechat_display_name(remark),
+                        nickname=_clean_wechat_display_name(nick_name),
                     )
-                    self._wxid_to_display[username] = display
+                    self._wxid_to_identity[username] = identity
+                    self._wxid_to_display[username] = identity.preferred_name
                     if local_type == 2 or username.endswith("@chatroom"):
                         self._group_wxids.add(username)
             # Load chat_room owners
@@ -193,3 +266,24 @@ class WeChatContactResolver:
         if not self._loaded:
             self.load()
         return dict(self._wxid_to_display)
+
+    def all_directory_labels(self) -> dict:
+        """返回 wxid 到本机目录标签的副本，同时保留备注与昵称。"""
+
+        if not self._loaded:
+            self.load()
+        return {
+            wxid: identity.directory_label or wxid
+            for wxid, identity in self._wxid_to_identity.items()
+        }
+
+    def account_directory_label(self, wxid: str) -> str:
+        """返回账号选择器标签；资料缺失时仍展示内部微信号。"""
+
+        if not self._loaded:
+            self.load()
+        identity = self._wxid_to_identity.get(wxid)
+        if identity is not None and identity.account_directory_label:
+            return identity.account_directory_label
+        normalized = _clean_wechat_display_name(wxid)
+        return f"微信号：{normalized}" if normalized else "微信账号"

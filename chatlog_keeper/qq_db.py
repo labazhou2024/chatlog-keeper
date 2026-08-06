@@ -19,16 +19,19 @@ import ctypes.wintypes as wt
 import hashlib
 import hmac as hmac_mod
 import logging
+import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Iterator, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,8 @@ class QQMessage:
     # equivalent file/voice fields are detected. Mirrors the wechat WxMessage
     # attachment_meta shape.
     attachment_meta: Optional[dict] = None
+    conversation_type: str = "direct"
+    is_group_chat: bool = False
 
     def is_text(self):
         return self.msg_type == 1
@@ -56,6 +61,46 @@ class QQMessage:
     def __str__(self):
         t = self.timestamp.strftime("%H:%M")
         return f"[{t}] {self.sender_name}: {self.content}"
+
+
+_QQ_MESSAGE_PAGE_DEFAULT_SIZE = 200
+_QQ_MESSAGE_PAGE_MAX_SIZE = 1000
+
+
+@dataclass(frozen=True)
+class _QQMessagePageCursor:
+    """Opaque, scope-bound keyset position inside one decrypted QQ snapshot."""
+
+    account_id: str
+    conversation_id: str
+    conversation_type: Optional[str]
+    since_ts: float
+    until_ts: float
+    msg_time: float
+    table_rank: int
+    rowid: int
+
+
+@dataclass(frozen=True)
+class _QQMessageDictPage:
+    """One bounded page plus the raw-row cursor needed to resume it exactly."""
+
+    records: Tuple[Dict, ...]
+    cursor_after: Optional[_QQMessagePageCursor]
+    has_more: bool
+
+
+class QQMessagePageCancelled(RuntimeError):
+    """Raised when a bounded QQ page stream is cancelled between DB queries."""
+
+
+def _raise_if_qq_message_page_cancelled(
+    cancel_requested: Optional[Callable[[], bool]],
+) -> None:
+    """Convert the reader's cooperative cancellation signal to one stable error."""
+
+    if cancel_requested is not None and cancel_requested():
+        raise QQMessagePageCancelled("QQ message page read cancelled")
 
 
 # ─── QQ Process helpers ───────────────────────────────────────────────────────
@@ -245,6 +290,33 @@ def find_qq_number_dirs(data_root: Path) -> List[Path]:
     return dirs
 
 
+def qq_account_database(account_dir: Path) -> Optional[Path]:
+    """Return the live message database inside an already-discovered account.
+
+    ``account_dir`` must come from :func:`find_qq_number_dirs`; callers must not
+    construct it from an untrusted account identifier.  Keeping the path
+    resolution here makes the CLI's account selection an exact name lookup
+    rather than a path join.
+    """
+    primary = account_dir / "nt_qq" / "nt_db" / "nt_msg.db"
+    if primary.is_file():
+        return primary
+    legacy = account_dir / "nt_db" / "nt_msg.db"
+    if legacy.is_file():
+        return legacy
+    return None
+
+
+def find_qq_account_databases(data_root: Path) -> Dict[str, Path]:
+    """Return every locally discovered QQ account and its message database."""
+    accounts: Dict[str, Path] = {}
+    for account_dir in find_qq_number_dirs(data_root):
+        db_path = qq_account_database(account_dir)
+        if db_path is not None:
+            accounts[account_dir.name] = db_path
+    return dict(sorted(accounts.items(), key=lambda item: item[0]))
+
+
 def find_msg_database(data_root: Path) -> Optional[Path]:
     """Locate the main NT QQ message database (nt_msg.db).
 
@@ -256,22 +328,12 @@ def find_msg_database(data_root: Path) -> Optional[Path]:
     over a stale snapshot stored alongside.
     """
     candidates: List[tuple] = []
-    for qq_dir in find_qq_number_dirs(data_root):
-        db_path = qq_dir / "nt_qq" / "nt_db" / "nt_msg.db"
-        if db_path.exists():
-            try:
-                st = db_path.stat()
-                candidates.append((st.st_mtime, st.st_size, db_path))
-            except OSError:
-                pass
-        # Legacy variant
-        legacy = qq_dir / "nt_db" / "nt_msg.db"
-        if legacy.exists():
-            try:
-                st = legacy.stat()
-                candidates.append((st.st_mtime, st.st_size, legacy))
-            except OSError:
-                pass
+    for db_path in find_qq_account_databases(data_root).values():
+        try:
+            st = db_path.stat()
+            candidates.append((st.st_mtime, st.st_size, db_path))
+        except OSError:
+            pass
     if candidates:
         # Pick most-recently-modified (mtime desc); break tie by size desc.
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -365,6 +427,15 @@ def _key_cache_path() -> Path:
     return p if p is not None else _legacy_key_cache_path()
 
 
+def _account_key_cache_path(account_id: str) -> Path:
+    """Return a private cache path without exposing the native QQ account ID."""
+    normalized = str(account_id or "").strip()
+    if not normalized:
+        return _key_cache_path()
+    digest = hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+    return _key_cache_path().parent / "qq_accounts" / f"{digest}.key"
+
+
 def _parse_cached_key_text(text: str) -> Optional[bytes]:
     """Parse a cached key file's text → key bytes, or None if unrecognised.
 
@@ -387,6 +458,8 @@ def load_cached_key() -> Optional[bytes]:
     Read order: persistent app-data secrets dir → legacy ``_internal`` path
     (old-install migration fallback). First file that parses to a valid key
     wins; missing/garbage files are skipped silently."""
+    from chatlog_keeper.core._secrets import read_secret_text
+
     seen: set = set()
     candidates = []
     persistent = _persistent_key_cache_path()
@@ -401,14 +474,43 @@ def load_cached_key() -> Optional[bytes]:
         if rp in seen:
             continue
         seen.add(rp)
-        try:
-            if not p.exists():
-                continue
-            key = _parse_cached_key_text(p.read_text(encoding="utf-8"))
-        except OSError:
+        text = read_secret_text(p)
+        if text is None:
             continue
+        key = _parse_cached_key_text(text)
         if key:
             return key
+    return None
+
+
+def load_cached_key_for_account(account_id: str) -> Optional[bytes]:
+    """Load an account-scoped key, then fall back to the legacy global key."""
+    from chatlog_keeper.core._secrets import read_secret_text
+
+    normalized = str(account_id or "").strip()
+    if normalized:
+        path = _account_key_cache_path(normalized)
+        text = read_secret_text(path)
+        if text is not None:
+            key = _parse_cached_key_text(text)
+            if key:
+                return key
+    return load_cached_key()
+
+
+def _cached_key_text(key) -> Optional[str]:
+    """Serialize a supported QQ passphrase without logging or previewing it."""
+    if not key:
+        return None
+    if isinstance(key, str):
+        try:
+            key = key.encode("ascii")
+        except UnicodeEncodeError:
+            return None
+    if len(key) in (16, 32) and all(0x20 <= b <= 0x7E for b in key):
+        return key.decode("ascii")
+    if len(key) == 32:
+        return key.hex()
     return None
 
 
@@ -418,17 +520,21 @@ def save_cached_key(key) -> bool:
     Stores as raw ASCII string (length 16 or 32) for 9.9.x passphrase format.
     Falls back to hex for 32-byte raw key (legacy <9.9.x).
     """
-    if not key:
+    text = _cached_key_text(key)
+    if text is None:
         return False
-    if isinstance(key, str):
-        key = key.encode("ascii")
-    p = _key_cache_path()
     from chatlog_keeper.core._secrets import write_secret_text
-    if len(key) in (16, 32) and all(0x20 <= b <= 0x7E for b in key):
-        return write_secret_text(p, key.decode("ascii"))
-    if len(key) == 32:
-        return write_secret_text(p, key.hex())
-    return False
+    return write_secret_text(_key_cache_path(), text)
+
+
+def save_cached_key_for_account(key, account_id: str) -> bool:
+    """Persist a key under an irreversible account-scoped cache filename."""
+    normalized = str(account_id or "").strip()
+    text = _cached_key_text(key)
+    if not normalized or text is None:
+        return False
+    from chatlog_keeper.core._secrets import write_secret_text
+    return write_secret_text(_account_key_cache_path(normalized), text)
 
 
 # ─── Key extraction from QQ process memory ────────────────────────────────────
@@ -1449,7 +1555,19 @@ def _extract_msg_text(blob: bytes) -> str:
     _collect(fields, image_w=[None], image_h=[None])
 
     if not parts:
-        return _brute_extract_utf8_fallback(blob)
+        # 47702 is a precise reaction/reply marker.  Its nested payload carries
+        # native participant metadata that must not be promoted to narrative,
+        # but silently dropping the row would make bounded coverage dishonest.
+        # Emit one fixed marker only when no structured narrative was decoded.
+        reaction_fields = fields
+        for wire_type, value in fields.get(_NTQQ_MSG_OUTER_WRAPPER, []):
+            if wire_type == "bytes":
+                reaction_fields = _proto_parse(value)
+                break
+        if _NTQQ_MSG_REACT_REPLY_GROUP in reaction_fields:
+            return "[回应]"
+        fallback = _brute_extract_utf8_fallback(blob)
+        return "" if _qq_fallback_text_is_machine_only(fallback) else fallback
 
     out: List[str] = []
     for p in parts:
@@ -1614,13 +1732,112 @@ def _brute_extract_utf8_fallback(blob: bytes, min_run: int = 4) -> str:
     return " ".join(out)[:1000]
 
 
+_QQ_FALLBACK_MACHINE_TOKEN_RE = re.compile(
+    r"(?:ntid|ntuid|uin)[:_-][A-Za-z0-9_-]{8,}|"
+    r"[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*",
+    re.IGNORECASE,
+)
+_QQ_FALLBACK_KNOWN_ID_RE = re.compile(
+    r"(?i)^(?:ntid|ntuid|uin)[:_-][A-Za-z0-9_-]{8,}$"
+)
+_QQ_FALLBACK_OPAQUE_PREFIX_RE = re.compile(
+    r"(?i)^(?:u_|nt_)[A-Za-z0-9_-]{18,}$"
+)
+_QQ_FALLBACK_UUID_RE = re.compile(
+    r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_QQ_FALLBACK_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\|/|\.{1,2}[\\/])\S+"
+)
+
+
+def _qq_fallback_text_is_machine_only(value: str) -> bool:
+    """Reject protobuf fallback output made only of QQ internal identifiers.
+
+    The structured decoder already skips sender/reaction UID fields.  This guard
+    applies only when decoding fell all the way back to an untyped UTF-8 scan,
+    where the same ``u_...`` value can otherwise be mistaken for message text.
+    Natural language, URLs, paths, email addresses and error-bearing sentences
+    remain available to the caller.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text):
+        return False
+    if (
+        re.search(r"(?i)\b(?:https?|ftp)://\S+", text)
+        or re.search(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b", text)
+        or _QQ_FALLBACK_PATH_RE.search(text)
+    ):
+        return False
+    if len(re.findall(r"(?<![A-Za-z])[A-Za-z]{2,}(?![A-Za-z])", text)) >= 3 and re.search(
+        r"\s", text
+    ):
+        return False
+
+    tokens = [match.group(0) for match in _QQ_FALLBACK_MACHINE_TOKEN_RE.finditer(text)]
+    if not tokens:
+        return False
+    unmatched = _QQ_FALLBACK_MACHINE_TOKEN_RE.sub("", text)
+    if any(
+        not char.isspace()
+        and unicodedata.category(char)[:1] not in {"P", "S", "Z", "C"}
+        for char in unmatched
+    ):
+        return False
+    return all(_qq_fallback_token_is_machine_identifier(token) for token in tokens)
+
+
+def _qq_fallback_token_is_machine_identifier(value: str) -> bool:
+    """Return whether one fallback token has strong internal-ID characteristics."""
+
+    token = str(value or "").strip().rstrip("=")
+    if _QQ_FALLBACK_KNOWN_ID_RE.fullmatch(token) or _QQ_FALLBACK_UUID_RE.fullmatch(token):
+        return True
+    if re.fullmatch(r"(?i)[0-9a-f]{16,}", token):
+        return True
+    if _QQ_FALLBACK_OPAQUE_PREFIX_RE.fullmatch(token):
+        return _qq_fallback_token_has_opaque_shape(token)
+    if re.fullmatch(r"[A-Za-z0-9_-]{24,}={0,2}", token) is None:
+        return False
+    return _qq_fallback_token_has_opaque_shape(token)
+
+
+def _qq_fallback_token_has_opaque_shape(token: str) -> bool:
+    """Require random-looking shape before treating an unlabelled token as an ID."""
+
+    compact = "".join(char for char in token if char.isalnum())
+    if len(compact) < 20:
+        return False
+    classes = sum(
+        (
+            any(char.islower() for char in token),
+            any(char.isupper() for char in token),
+            any(char.isdigit() for char in token),
+            "_" in token or "-" in token,
+        )
+    )
+    if classes < 3:
+        return False
+    frequencies = {char: compact.count(char) for char in set(compact)}
+    entropy = -sum(
+        (count / len(compact)) * math.log2(count / len(compact))
+        for count in frequencies.values()
+    )
+    unique_ratio = len(frequencies) / len(compact)
+    return entropy >= 3.5 and unique_ratio >= 0.62
+
+
 # Back-compat alias: callers using the legacy name still work.
 _brute_extract_utf8_text = _extract_msg_text
 
 
 # NTQQ 9.9.x column-id schema (numeric col names — they're hex-ish ids)
 _NTQQ_COL_MSG_UID = "40001"     # msg_uid (BIGINT)
-_NTQQ_COL_PEER_UIN = "40002"    # peer uin (for c2c)
+_NTQQ_COL_PEER_UIN = "40030"    # peer QQ number (for c2c)
 _NTQQ_COL_MSG_SEQ = "40003"     # msg seq number
 _NTQQ_COL_SENDER_UID = "40020"  # sender uid (string u_xxx)
 _NTQQ_COL_GROUP_CODE = "40021"  # group code (group_msg_table)
@@ -1630,9 +1847,60 @@ _NTQQ_COL_MSG_TIME = "40050"    # msg unix epoch seconds
 _NTQQ_COL_SENDER_UIN = "40033"  # sender QQ number (BIGINT)
 
 
+@dataclass(frozen=True)
+class _QQMessageTableSpec:
+    """Allowlisted NTQQ message-table identifiers and their global sort rank."""
+
+    table: str
+    conversation_column: str
+    conversation_type: str
+    table_rank: int
+
+
+_QQ_MESSAGE_TABLE_SPECS = (
+    _QQMessageTableSpec(
+        table="c2c_msg_table",
+        conversation_column=_NTQQ_COL_PEER_UIN,
+        conversation_type="direct",
+        table_rank=0,
+    ),
+    _QQMessageTableSpec(
+        table="group_msg_table",
+        conversation_column=_NTQQ_COL_GROUP_CODE,
+        conversation_type="group",
+        table_rank=1,
+    ),
+)
+
+
+def _qq_table_columns(cursor, table: str) -> Optional[set[str]]:
+    """Return an NTQQ table's declared columns, or ``None`` on schema errors.
+
+    SQLite may evaluate a double-quoted missing column as a string literal.
+    Every numeric-column query must therefore validate the live table schema
+    before constructing its ``SELECT`` statement.
+    """
+    import sqlite3
+
+    try:
+        cursor.execute(f'PRAGMA table_info("{table}")')
+        return {
+            str(row[1])
+            for row in cursor.fetchall()
+            if len(row) > 1 and row[1] is not None
+        }
+    except sqlite3.Error as exc:
+        logger.debug(
+            "QQ table schema query failed for %s: %s",
+            table,
+            type(exc).__name__,
+        )
+        return None
+
+
 # ─── Buddy / group nickname lookup ────────────────────────────────────────────
 # profile_info.db tables:
-#   profile_info_v6: col 1002=qq_uin, 20002=nickname, 1000=uid
+#   profile_info_v6: col 1002=qq_uin, 20002=nickname, 20009=remark, 1000=uid
 #   buddy_list: friends only — col 1000=uid, 1002=qq_uin
 # group_info.db tables:
 #   group_member3: col 60001=group_id, 1002=qq_uin, 20002=group nickname, 1000=uid
@@ -1641,10 +1909,13 @@ _NTQQ_COL_SENDER_UIN = "40033"  # sender QQ number (BIGINT)
 # messages — only group_msg_table carries it. We close the gap by joining
 # profile_info.db.profile_info_v6 and group_info.db.group_member3.
 
+_NTQQ_PROFILE_COL_UID = "1000"        # TEXT — NT internal UID
 _NTQQ_PROFILE_COL_QQ_UIN = "1002"     # BIGINT — QQ number
 _NTQQ_PROFILE_COL_NICKNAME = "20002"  # TEXT — display nickname
+_NTQQ_PROFILE_COL_REMARK = "20009"    # TEXT — local friend remark
 _NTQQ_GROUP_MEMBER_COL_GROUP = "60001"  # BIGINT — group_id
 _NTQQ_GROUP_MEMBER_COL_UIN = "1002"     # BIGINT — member QQ number
+_NTQQ_GROUP_COL_NAME = "60007"           # TEXT — group display name
 
 
 def _decrypt_aux_db(src_db: Path, key, tmp_dir: Path) -> Optional[Path]:
@@ -1668,35 +1939,247 @@ def _decrypt_aux_db(src_db: Path, key, tmp_dir: Path) -> Optional[Path]:
         return None
 
 
-def _build_buddy_name_map(profile_db: Path) -> Dict[int, str]:
-    """Read profile_info_v6 and build {qq_uin: nickname} map.
+@dataclass(frozen=True)
+class QQBuddyIdentity:
+    """QQ 联系人的本机备注与公开昵称。"""
+
+    nickname: str = ""
+    remark: str = ""
+
+    @property
+    def preferred_name(self) -> str:
+        """聊天正文优先使用用户自己的备注，缺失时回退公开昵称。"""
+
+        return self.remark or self.nickname
+
+    @property
+    def directory_label(self) -> str:
+        """生成让用户能区分备注与昵称的目录标签。"""
+
+        if self.remark and self.nickname and self.remark != self.nickname:
+            return f"备注：{self.remark} · 昵称：{self.nickname}"
+        if self.remark and self.nickname:
+            return f"备注/昵称：{self.remark}"
+        if self.remark:
+            return f"备注：{self.remark}"
+        if self.nickname:
+            return f"昵称：{self.nickname}"
+        return ""
+
+
+def _clean_qq_display_name(value) -> str:
+    """把 QQ 资料字段收敛为适合本机 UI 的单行短文本。"""
+
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).strip()[:120]
+
+
+def _build_buddy_identity_map(profile_db: Path) -> Dict[int, QQBuddyIdentity]:
+    """读取 profile_info_v6，建立 QQ 号到备注和昵称的映射。
 
     Returns {} on any failure (db missing, table missing, etc.) so callers
     can fall back gracefully.
     """
     import sqlite3
+    out: Dict[int, QQBuddyIdentity] = {}
+    if not profile_db.exists():
+        return out
+    try:
+        conn = sqlite3.connect(str(profile_db))
+        try:
+            cursor = conn.cursor()
+            columns = _qq_table_columns(cursor, "profile_info_v6")
+            if columns is None or _NTQQ_PROFILE_COL_QQ_UIN not in columns:
+                return out
+            nickname_expression = (
+                f'"{_NTQQ_PROFILE_COL_NICKNAME}"'
+                if _NTQQ_PROFILE_COL_NICKNAME in columns
+                else "NULL"
+            )
+            remark_expression = (
+                f'"{_NTQQ_PROFILE_COL_REMARK}"'
+                if _NTQQ_PROFILE_COL_REMARK in columns
+                else "NULL"
+            )
+            cursor.execute(
+                f'SELECT "{_NTQQ_PROFILE_COL_QQ_UIN}", '
+                f'{nickname_expression}, {remark_expression} '
+                f'FROM profile_info_v6 '
+                f'WHERE "{_NTQQ_PROFILE_COL_QQ_UIN}" IS NOT NULL'
+            )
+            for uin, nickname, remark in cursor.fetchall():
+                identity = QQBuddyIdentity(
+                    nickname=_clean_qq_display_name(nickname),
+                    remark=_clean_qq_display_name(remark),
+                )
+                if not uin or not identity.preferred_name:
+                    continue
+                try:
+                    out[int(uin)] = identity
+                except (ValueError, TypeError):
+                    pass
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug(f"buddy_identity_map build failed: {e}")
+    return out
+
+
+def _build_buddy_name_map(profile_db: Path) -> Dict[int, str]:
+    """建立聊天正文使用的 QQ 展示名映射，备注优先于昵称。"""
+
+    return {
+        uin: identity.preferred_name
+        for uin, identity in _build_buddy_identity_map(profile_db).items()
+    }
+
+
+def _build_buddy_directory_label_map(profile_db: Path) -> Dict[int, str]:
+    """建立 GUI 目录标签映射，同时明确显示本机备注和公开昵称。"""
+
+    return {
+        uin: identity.directory_label
+        for uin, identity in _build_buddy_identity_map(profile_db).items()
+        if identity.directory_label
+    }
+
+
+def _build_buddy_directory_map(profile_db: Path) -> Dict[int, str]:
+    """读取 ``buddy_list``，建立只包含好友的 QQ 会话目录。
+
+    ``profile_info_v6`` 还缓存群成员和其他见过的账号，不能直接当作好友
+    清单。这里用 ``buddy_list`` 限定成员，再复用 profile 的备注/昵称作为
+    展示标签；没有资料缓存的好友仍以稳定的 QQ 号占位，不会从目录消失。
+    """
+
+    import sqlite3
+
+    identities = _build_buddy_identity_map(profile_db)
     out: Dict[int, str] = {}
     if not profile_db.exists():
         return out
     try:
         conn = sqlite3.connect(str(profile_db))
-        cur = conn.cursor()
-        cur.execute(
-            f'SELECT "{_NTQQ_PROFILE_COL_QQ_UIN}", "{_NTQQ_PROFILE_COL_NICKNAME}" '
-            f'FROM profile_info_v6 '
-            f'WHERE "{_NTQQ_PROFILE_COL_QQ_UIN}" IS NOT NULL '
-            f'AND "{_NTQQ_PROFILE_COL_NICKNAME}" IS NOT NULL'
-        )
-        for uin, nick in cur.fetchall():
-            if uin and nick and isinstance(nick, str) and nick.strip():
-                try:
-                    out[int(uin)] = nick.strip()
-                except (ValueError, TypeError):
-                    pass
-        conn.close()
-    except Exception as e:
-        logger.debug(f"buddy_name_map build failed: {e}")
+        try:
+            cursor = conn.cursor()
+            columns = _qq_table_columns(cursor, "buddy_list")
+            if columns is None or _NTQQ_PROFILE_COL_QQ_UIN not in columns:
+                return out
+            cursor.execute(
+                f'SELECT DISTINCT "{_NTQQ_PROFILE_COL_QQ_UIN}" '
+                f'FROM buddy_list '
+                f'WHERE "{_NTQQ_PROFILE_COL_QQ_UIN}" IS NOT NULL'
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        for (raw_uin,) in rows:
+            try:
+                uin = int(raw_uin)
+            except (TypeError, ValueError):
+                continue
+            if uin <= 0:
+                continue
+            identity = identities.get(uin)
+            out[uin] = (
+                identity.directory_label
+                if identity is not None and identity.directory_label
+                else f"qq_friend_{uin}"
+            )
+    except sqlite3.Error as exc:
+        logger.debug("buddy directory build failed: %s", type(exc).__name__)
     return out
+
+
+def _normalize_qq_number(value: object) -> str:
+    """返回可展示的 ASCII QQ 号；其他数字或内部 UID 返回空字符串。"""
+
+    candidate = str(value or "").strip()
+    return candidate if re.fullmatch(r"[1-9][0-9]{4,19}", candidate) else ""
+
+
+def _exclude_self_from_buddy_directory(
+    buddy_directory_map: Dict[int, str],
+    account_qq_number: object,
+) -> None:
+    """从好友元数据目录移除自身 QQ 号，不影响消息表中的真实自聊。"""
+
+    normalized = _normalize_qq_number(account_qq_number)
+    if not normalized:
+        return
+    buddy_directory_map.pop(int(normalized), None)
+
+
+def _build_account_qq_number_map(profile_db: Path) -> Dict[str, str]:
+    """按 QQ UIN 和 NT UID 建立本机账号到 QQ 号的映射。"""
+
+    import sqlite3
+
+    out: Dict[str, str] = {}
+    if not profile_db.exists():
+        return out
+    try:
+        conn = sqlite3.connect(str(profile_db))
+        try:
+            cursor = conn.cursor()
+            columns = _qq_table_columns(cursor, "profile_info_v6")
+            required_columns = {
+                _NTQQ_PROFILE_COL_UID,
+                _NTQQ_PROFILE_COL_QQ_UIN,
+            }
+            if columns is None or not required_columns.issubset(columns):
+                return out
+            cursor.execute(
+                f'SELECT "{_NTQQ_PROFILE_COL_UID}", '
+                f'"{_NTQQ_PROFILE_COL_QQ_UIN}" '
+                f'FROM profile_info_v6 '
+                f'WHERE "{_NTQQ_PROFILE_COL_QQ_UIN}" IS NOT NULL'
+            )
+            for uid, uin in cursor.fetchall():
+                qq_number = _normalize_qq_number(uin)
+                if not qq_number:
+                    continue
+                for value in (uid, uin):
+                    key = str(value or "").strip()
+                    if key:
+                        out[key] = qq_number
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - metadata lookup is optional
+        logger.debug("account_qq_number_map build failed: %s", exc)
+    return out
+
+
+def _query_account_qq_number(conn) -> str:
+    """从直聊 sender/peer 元数据确认当前数据库唯一的自身 QQ 号。"""
+
+    import sqlite3
+
+    try:
+        cursor = conn.cursor()
+        columns = _qq_table_columns(cursor, "c2c_msg_table")
+        required_columns = {_NTQQ_COL_SENDER_UIN, _NTQQ_COL_PEER_UIN}
+        if columns is None or not required_columns.issubset(columns):
+            return ""
+        cursor.execute(
+            f'SELECT "{_NTQQ_COL_SENDER_UIN}" FROM c2c_msg_table '
+            f'WHERE "{_NTQQ_COL_SENDER_UIN}" IS NOT NULL '
+            f'AND "{_NTQQ_COL_PEER_UIN}" IS NOT NULL '
+            f'AND CAST("{_NTQQ_COL_SENDER_UIN}" AS TEXT) '
+            f'<> CAST("{_NTQQ_COL_PEER_UIN}" AS TEXT) '
+            f'GROUP BY "{_NTQQ_COL_SENDER_UIN}"'
+        )
+        rows = cursor.fetchall()
+    except sqlite3.Error as exc:
+        logger.debug("account QQ number query failed: %s", type(exc).__name__)
+        return ""
+    candidates = {
+        candidate
+        for row in rows
+        if row and (candidate := _normalize_qq_number(row[0]))
+    }
+    return next(iter(candidates)) if len(candidates) == 1 else ""
 
 
 def _build_group_member_map(group_db: Path) -> Dict[Tuple[int, int], str]:
@@ -1711,26 +2194,106 @@ def _build_group_member_map(group_db: Path) -> Dict[Tuple[int, int], str]:
         return out
     try:
         conn = sqlite3.connect(str(group_db))
-        cur = conn.cursor()
-        cur.execute(
-            f'SELECT "{_NTQQ_GROUP_MEMBER_COL_GROUP}", '
-            f'"{_NTQQ_GROUP_MEMBER_COL_UIN}", '
-            f'"{_NTQQ_PROFILE_COL_NICKNAME}" '
-            f'FROM group_member3 '
-            f'WHERE "{_NTQQ_GROUP_MEMBER_COL_GROUP}" IS NOT NULL '
-            f'AND "{_NTQQ_GROUP_MEMBER_COL_UIN}" IS NOT NULL '
-            f'AND "{_NTQQ_PROFILE_COL_NICKNAME}" IS NOT NULL'
-        )
-        for gid, uin, nick in cur.fetchall():
-            if not (gid and uin and nick and isinstance(nick, str) and nick.strip()):
-                continue
-            try:
-                out[(int(gid), int(uin))] = nick.strip()
-            except (ValueError, TypeError):
-                pass
-        conn.close()
+        try:
+            cursor = conn.cursor()
+            columns = _qq_table_columns(cursor, "group_member3")
+            required_columns = {
+                _NTQQ_GROUP_MEMBER_COL_GROUP,
+                _NTQQ_GROUP_MEMBER_COL_UIN,
+            }
+            if columns is None or not required_columns.issubset(columns):
+                return out
+            nickname_expression = (
+                f'"{_NTQQ_PROFILE_COL_NICKNAME}"'
+                if _NTQQ_PROFILE_COL_NICKNAME in columns
+                else "NULL"
+            )
+            cursor.execute(
+                f'SELECT "{_NTQQ_GROUP_MEMBER_COL_GROUP}", '
+                f'"{_NTQQ_GROUP_MEMBER_COL_UIN}", '
+                f'{nickname_expression} '
+                f'FROM group_member3 '
+                f'WHERE "{_NTQQ_GROUP_MEMBER_COL_GROUP}" IS NOT NULL '
+                f'AND "{_NTQQ_GROUP_MEMBER_COL_UIN}" IS NOT NULL'
+            )
+            for gid, uin, nick in cursor.fetchall():
+                if not (gid and uin and nick and isinstance(nick, str) and nick.strip()):
+                    continue
+                try:
+                    out[(int(gid), int(uin))] = nick.strip()
+                except (ValueError, TypeError):
+                    pass
+        finally:
+            conn.close()
     except Exception as e:
         logger.debug(f"group_member_map build failed: {e}")
+    return out
+
+
+def _build_group_name_map(group_db: Path) -> Dict[int, str]:
+    """Read QQ group metadata and build ``{group_id: display_name}``.
+
+    Both ``group_list`` and ``group_detail_info_ver1`` occur in current NTQQ
+    releases. The detail table is read last so its newer non-empty label wins.
+    A valid group ID with no name is retained with an empty internal label;
+    callers apply a machine-ID placeholder that Core later masks. Each table's
+    schema is checked first because SQLite may treat a quoted missing column as
+    a string literal instead of raising an error.
+    """
+    import sqlite3
+
+    out: Dict[int, str] = {}
+    if not group_db.exists():
+        return out
+    try:
+        conn = sqlite3.connect(str(group_db))
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {str(row[0]) for row in cursor.fetchall()}
+            for table in ("group_list", "group_detail_info_ver1"):
+                if table not in tables:
+                    continue
+                try:
+                    columns = _qq_table_columns(cursor, table)
+                    if (
+                        columns is None
+                        or _NTQQ_GROUP_MEMBER_COL_GROUP not in columns
+                    ):
+                        continue
+                    name_expression = (
+                        f'"{_NTQQ_GROUP_COL_NAME}"'
+                        if _NTQQ_GROUP_COL_NAME in columns
+                        else "NULL"
+                    )
+                    cursor.execute(
+                        f'SELECT "{_NTQQ_GROUP_MEMBER_COL_GROUP}", '
+                        f'{name_expression} FROM "{table}" '
+                        f'WHERE "{_NTQQ_GROUP_MEMBER_COL_GROUP}" IS NOT NULL'
+                    )
+                    rows = cursor.fetchall()
+                except sqlite3.Error as exc:
+                    logger.debug(
+                        "QQ group metadata table is incompatible: %s",
+                        type(exc).__name__,
+                    )
+                    continue
+                for group_id, name in rows:
+                    try:
+                        normalized_id = int(group_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if normalized_id <= 0:
+                        continue
+                    clean_name = name.strip() if isinstance(name, str) else ""
+                    if clean_name:
+                        out[normalized_id] = clean_name
+                    else:
+                        out.setdefault(normalized_id, "")
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("group_name_map build failed: %s", type(exc).__name__)
     return out
 
 
@@ -1769,11 +2332,531 @@ def _resolve_sender_name(
     return str(sender_uin)
 
 
+def _query_conversation_directory(
+    conn,
+    buddy_map: Optional[Dict[int, str]] = None,
+    buddy_directory_map: Optional[Dict[int, str]] = None,
+    group_name_map: Optional[Dict[int, str]] = None,
+) -> List[Dict]:
+    """Read the QQ conversation directory without selecting message bodies.
+
+    Only the peer/group identifier and ``COUNT(*)`` are queried from the two
+    message tables.  This function is intentionally separate from
+    :func:`_query_messages` so directory discovery cannot accidentally decode
+    message content.
+    """
+    import sqlite3
+
+    buddy_map = buddy_map or {}
+    buddy_directory_map = buddy_directory_map or {}
+    group_name_map = group_name_map or {}
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {str(row[0]) for row in cursor.fetchall()}
+    directory: List[Dict] = []
+
+    queries = (
+        ("c2c_msg_table", _NTQQ_COL_PEER_UIN, "direct"),
+        ("group_msg_table", _NTQQ_COL_GROUP_CODE, "group"),
+    )
+    for table, id_column, conversation_type in queries:
+        if table not in tables:
+            continue
+        columns = _qq_table_columns(cursor, table)
+        if columns is None or id_column not in columns:
+            logger.debug(
+                "QQ conversation table lacks required column: %s.%s",
+                table,
+                id_column,
+            )
+            continue
+        try:
+            cursor.execute(
+                f'SELECT "{id_column}", COUNT(*) FROM "{table}" '
+                f'WHERE "{id_column}" IS NOT NULL GROUP BY "{id_column}"'
+            )
+            rows = cursor.fetchall()
+        except sqlite3.Error as exc:
+            logger.debug("QQ conversation directory query failed: %s", type(exc).__name__)
+            continue
+        for raw_id, raw_count in rows:
+            conversation_id = str(raw_id or "").strip()
+            if not conversation_id:
+                continue
+            label = ""
+            if conversation_type == "direct":
+                try:
+                    label = buddy_map.get(int(conversation_id), "")
+                except (TypeError, ValueError):
+                    label = ""
+            else:
+                try:
+                    label = group_name_map.get(int(conversation_id), "")
+                except (TypeError, ValueError):
+                    label = ""
+            if not label:
+                prefix = "qq_group" if conversation_type == "group" else "qq_friend"
+                label = f"{prefix}_{conversation_id}"
+            directory.append({
+                "conversation_id": conversation_id,
+                "label": label,
+                "conversation_type": conversation_type,
+                "message_count": int(raw_count or 0),
+            })
+
+    represented = {
+        (item["conversation_type"], item["conversation_id"])
+        for item in directory
+    }
+    for raw_id, label in buddy_directory_map.items():
+        conversation_id = str(raw_id or "").strip()
+        key = ("direct", conversation_id)
+        if not conversation_id or key in represented:
+            continue
+        directory.append({
+            "conversation_id": conversation_id,
+            "label": str(label or f"qq_friend_{conversation_id}"),
+            "conversation_type": "direct",
+            "message_count": 0,
+        })
+        represented.add(key)
+    for raw_id, label in group_name_map.items():
+        conversation_id = str(raw_id or "").strip()
+        key = ("group", conversation_id)
+        if not conversation_id or key in represented:
+            continue
+        directory.append({
+            "conversation_id": conversation_id,
+            "label": str(label or f"qq_group_{conversation_id}"),
+            "conversation_type": "group",
+            "message_count": 0,
+        })
+        represented.add(key)
+
+    directory.sort(key=lambda item: (item["conversation_type"], item["conversation_id"]))
+    return directory
+
+
+def _normalize_qq_message_page_scope(
+    account_id: str,
+    conversation_id: str,
+    conversation_type: Optional[str],
+) -> Tuple[str, str, Optional[str]]:
+    """Validate one source-account/conversation scope without broadening it."""
+
+    if not isinstance(account_id, str) or not account_id.strip():
+        raise ValueError("account_id must identify one QQ source account")
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        raise ValueError("conversation_id must identify one exact QQ conversation")
+    normalized_type: Optional[str]
+    if conversation_type is None:
+        normalized_type = None
+    elif isinstance(conversation_type, str):
+        normalized_type = conversation_type.strip().lower()
+        if normalized_type not in {"direct", "group"}:
+            raise ValueError("conversation_type must be direct, group, or None")
+    else:
+        raise ValueError("conversation_type must be direct, group, or None")
+    return account_id.strip(), conversation_id.strip(), normalized_type
+
+
+def _validate_qq_message_page_request(
+    *,
+    account_id: str,
+    conversation_id: str,
+    conversation_type: Optional[str],
+    since_ts: float,
+    until_ts: float,
+    page_size: int,
+    cursor: Optional[_QQMessagePageCursor],
+) -> Tuple[str, str, Optional[str], float, float]:
+    """Return normalized page inputs, rejecting unsafe bounds and cursor reuse."""
+
+    account_id, conversation_id, conversation_type = (
+        _normalize_qq_message_page_scope(
+            account_id,
+            conversation_id,
+            conversation_type,
+        )
+    )
+    if isinstance(page_size, bool) or not isinstance(page_size, int):
+        raise ValueError("page_size must be an integer")
+    if page_size < 1 or page_size > _QQ_MESSAGE_PAGE_MAX_SIZE:
+        raise ValueError(
+            f"page_size must be between 1 and {_QQ_MESSAGE_PAGE_MAX_SIZE}"
+        )
+    if isinstance(since_ts, bool) or isinstance(until_ts, bool):
+        raise ValueError("since_ts and until_ts must be finite numbers")
+    try:
+        since_value = float(since_ts)
+        until_value = float(until_ts)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("since_ts and until_ts must be finite numbers") from exc
+    if not math.isfinite(since_value) or not math.isfinite(until_value):
+        raise ValueError("since_ts and until_ts must be finite numbers")
+    if since_value > until_value:
+        raise ValueError("since_ts must not be after until_ts")
+
+    if cursor is not None:
+        if not isinstance(cursor, _QQMessagePageCursor):
+            raise ValueError("cursor must be a QQ message page cursor")
+        if cursor.account_id != account_id:
+            raise ValueError("cursor account_id does not match the requested scope")
+        if cursor.conversation_id != conversation_id:
+            raise ValueError("cursor conversation_id does not match the requested scope")
+        if cursor.conversation_type != conversation_type:
+            raise ValueError("cursor conversation_type does not match the requested scope")
+        if cursor.since_ts != since_value:
+            raise ValueError("cursor since_ts does not match the requested window")
+        if cursor.until_ts != until_value:
+            raise ValueError("cursor until_ts does not match the requested window")
+        allowed_ranks = {
+            spec.table_rank
+            for spec in _QQ_MESSAGE_TABLE_SPECS
+            if conversation_type is None or spec.conversation_type == conversation_type
+        }
+        if (
+            isinstance(cursor.table_rank, bool)
+            or not isinstance(cursor.table_rank, int)
+            or cursor.table_rank not in allowed_ranks
+        ):
+            raise ValueError("cursor table_rank does not match the requested scope")
+        try:
+            cursor_time = float(cursor.msg_time)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("cursor keyset position is invalid") from exc
+        if (
+            not math.isfinite(cursor_time)
+            or isinstance(cursor.rowid, bool)
+            or not isinstance(cursor.rowid, int)
+            or cursor.rowid < 1
+        ):
+            raise ValueError("cursor keyset position is invalid")
+    return account_id, conversation_id, conversation_type, since_value, until_value
+
+
+def _qq_message_keyset_sql(
+    spec: _QQMessageTableSpec,
+    cursor: Optional[_QQMessagePageCursor],
+) -> Tuple[str, Tuple[object, ...]]:
+    """Build the per-table half of the global (time, table, rowid) keyset."""
+
+    if cursor is None:
+        return "", ()
+    time_column = f'"{_NTQQ_COL_MSG_TIME}"'
+    if spec.table_rank < cursor.table_rank:
+        return f" AND {time_column} > ?", (cursor.msg_time,)
+    if spec.table_rank > cursor.table_rank:
+        return f" AND {time_column} >= ?", (cursor.msg_time,)
+    return (
+        f" AND ({time_column} > ? OR "
+        f"({time_column} = ? AND rowid > ?))",
+        (cursor.msg_time, cursor.msg_time, cursor.rowid),
+    )
+
+
+def _qq_message_page_select(
+    spec: _QQMessageTableSpec,
+    columns: set[str],
+    *,
+    conversation_id: str,
+    since_ts: float,
+    until_ts: float,
+    cursor: Optional[_QQMessagePageCursor],
+) -> Tuple[str, Tuple[object, ...]]:
+    """Build one allowlisted message-table SELECT with all row filters pushed down."""
+
+    def optional_column(column: str) -> str:
+        return f'"{column}"' if column in columns else "NULL"
+
+    keyset_sql, keyset_params = _qq_message_keyset_sql(spec, cursor)
+    sql = (
+        f"SELECT {optional_column(_NTQQ_COL_MSG_UID)} AS _msg_uid, "
+        f'"{_NTQQ_COL_MSG_TIME}" AS _msg_time, '
+        f"{optional_column(_NTQQ_COL_SENDER_NAME)} AS _sender_name, "
+        f'"{_NTQQ_COL_SENDER_UIN}" AS _sender_uin, '
+        f'"{_NTQQ_COL_MSG_BODY}" AS _msg_body, '
+        f'"{spec.conversation_column}" AS _conversation_id, '
+        f"{spec.table_rank} AS _table_rank, rowid AS _rowid, "
+        f"'{spec.conversation_type}' AS _conversation_type, "
+        f"{optional_column(_NTQQ_COL_SENDER_UID)} AS _sender_uid "
+        f'FROM "{spec.table}" '
+        f'WHERE "{_NTQQ_COL_MSG_TIME}" >= ? '
+        f'AND "{_NTQQ_COL_MSG_TIME}" <= ? '
+        f'AND "{_NTQQ_COL_MSG_TIME}" > 0 '
+        f'AND "{spec.conversation_column}" = ?'
+        f"{keyset_sql}"
+    )
+    return sql, (since_ts, until_ts, conversation_id, *keyset_params)
+
+
+def _qq_message_page_record(
+    row: Tuple,
+    *,
+    account_id: str,
+    conversation_id: str,
+    buddy_map: Dict[int, str],
+    group_map: Dict[Tuple[int, int], str],
+    group_name_map: Dict[int, str],
+) -> Optional[Dict]:
+    """Decode one already-bounded raw row into the legacy dictionary shape."""
+
+    from datetime import timezone
+
+    (
+        msg_uid,
+        msg_time,
+        sender_name,
+        sender_uin,
+        msg_body,
+        _raw_conversation_id,
+        _table_rank,
+        source_rowid,
+        conversation_type,
+        sender_uid,
+    ) = row
+    try:
+        ts = float(msg_time)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ts):
+        return None
+    if not msg_body:
+        raise RuntimeError("QQ message body is unavailable")
+    content = _extract_msg_text(msg_body)
+    content = str(content or "")
+    if not content.strip():
+        raise RuntimeError("QQ message body has no safe narrative")
+    is_group = conversation_type == "group"
+    raw_sender_uin = str(sender_uin).strip() if sender_uin is not None else ""
+    if not raw_sender_uin:
+        raise RuntimeError("QQ message sender identity is unavailable")
+    try:
+        sender_uin_int = int(raw_sender_uin)
+    except (TypeError, ValueError):
+        raise RuntimeError("QQ message sender identity is invalid") from None
+    if sender_uin_int < 0:
+        raise RuntimeError("QQ message sender identity is invalid")
+    normalized_sender_uid = str(sender_uid or "").strip()
+    if normalized_sender_uid and (
+        len(normalized_sender_uid) > 512
+        or any(ord(character) < 32 for character in normalized_sender_uid)
+    ):
+        raise RuntimeError("QQ message sender identity is invalid")
+    if sender_uin_int == 0 and not normalized_sender_uid:
+        raise RuntimeError("QQ message sender identity is unavailable")
+    raw_sender_name = sender_name.strip() if isinstance(sender_name, str) else ""
+    resolved_name = _resolve_sender_name(
+        raw_name=raw_sender_name,
+        sender_uin=sender_uin_int,
+        chat_uid=conversation_id,
+        is_group=is_group,
+        buddy_map=buddy_map,
+        group_map=group_map,
+    )
+    sender_identity = (
+        str(sender_uin_int) if sender_uin_int != 0 else normalized_sender_uid
+    )
+    if is_group:
+        try:
+            chat_name = group_name_map.get(int(conversation_id), "")
+        except (TypeError, ValueError):
+            chat_name = ""
+        chat_name = chat_name or f"qq_group_{conversation_id}"
+    else:
+        try:
+            chat_name = buddy_map.get(int(conversation_id), "")
+        except (TypeError, ValueError):
+            chat_name = ""
+        chat_name = chat_name or f"qq_friend_{conversation_id}"
+    try:
+        normalized_msg_uid = int(msg_uid) if msg_uid is not None else None
+    except (TypeError, ValueError):
+        normalized_msg_uid = None
+    wxid_hash = hashlib.sha256(sender_identity.encode("utf-8")).hexdigest()[:16]
+    return {
+        "ts": ts,
+        "ts_iso": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+        "wxid_hash": wxid_hash,
+        "sender_qq": sender_uin_int,
+        "sender_uid": normalized_sender_uid,
+        "sender_name": resolved_name or sender_identity,
+        # Bounded page reads bound row count, not message-body length.  The
+        # stream transport applies its own per-frame byte ceiling and must see
+        # the complete local message so downstream SourceRecord construction is
+        # lossless.
+        "content": content,
+        "msg_id": normalized_msg_uid,
+        "chat_uid": conversation_id,
+        "chat_kind": "group" if is_group else "friend",
+        "chat_name": chat_name,
+        "account_id": account_id,
+        "conversation_id": conversation_id,
+        "thread_id": f"{account_id}::{conversation_id}",
+        "conversation_type": conversation_type,
+        "is_group_chat": is_group,
+        "source_offset": (
+            f"qq_db:{conversation_id}:{conversation_type}:{int(source_rowid)}"
+        ),
+        "attachment_meta": (
+            _extract_qq_attachment_meta(msg_body) if msg_body else None
+        ),
+    }
+
+
+def _query_message_dict_page(
+    conn,
+    *,
+    account_id: str,
+    conversation_id: str,
+    conversation_type: Optional[str],
+    since_ts: float,
+    until_ts: float,
+    page_size: int = _QQ_MESSAGE_PAGE_DEFAULT_SIZE,
+    cursor: Optional[_QQMessagePageCursor] = None,
+    buddy_map: Optional[Dict[int, str]] = None,
+    group_map: Optional[Dict[Tuple[int, int], str]] = None,
+    group_name_map: Optional[Dict[int, str]] = None,
+) -> _QQMessageDictPage:
+    """Read one bounded, deterministic keyset page from a decrypted QQ DB.
+
+    The source account is bound by the caller's already-selected database and
+    repeated in the cursor. Conversation, direct/group type, inclusive time
+    window, keyset position, ordering, and LIMIT are all enforced by SQLite.
+    ``conversation_type=None`` intentionally merges the two fixed allowlisted
+    message tables; an exact type only touches its corresponding table.
+    """
+
+    import sqlite3
+
+    (
+        account_id,
+        conversation_id,
+        conversation_type,
+        since_ts,
+        until_ts,
+    ) = _validate_qq_message_page_request(
+        account_id=account_id,
+        conversation_id=conversation_id,
+        conversation_type=conversation_type,
+        since_ts=since_ts,
+        until_ts=until_ts,
+        page_size=page_size,
+        cursor=cursor,
+    )
+    buddy_map = buddy_map or {}
+    group_map = group_map or {}
+    group_name_map = group_name_map or {}
+    db_cursor = conn.cursor()
+    db_cursor.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type = 'table' AND name IN (?, ?) ORDER BY name",
+        tuple(spec.table for spec in _QQ_MESSAGE_TABLE_SPECS),
+    )
+    available_tables = {
+        str(row[0])
+        for row in db_cursor.fetchmany(len(_QQ_MESSAGE_TABLE_SPECS) + 1)
+    }
+    requested_specs = [
+        spec
+        for spec in _QQ_MESSAGE_TABLE_SPECS
+        if conversation_type is None or spec.conversation_type == conversation_type
+    ]
+    specs = []
+    for spec in requested_specs:
+        if spec.table not in available_tables:
+            if conversation_type is not None:
+                raise RuntimeError("requested QQ message table is unavailable")
+            continue
+        specs.append(spec)
+
+    selects: List[str] = []
+    parameters: List[object] = []
+    for spec in specs:
+        columns = _qq_table_columns(db_cursor, spec.table)
+        required_columns = {
+            spec.conversation_column,
+            _NTQQ_COL_SENDER_UIN,
+            _NTQQ_COL_MSG_TIME,
+            _NTQQ_COL_MSG_BODY,
+        }
+        if columns is None or not required_columns.issubset(columns):
+            logger.warning("%s: incompatible message page schema", spec.table)
+            raise RuntimeError("requested QQ message table schema is incompatible")
+        select_sql, select_parameters = _qq_message_page_select(
+            spec,
+            columns,
+            conversation_id=conversation_id,
+            since_ts=since_ts,
+            until_ts=until_ts,
+            cursor=cursor,
+        )
+        selects.append(select_sql)
+        parameters.extend(select_parameters)
+
+    if not selects:
+        return _QQMessageDictPage(records=(), cursor_after=cursor, has_more=False)
+
+    # One-row lookahead makes ``has_more`` exact while peak result materialization
+    # remains bounded by ``page_size + 1``. The returned page never exceeds the
+    # caller's requested page size.
+    sql = (
+        "SELECT * FROM ("
+        + " UNION ALL ".join(selects)
+        + ") AS _qq_message_page "
+        "ORDER BY _msg_time ASC, _table_rank ASC, _rowid ASC LIMIT ?"
+    )
+    parameters.append(page_size + 1)
+    try:
+        db_cursor.execute(sql, tuple(parameters))
+        raw_rows = db_cursor.fetchmany(page_size + 1)
+    except sqlite3.Error as exc:
+        logger.warning("QQ bounded message page query failed: %s", type(exc).__name__)
+        raise
+
+    has_more = len(raw_rows) > page_size
+    consumed_rows = raw_rows[:page_size]
+    if not consumed_rows:
+        return _QQMessageDictPage(records=(), cursor_after=cursor, has_more=False)
+    last_row = consumed_rows[-1]
+    cursor_after = _QQMessagePageCursor(
+        account_id=account_id,
+        conversation_id=conversation_id,
+        conversation_type=conversation_type,
+        since_ts=since_ts,
+        until_ts=until_ts,
+        msg_time=float(last_row[1]),
+        table_rank=int(last_row[6]),
+        rowid=int(last_row[7]),
+    )
+    records = tuple(
+        record
+        for record in (
+            _qq_message_page_record(
+                row,
+                account_id=account_id,
+                conversation_id=conversation_id,
+                buddy_map=buddy_map,
+                group_map=group_map,
+                group_name_map=group_name_map,
+            )
+            for row in consumed_rows
+        )
+        if record is not None
+    )
+    return _QQMessageDictPage(
+        records=records,
+        cursor_after=cursor_after,
+        has_more=has_more,
+    )
+
+
 def _query_messages(
     conn,
     days_back: int = 1,
     buddy_map: Optional[Dict[int, str]] = None,
     group_map: Optional[Dict[Tuple[int, int], str]] = None,
+    group_name_map: Optional[Dict[int, str]] = None,
 ) -> List[QQMessage]:
     """Query messages from NTQQ 9.9.x message tables using hardcoded numeric
     column IDs (NTQQ stores cols as numeric "40001"/"40050" etc., not semantic
@@ -1793,6 +2876,8 @@ def _query_messages(
         buddy_map = {}
     if group_map is None:
         group_map = {}
+    if group_name_map is None:
+        group_name_map = {}
 
     messages: List[QQMessage] = []
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -1802,19 +2887,39 @@ def _query_messages(
     since_ts = int((datetime.now() - timedelta(days=days_back)).timestamp())
 
     for table in target_tables:
+        is_group = table == "group_msg_table"
+        conversation_column = (
+            _NTQQ_COL_GROUP_CODE if is_group else _NTQQ_COL_PEER_UIN
+        )
+        columns = _qq_table_columns(cursor, table)
+        required_columns = {
+            conversation_column,
+            _NTQQ_COL_SENDER_UIN,
+            _NTQQ_COL_MSG_TIME,
+            _NTQQ_COL_MSG_BODY,
+        }
+        if columns is None or not required_columns.issubset(columns):
+            logger.warning("%s: incompatible message schema", table)
+            continue
+
+        def select_expression(column: str) -> str:
+            return f'"{column}"' if column in columns else "NULL"
+
         try:
             cursor.execute(
-                f'SELECT "{_NTQQ_COL_MSG_UID}", "{_NTQQ_COL_MSG_TIME}", '
-                f'"{_NTQQ_COL_SENDER_NAME}", "{_NTQQ_COL_SENDER_UIN}", '
-                f'"{_NTQQ_COL_MSG_BODY}", "{_NTQQ_COL_PEER_UIN}", '
-                f'"{_NTQQ_COL_GROUP_CODE}" '
-                f'FROM {table} WHERE "{_NTQQ_COL_MSG_TIME}" > ? '
+                f'SELECT {select_expression(_NTQQ_COL_MSG_UID)}, '
+                f'"{_NTQQ_COL_MSG_TIME}", '
+                f'{select_expression(_NTQQ_COL_SENDER_NAME)}, '
+                f'"{_NTQQ_COL_SENDER_UIN}", "{_NTQQ_COL_MSG_BODY}", '
+                f'{select_expression(_NTQQ_COL_PEER_UIN)}, '
+                f'{select_expression(_NTQQ_COL_GROUP_CODE)} '
+                f'FROM "{table}" WHERE "{_NTQQ_COL_MSG_TIME}" > ? '
                 f'ORDER BY "{_NTQQ_COL_MSG_TIME}"',
                 (since_ts,),
             )
             rows = cursor.fetchall()
             logger.info(f"{table}: {len(rows)} rows since {since_ts}")
-        except sqlite3.OperationalError as e:
+        except sqlite3.Error as e:
             logger.warning(f"{table}: query fail {e}")
             continue
 
@@ -1828,9 +2933,19 @@ def _query_messages(
             if not text:
                 continue
             att_meta = _extract_qq_attachment_meta(msg_body) if msg_body else None
-            is_group = (table == "group_msg_table")
             chat_uid = str(group_code) if is_group else str(peer_uin)
-            chat_name = f"qq_group_{chat_uid}" if is_group else f"qq_friend_{chat_uid}"
+            if is_group:
+                try:
+                    chat_name = group_name_map.get(int(chat_uid), "")
+                except (TypeError, ValueError):
+                    chat_name = ""
+                chat_name = chat_name or f"qq_group_{chat_uid}"
+            else:
+                try:
+                    chat_name = buddy_map.get(int(chat_uid), "")
+                except (TypeError, ValueError):
+                    chat_name = ""
+                chat_name = chat_name or f"qq_friend_{chat_uid}"
             try:
                 sender_uin_int = int(sender_uin) if sender_uin else 0
             except (ValueError, TypeError):
@@ -1852,6 +2967,8 @@ def _query_messages(
                 chat_name=chat_name,
                 chat_uid=chat_uid,
                 msg_type=1,
+                conversation_type="group" if is_group else "direct",
+                is_group_chat=is_group,
                 attachment_meta=att_meta,
             ))
     messages.sort(key=lambda m: m.timestamp)
@@ -1874,9 +2991,33 @@ class QQDBReader:
             print("Use clipboard fallback")
     """
     
-    def __init__(self):
+    def __init__(
+        self,
+        data_root: Optional[Path] = None,
+        account_id: Optional[str] = None,
+        *,
+        allow_live_key_extract: bool = True,
+        live_key_timeout_s: Optional[float] = None,
+    ):
+        """Create a reader, optionally scoped to one discovered account.
+
+        ``account_id`` is matched against :func:`find_qq_account_databases` and
+        is never joined onto a filesystem path.  Calling without arguments
+        preserves the v0.2.0 active-account behavior. Directory-only callers
+        disable live extraction so listing accounts never scans process memory.
+        """
+        self._configured_data_root = Path(data_root) if data_root is not None else None
+        self._configured_account_id = str(account_id) if account_id is not None else None
+        self._allow_live_key_extract = bool(allow_live_key_extract)
+        self._live_key_timeout_s = (
+            max(float(live_key_timeout_s), 0.1)
+            if live_key_timeout_s is not None
+            else None
+        )
         self.data_root = None
         self.db_path = None
+        self.account_id = None
+        self.account_label = ""
         self.key = None
         self.key_source = None  # "live" | "cache"; never contains key material
         self._initialized = False
@@ -1889,15 +3030,24 @@ class QQDBReader:
           2. Cached key file ``data/secrets/qq_db.key`` (extracted previously).
           3. None — caller sees ``key=None`` and downstream skips gracefully.
         """
-        self.data_root = find_qq_data_root()
+        self.data_root = self._configured_data_root or find_qq_data_root()
         if not self.data_root:
             logger.warning("QQ data root not found")
             self._initialized = True
             return False
 
-        self.db_path = find_msg_database(self.data_root)
+        account_databases = find_qq_account_databases(self.data_root)
+        if self._configured_account_id is not None:
+            self.db_path = account_databases.get(self._configured_account_id)
+            self.account_id = self._configured_account_id if self.db_path is not None else None
+        else:
+            self.db_path = find_msg_database(self.data_root)
+            for discovered_id, discovered_db in account_databases.items():
+                if discovered_db == self.db_path:
+                    self.account_id = discovered_id
+                    break
         if not self.db_path:
-            logger.warning("QQ message database not found (no live install nor snapshot)")
+            logger.warning("QQ message database is unavailable for the requested scope")
             self._initialized = True
             return False
 
@@ -1911,14 +3061,21 @@ class QQDBReader:
 
         # 0. Try cached key first (fast path)
         if not force_live:
-            cached = load_cached_key()
-            if cached:
+            cached = (
+                load_cached_key_for_account(self.account_id)
+                if self.account_id
+                else load_cached_key()
+            )
+            verification = _read_qq_verification_bytes(self.db_path) if cached else None
+            if cached and verification and _verify_key_qq(cached, verification):
                 logger.info("Using cached key from data/secrets/qq_db.key (fast path)")
                 self.key = cached
                 self.key_source = "cache"
+            elif cached:
+                logger.warning("Cached QQ key does not unlock the requested account database")
 
         # 1. Try live extraction if no cached key OR force_live
-        if not self.key:
+        if not self.key and self._allow_live_key_extract:
             pids = _get_qq_pids()
             if pids:
                 # Bound the complete passive scan, not every QQ helper. The
@@ -1931,6 +3088,9 @@ class QQDBReader:
                 total_budget = max(
                     0.1, float(os.environ.get("CHATLOG_QQ_SCAN_TOTAL_S", "120"))
                 )
+                if self._live_key_timeout_s is not None:
+                    total_budget = min(total_budget, self._live_key_timeout_s)
+                    per_process_budget = min(per_process_budget, total_budget)
                 deadline = _time.monotonic() + total_budget
                 for pid in pids:
                     remaining = deadline - _time.monotonic()
@@ -1943,8 +3103,13 @@ class QQDBReader:
                                                    timeout_s=min(per_process_budget, remaining))
                     if self.key:
                         self.key_source = "live"
-                        if save_cached_key(self.key):
-                            logger.info("Key extracted from QQ.exe and cached to data/secrets/qq_db.key")
+                        saved = (
+                            save_cached_key_for_account(self.key, self.account_id)
+                            if self.account_id
+                            else save_cached_key(self.key)
+                        )
+                        if saved:
+                            logger.info("Key extracted from QQ.exe and cached for the selected account")
                         break
                 if not self.key:
                     logger.warning("QQ running but key extraction failed (try Admin or different PID).")
@@ -1954,11 +3119,18 @@ class QQDBReader:
             "1", "true", "yes", "on",
         )
         if not self.key and not require_live:
-            cached = load_cached_key()
-            if cached:
+            cached = (
+                load_cached_key_for_account(self.account_id)
+                if self.account_id
+                else load_cached_key()
+            )
+            verification = _read_qq_verification_bytes(self.db_path) if cached else None
+            if cached and verification and _verify_key_qq(cached, verification):
                 logger.info("Using cached key from data/secrets/qq_db.key (fallback)")
                 self.key = cached
                 self.key_source = "cache"
+            elif not self._allow_live_key_extract:
+                logger.warning("No verified cached key is available for the requested account")
             else:
                 logger.warning("No key available (QQ.exe not running and no cached key).")
         elif not self.key:
@@ -1973,6 +3145,127 @@ class QQDBReader:
         if not self._initialized:
             self.initialize()
         return bool(self.db_path) and bool(self.key)
+
+    def iter_message_dict_pages(
+        self,
+        since_ts: float,
+        until_ts: float,
+        *,
+        account_id: str,
+        conversation_id: str,
+        conversation_type: Optional[str],
+        page_size: int = _QQ_MESSAGE_PAGE_DEFAULT_SIZE,
+        cursor: Optional[_QQMessagePageCursor] = None,
+        cancel_requested: Optional[Callable[[], bool]] = None,
+    ) -> Iterator[_QQMessageDictPage]:
+        """Yield bounded keyset pages for one explicitly selected QQ scope.
+
+        A single decrypted snapshot and SQLite connection live for the whole
+        iterator. The method never calls ``read_recent``/``read_recent_dicts``
+        and therefore never materializes the account's complete history first.
+        ``account_id`` must exactly match this reader's discovered database;
+        stream-v1 callers should also provide an exact direct/group type.
+        """
+
+        if cancel_requested is not None and not callable(cancel_requested):
+            raise ValueError("cancel_requested must be callable")
+        (
+            account_id,
+            conversation_id,
+            conversation_type,
+            since_ts,
+            until_ts,
+        ) = _validate_qq_message_page_request(
+            account_id=account_id,
+            conversation_id=conversation_id,
+            conversation_type=conversation_type,
+            since_ts=since_ts,
+            until_ts=until_ts,
+            page_size=page_size,
+            cursor=cursor,
+        )
+        _raise_if_qq_message_page_cancelled(cancel_requested)
+        if not self._initialized:
+            self.initialize()
+        _raise_if_qq_message_page_cancelled(cancel_requested)
+        reader_account_id = str(self.account_id or "").strip()
+        if reader_account_id != account_id:
+            raise ValueError("account_id does not match the reader's selected database")
+        if not self.db_path or not self.key:
+            return
+
+        tmp_dir = tempfile.mkdtemp(prefix="qq_page_")
+        conn = None
+        try:
+            no_header_path = Path(tmp_dir) / "no_header.db"
+            if not _skip_header(self.db_path, no_header_path):
+                raise OSError("failed to prepare the selected QQ database snapshot")
+            decrypted_path = Path(tmp_dir) / "decrypted.db"
+            if not _decrypt_db_qq(no_header_path, self.key, decrypted_path):
+                logger.warning("QQ page snapshot decryption failed, trying as plaintext")
+                decrypted_path = no_header_path
+            _raise_if_qq_message_page_cancelled(cancel_requested)
+
+            buddy_map: Dict[int, str] = {}
+            group_map: Dict[Tuple[int, int], str] = {}
+            group_name_map: Dict[int, str] = {}
+            nt_db_dir = self.db_path.parent
+            profile_src = nt_db_dir / "profile_info.db"
+            if profile_src.exists():
+                profile_dec = _decrypt_aux_db(profile_src, self.key, Path(tmp_dir))
+                if profile_dec:
+                    buddy_map = _build_buddy_name_map(profile_dec)
+                    account_numbers = _build_account_qq_number_map(profile_dec)
+                    profile_account_label = account_numbers.get(account_id, "")
+                    if profile_account_label:
+                        self.account_label = profile_account_label
+            group_src = nt_db_dir / "group_info.db"
+            if group_src.exists():
+                _raise_if_qq_message_page_cancelled(cancel_requested)
+                group_dec = _decrypt_aux_db(group_src, self.key, Path(tmp_dir))
+                if group_dec:
+                    group_map = _build_group_member_map(group_dec)
+                    group_name_map = _build_group_name_map(group_dec)
+
+            import sqlite3
+
+            conn = sqlite3.connect(str(decrypted_path))
+            account_number = _query_account_qq_number(conn)
+            if account_number:
+                self.account_label = account_number
+            current_cursor = cursor
+            while True:
+                _raise_if_qq_message_page_cancelled(cancel_requested)
+                page = _query_message_dict_page(
+                    conn,
+                    account_id=account_id,
+                    conversation_id=conversation_id,
+                    conversation_type=conversation_type,
+                    since_ts=since_ts,
+                    until_ts=until_ts,
+                    page_size=page_size,
+                    cursor=current_cursor,
+                    buddy_map=buddy_map,
+                    group_map=group_map,
+                    group_name_map=group_name_map,
+                )
+                _raise_if_qq_message_page_cancelled(cancel_requested)
+                progressed = page.cursor_after != current_cursor
+                if page.records or progressed:
+                    yield page
+                    _raise_if_qq_message_page_cancelled(cancel_requested)
+                if not page.has_more:
+                    break
+                if not progressed or page.cursor_after is None:
+                    raise RuntimeError("QQ message keyset page did not advance")
+                current_cursor = page.cursor_after
+        finally:
+            if conn is not None:
+                conn.close()
+            try:
+                shutil.rmtree(tmp_dir)
+            except Exception:
+                pass
     
     def read_recent(self, days: int = 1, hours: Optional[float] = None) -> List[QQMessage]:
         """Read messages from the last N days (or hours).
@@ -2014,6 +3307,7 @@ class QQDBReader:
             # name lookup maps. Failure is non-fatal (= numeric uin fallback).
             buddy_map: Dict[int, str] = {}
             group_map: Dict[Tuple[int, int], str] = {}
+            group_name_map: Dict[int, str] = {}
             try:
                 nt_db_dir = self.db_path.parent  # nt_db/
                 profile_src = nt_db_dir / "profile_info.db"
@@ -2025,6 +3319,13 @@ class QQDBReader:
                     )
                     if profile_dec:
                         buddy_map = _build_buddy_name_map(profile_dec)
+                        account_numbers = _build_account_qq_number_map(profile_dec)
+                        profile_account_label = account_numbers.get(
+                            str(self.account_id or "").strip(),
+                            "",
+                        )
+                        if profile_account_label:
+                            self.account_label = profile_account_label
                         logger.info(f"buddy_map loaded: {len(buddy_map)} entries")
                 if group_src.exists():
                     group_dec = _decrypt_aux_db(
@@ -2032,17 +3333,23 @@ class QQDBReader:
                     )
                     if group_dec:
                         group_map = _build_group_member_map(group_dec)
+                        group_name_map = _build_group_name_map(group_dec)
                         logger.info(f"group_member_map loaded: {len(group_map)} entries")
+                        logger.info(f"group_name_map loaded: {len(group_name_map)} entries")
             except Exception as e:
                 logger.warning(f"Aux db decrypt for name lookup failed: {e}")
 
             try:
                 import sqlite3
                 conn = sqlite3.connect(str(decrypted_path))
+                account_number = _query_account_qq_number(conn)
+                if account_number:
+                    self.account_label = account_number
                 messages = _query_messages(
                     conn, days_back=days,
                     buddy_map=buddy_map,
                     group_map=group_map,
+                    group_name_map=group_name_map,
                 )
                 conn.close()
                 return messages
@@ -2050,6 +3357,75 @@ class QQDBReader:
                 logger.warning(f"SQLite query failed: {e}")
                 return []
 
+        finally:
+            try:
+                shutil.rmtree(tmp_dir)
+            except Exception:
+                pass
+
+    def read_conversation_directory(self) -> Optional[List[Dict]]:
+        """Return native QQ conversations and counts without reading bodies.
+
+        ``None`` means the database could not be opened/decrypted; an empty
+        list means it was read successfully and contains no conversation rows.
+        """
+        if not self._initialized:
+            self.initialize()
+        if not self.db_path or not self.key:
+            return None
+
+        self.account_label = ""
+        tmp_dir = tempfile.mkdtemp(prefix="qq_directory_")
+        try:
+            no_header_path = Path(tmp_dir) / "no_header.db"
+            if not _skip_header(self.db_path, no_header_path):
+                return None
+            decrypted_path = Path(tmp_dir) / "decrypted.db"
+            if not _decrypt_db_qq(no_header_path, self.key, decrypted_path):
+                decrypted_path = no_header_path
+
+            buddy_map: Dict[int, str] = {}
+            buddy_directory_map: Dict[int, str] = {}
+            group_name_map: Dict[int, str] = {}
+            profile_src = self.db_path.parent / "profile_info.db"
+            if profile_src.exists():
+                profile_dec = _decrypt_aux_db(profile_src, self.key, Path(tmp_dir))
+                if profile_dec:
+                    buddy_map = _build_buddy_directory_label_map(profile_dec)
+                    buddy_directory_map = _build_buddy_directory_map(profile_dec)
+                    account_numbers = _build_account_qq_number_map(profile_dec)
+                    self.account_label = account_numbers.get(
+                        str(self.account_id or "").strip(),
+                        "",
+                    )
+
+            group_src = self.db_path.parent / "group_info.db"
+            if group_src.exists():
+                group_dec = _decrypt_aux_db(group_src, self.key, Path(tmp_dir))
+                if group_dec:
+                    group_name_map = _build_group_name_map(group_dec)
+
+            import sqlite3
+            conn = sqlite3.connect(str(decrypted_path))
+            try:
+                account_number = _query_account_qq_number(conn)
+                if account_number:
+                    self.account_label = account_number
+                _exclude_self_from_buddy_directory(
+                    buddy_directory_map,
+                    self.account_label,
+                )
+                return _query_conversation_directory(
+                    conn,
+                    buddy_map=buddy_map,
+                    buddy_directory_map=buddy_directory_map,
+                    group_name_map=group_name_map,
+                )
+            finally:
+                conn.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("QQ conversation directory is unavailable: %s", type(exc).__name__)
+            return None
         finally:
             try:
                 shutil.rmtree(tmp_dir)
@@ -2106,6 +3482,7 @@ class QQDBReader:
         from datetime import timezone
         msgs = self.read_recent(days=max(1, int((until_ts - since_ts) / 86400) + 1))
         out: List[Dict] = []
+        account_id = str(self.account_id or "unknown")
         for m in msgs:
             ts = m.timestamp.timestamp()
             if ts < since_ts or ts > until_ts:
@@ -2119,6 +3496,16 @@ class QQDBReader:
                 sender_qq = int(m.sender) if m.sender and m.sender.isdigit() else 0
             except (ValueError, AttributeError):
                 sender_qq = 0
+            conversation_id = str(m.chat_uid or m.chat_name or "")
+            conversation_type = str(
+                getattr(m, "conversation_type", "") or ""
+            ).strip().lower()
+            is_group_chat = bool(
+                getattr(m, "is_group_chat", False)
+                or conversation_type == "group"
+            )
+            if conversation_type not in {"direct", "group"}:
+                conversation_type = "group" if is_group_chat else "direct"
             out.append({
                 "ts": ts,
                 "ts_iso": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
@@ -2128,7 +3515,12 @@ class QQDBReader:
                 "content": content[:1500],
                 "msg_id": None,
                 "chat_uid": m.chat_uid or m.chat_name,
-                "chat_kind": "group" if "group" in (m.chat_name or "").lower() else "friend",
+                "chat_kind": "group" if is_group_chat else "friend",
+                "account_id": account_id,
+                "conversation_id": conversation_id,
+                "thread_id": f"{account_id}::{conversation_id}",
+                "conversation_type": conversation_type,
+                "is_group_chat": is_group_chat,
                 "source_offset": f"qq_db:{m.chat_uid}:{int(ts)}",
                 # attachment metadata for doc cross-linkage
                 "attachment_meta": m.attachment_meta,

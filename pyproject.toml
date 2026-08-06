@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatlog-keeper"
-version = "0.2.0"
+version = "0.3.1"
 description = "Decrypt and export your own local QQ / WeChat chat history for personal backup and nostalgia. Local-only; nothing is uploaded."
 readme = "README.md"
 requires-python = ">=3.9"

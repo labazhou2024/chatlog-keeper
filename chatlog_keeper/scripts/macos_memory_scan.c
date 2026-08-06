@@ -6,14 +6,102 @@
  * before it can be cached.
  */
 #include <ctype.h>
+#include <libproc.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/proc_info.h>
 
 #define CHUNK (8u * 1024u * 1024u)
 #define OVERLAP 256u
+
+struct process_identity {
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    uint64_t start_sec;
+    uint64_t start_usec;
+};
+
+static int read_identity(pid_t pid, struct process_identity *out) {
+    struct proc_bsdinfo info;
+    memset(out, 0, sizeof(*out));
+    memset(&info, 0, sizeof(info));
+    int path_len = proc_pidpath(pid, out->path, sizeof(out->path));
+    if (path_len <= 0 || (size_t)path_len >= sizeof(out->path)) return 0;
+    int info_len = proc_pidinfo(
+        pid, PROC_PIDTBSDINFO, 0, &info, (int)sizeof(info));
+    if (info_len != (int)sizeof(info) || info.pbi_pid != (uint32_t)pid) return 0;
+    out->start_sec = info.pbi_start_tvsec;
+    out->start_usec = info.pbi_start_tvusec;
+    return 1;
+}
+
+static int same_identity(
+    const struct process_identity *left,
+    const struct process_identity *right) {
+    return left->start_sec == right->start_sec &&
+           left->start_usec == right->start_usec &&
+           !strcmp(left->path, right->path);
+}
+
+static int snapshot_identity(pid_t pid, struct process_identity *out) {
+    struct process_identity first;
+    struct process_identity second;
+    if (!read_identity(pid, &first) || !read_identity(pid, &second) ||
+        !same_identity(&first, &second)) {
+        return 0;
+    }
+    *out = second;
+    return 1;
+}
+
+static int parse_u64(const char *raw, uint64_t *out) {
+    if (!raw || !*raw) return 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(raw, &end, 10);
+    if (!end || *end) return 0;
+    *out = (uint64_t)parsed;
+    return 1;
+}
+
+static int hex_value(unsigned char value) {
+    if (value >= '0' && value <= '9') return (int)(value - '0');
+    if (value >= 'a' && value <= 'f') return (int)(value - 'a') + 10;
+    if (value >= 'A' && value <= 'F') return (int)(value - 'A') + 10;
+    return -1;
+}
+
+static int decode_path(const char *raw, char *out, size_t out_size) {
+    size_t raw_len = strlen(raw);
+    if (!raw_len || (raw_len % 2) || raw_len / 2 >= out_size) return 0;
+    for (size_t i = 0; i < raw_len / 2; ++i) {
+        int high = hex_value((unsigned char)raw[2 * i]);
+        int low = hex_value((unsigned char)raw[2 * i + 1]);
+        if (high < 0 || low < 0) return 0;
+        out[i] = (char)((high << 4) | low);
+        if (!out[i]) return 0;
+    }
+    out[raw_len / 2] = '\0';
+    return 1;
+}
+
+static void emit_identity(const struct process_identity *identity) {
+    printf("IDENTITY:%llu:%llu:",
+           (unsigned long long)identity->start_sec,
+           (unsigned long long)identity->start_usec);
+    const unsigned char *path = (const unsigned char *)identity->path;
+    for (size_t i = 0; path[i]; ++i) printf("%02x", path[i]);
+    fputc('\n', stdout);
+}
+
+static int identity_matches(
+    pid_t pid,
+    const struct process_identity *expected) {
+    struct process_identity current;
+    return snapshot_identity(pid, &current) && same_identity(&current, expected);
+}
 
 static int printable(unsigned char c) { return c >= 0x20 && c <= 0x7e; }
 
@@ -67,19 +155,53 @@ static void scan_wechat(const unsigned char *p, size_t n) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3 || (strcmp(argv[1], "qq") && strcmp(argv[1], "wechat"))) {
-        fprintf(stderr, "usage: macos-memory-scan <qq|wechat> <pid>\n");
+    if (argc == 3 && !strcmp(argv[1], "identity")) {
+        char *identity_end = NULL;
+        long identity_pid = strtol(argv[2], &identity_end, 10);
+        struct process_identity identity;
+        if (!identity_end || *identity_end || identity_pid <= 0 ||
+            !snapshot_identity((pid_t)identity_pid, &identity)) {
+            fprintf(stderr, "process_identity_unavailable\n");
+            return 5;
+        }
+        emit_identity(&identity);
+        return 0;
+    }
+    if (argc != 6 || (strcmp(argv[1], "qq") && strcmp(argv[1], "wechat"))) {
+        fprintf(stderr,
+                "usage: macos-memory-scan <qq|wechat> <pid> "
+                "<start-sec> <start-usec> <path-hex>\n");
         return 2;
     }
     char *end = NULL;
     long parsed = strtol(argv[2], &end, 10);
     if (!end || *end || parsed <= 0) return 2;
 
+    struct process_identity expected;
+    memset(&expected, 0, sizeof(expected));
+    if (!parse_u64(argv[3], &expected.start_sec) ||
+        !parse_u64(argv[4], &expected.start_usec) ||
+        expected.start_usec >= 1000000 ||
+        !decode_path(argv[5], expected.path, sizeof(expected.path))) {
+        fprintf(stderr, "invalid_process_identity\n");
+        return 2;
+    }
+    pid_t pid = (pid_t)parsed;
+    if (!identity_matches(pid, &expected)) {
+        fprintf(stderr, "process_identity_mismatch\n");
+        return 5;
+    }
+
     mach_port_t task = MACH_PORT_NULL;
-    kern_return_t kr = task_for_pid(mach_task_self(), (pid_t)parsed, &task);
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "task_for_pid:%d\n", kr);
         return 3;
+    }
+    if (!identity_matches(pid, &expected)) {
+        mach_port_deallocate(mach_task_self(), task);
+        fprintf(stderr, "process_identity_mismatch\n");
+        return 5;
     }
 
     unsigned char *buf = malloc(CHUNK + OVERLAP);
@@ -120,5 +242,9 @@ int main(int argc, char **argv) {
     }
     free(buf);
     mach_port_deallocate(mach_task_self(), task);
+    if (!identity_matches(pid, &expected)) {
+        fprintf(stderr, "process_identity_mismatch\n");
+        return 5;
+    }
     return 0;
 }

@@ -51,7 +51,8 @@ param(
     [Parameter()] [string]$WeixinDllPath,
     [Parameter()] [string]$DbPath,
     [Parameter()] [switch]$NoDebugForKey,
-    [Parameter()] [bool]$KillExisting = $true
+    [Parameter()] [bool]$KillExisting = $true,
+    [Parameter()] [ValidateRange(1, 3600)] [int]$TimeoutSeconds = 600
 )
 
 Set-StrictMode -Version 2.0
@@ -63,6 +64,51 @@ $ErrorActionPreference = 'Stop'
 # `master key:` line and Chinese prompts render correctly when captured.
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 #endregion
+
+function Resolve-TencentSignedFile {
+    [CmdletBinding()] [OutputType([string])] param(
+        [Parameter(Mandatory = $true)] [string]$LiteralPath,
+        [Parameter(Mandatory = $true)] [string]$Label
+    )
+    $resolved = (Resolve-Path -LiteralPath $LiteralPath -ErrorAction Stop).Path
+    $item = Get-Item -LiteralPath $resolved -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "$Label 不是可信普通文件"
+    }
+    $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $resolved
+    if (-not $signature -or $signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or -not $signature.SignerCertificate) {
+        throw "$Label 的 Authenticode 签名无效"
+    }
+    $subject = [string]$signature.SignerCertificate.Subject
+    if ($subject -notmatch '(?i)(Tencent|腾讯)') {
+        throw "$Label 不是腾讯签名文件"
+    }
+    return $resolved
+}
+
+function Get-WeixinInfoFromDll {
+    [CmdletBinding()] [OutputType([hashtable])] param(
+        [Parameter(Mandatory = $true)] [string]$DllPath
+    )
+    $dll = Resolve-TencentSignedFile -LiteralPath $DllPath -Label 'Weixin.dll'
+    $dllDir = Split-Path -Parent $dll
+    $installPath = if ((Split-Path -Leaf $dllDir) -match '^\d+\.\d+\.\d+\.\d+$') {
+        Split-Path -Parent $dllDir
+    } else {
+        $dllDir
+    }
+    $exe = Resolve-TencentSignedFile -LiteralPath (Join-Path $installPath 'Weixin.exe') -Label 'Weixin.exe'
+    $root = [IO.Path]::GetFullPath($installPath).TrimEnd('\') + '\'
+    if (-not ([IO.Path]::GetFullPath($dll).StartsWith($root, [StringComparison]::OrdinalIgnoreCase))) {
+        throw 'Weixin.dll 不在 Weixin.exe 的安装目录内'
+    }
+    return @{
+        InstallPath = $installPath
+        WeixinExe = $exe
+        WeixinDll = $dll
+        Version = $(if ((Split-Path -Leaf $dllDir) -match '^\d+\.\d+\.\d+\.\d+$') { Split-Path -Leaf $dllDir } else { '' })
+    }
+}
 
 #region P/Invoke + debugger (mirrors windows_ntqq_get_key.ps1; HMAC oracle is new)
 
@@ -211,6 +257,7 @@ namespace DebugApiWx
         private readonly byte[] _dbPage1;
         private readonly Action<string> _log;
         private readonly Action<string> _logVerbose;
+        private readonly DateTime _deadlineUtc;
 
         // 多进程: 微信登录后 spawn 子进程, message 库的解密调用可能在子进程, 故用 DEBUG_PROCESS
         // 调试整个进程树, 每个加载 Weixin.dll 的进程独立维护断点 (per-process ProcCtx)。
@@ -222,10 +269,11 @@ namespace DebugApiWx
         private readonly byte[] _calibrateKey; // 校准诊断 (env CHATLOG_CALIBRATE_KEY): 已知标尺 key, 命中时定位其真实位置
         private Dictionary<uint, ulong> _steppingThreads = new Dictionary<uint, ulong>();
 
-        public KeyExtractor(string exePath, ulong[] functionRvas, byte[] dbPage1, Action<string> log, Action<string> logVerbose)
+        public KeyExtractor(string exePath, ulong[] functionRvas, byte[] dbPage1, Action<string> log, Action<string> logVerbose, int timeoutSeconds)
         {
             _exePath = exePath; _functionRvas = functionRvas; _dbPage1 = dbPage1;
             _log = log ?? (s => { }); _logVerbose = logVerbose ?? (s => { });
+            _deadlineUtc = DateTime.UtcNow.AddSeconds(Math.Max(1, timeoutSeconds));
             string ck = Environment.GetEnvironmentVariable("CHATLOG_CALIBRATE_KEY");
             if (ck != null && ck.Trim().Length == 64) { try { _calibrateKey = HexToBytes(ck.Trim()); } catch { _calibrateKey = null; } }
         }
@@ -385,7 +433,10 @@ namespace DebugApiWx
             DEBUG_EVENT ev; bool go = true; string foundKey = null;
             while (go)
             {
-                if (!Native.WaitForDebugEvent(out ev, 10000)) { continue; } // timeout: 继续等登录
+                double remainingMs = (_deadlineUtc - DateTime.UtcNow).TotalMilliseconds;
+                if (remainingMs <= 0) { _log("等待登录/密钥超时，已安全结束调试实例"); break; }
+                uint waitMs = (uint)Math.Max(1, Math.Min(10000, remainingMs));
+                if (!Native.WaitForDebugEvent(out ev, waitMs)) { continue; }
                 uint pid = ev.dwProcessId;
                 uint cont = Native.DBG_CONTINUE;
                 switch (ev.dwDebugEventCode)
@@ -806,11 +857,19 @@ function Get-WeixinCipherFunctionRva {
 function Get-InstalledWeixinInfo {
     [CmdletBinding()] [OutputType([hashtable])] param()
     $installPath = $null
-    foreach ($rp in @('HKCU:\Software\Tencent\Weixin', 'HKLM:\SOFTWARE\WOW6432Node\Tencent\Weixin', 'HKLM:\SOFTWARE\Tencent\Weixin')) {
+    # HKCU remains a compatibility locator for per-user installs, never a trust
+    # decision: the selected EXE and DLL are independently Authenticode-verified
+    # before analysis or launch, and this script runs without UAC elevation.
+    foreach ($rp in @('HKLM:\SOFTWARE\WOW6432Node\Tencent\Weixin', 'HKLM:\SOFTWARE\Tencent\Weixin', 'HKCU:\Software\Tencent\Weixin')) {
         try { if (Test-Path $rp) { $r = Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue; if ($r -and $r.InstallPath) { $installPath = $r.InstallPath; break } } } catch {}
     }
     if (-not $installPath) {
-        foreach ($c in @('C:\Program Files\Tencent\Weixin', 'C:\Program Files (x86)\Tencent\Weixin')) { if (Test-Path $c) { $installPath = $c; break } }
+        $candidates = @()
+        foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+            $candidates += (Join-Path $drive.Root 'Program Files\Tencent\Weixin')
+            $candidates += (Join-Path $drive.Root 'Program Files (x86)\Tencent\Weixin')
+        }
+        foreach ($c in $candidates) { if (Test-Path -LiteralPath $c -PathType Container) { $installPath = $c; break } }
     }
     if (-not $installPath -or -not (Test-Path $installPath)) { throw "未找到微信安装目录 (Weixin)" }
     $exe = Join-Path $installPath 'Weixin.exe'
@@ -822,7 +881,7 @@ function Get-InstalledWeixinInfo {
     if ($verDir) { $cand = Join-Path $verDir.FullName 'Weixin.dll'; if (Test-Path $cand) { $dll = $cand } }
     if (-not $dll) { $cand = Join-Path $installPath 'Weixin.dll'; if (Test-Path $cand) { $dll = $cand } }
     if (-not $dll) { throw "未找到 Weixin.dll (安装目录或版本子目录)" }
-    return @{ InstallPath = $installPath; WeixinExe = $exe; WeixinDll = $dll; Version = $(if ($verDir) { $verDir.Name } else { '' }) }
+    return Get-WeixinInfoFromDll -DllPath $dll
 }
 
 # Read a message_0.db page-1 (4096 bytes) with FILE_SHARE_READ|WRITE|DELETE so a
@@ -862,14 +921,10 @@ function Find-WeixinMessageDb {
 
 Write-Host "=== 微信 master key 自动提取 (本人数据, 全本地) ===" -ForegroundColor Yellow
 
-$info = $null
-if (-not $WeixinDllPath) {
-    $info = Get-InstalledWeixinInfo
-    $WeixinDllPath = $info.WeixinDll
-    Write-Host ("微信安装: {0}  (版本 {1})" -f $info.InstallPath, $info.Version) -ForegroundColor Cyan
-    Write-Host ("  Weixin.dll: {0}" -f $WeixinDllPath) -ForegroundColor Cyan
-}
-if (-not (Test-Path $WeixinDllPath)) { throw "Weixin.dll 不存在: $WeixinDllPath" }
+$info = if ($WeixinDllPath) { Get-WeixinInfoFromDll -DllPath $WeixinDllPath } else { Get-InstalledWeixinInfo }
+$WeixinDllPath = $info.WeixinDll
+Write-Host ("微信安装: {0}  (版本 {1})" -f $info.InstallPath, $info.Version) -ForegroundColor Cyan
+Write-Host ("  Weixin.dll: {0}" -f $WeixinDllPath) -ForegroundColor Cyan
 
 Write-Host "`n=== 静态定位 WCDB key-set 函数 (wx_key 签名) ===" -ForegroundColor Yellow
 if (-not ([System.Management.Automation.PSTypeName]'DebugApiWx.KeyExtractor').Type) {
@@ -889,9 +944,7 @@ if (-not $DbPath -or -not (Test-Path $DbPath)) { throw "未找到 message_0.db �
 Write-Host ("HMAC 校验库: {0}" -f $DbPath) -ForegroundColor Cyan
 $page1 = Get-DbPage1 -Path $DbPath
 
-if (-not $info) { try { $info = Get-InstalledWeixinInfo } catch {} }
-$weixinExe = if ($info) { $info.WeixinExe } else { (Join-Path (Split-Path -Parent (Split-Path -Parent $WeixinDllPath)) 'Weixin.exe') }
-if (-not (Test-Path $weixinExe)) { throw "未找到 Weixin.exe: $weixinExe" }
+$weixinExe = $info.WeixinExe
 
 if ($KillExisting) {
     $running = @(Get-Process -Name 'Weixin' -ErrorAction SilentlyContinue)
@@ -909,7 +962,7 @@ if (-not ([System.Management.Automation.PSTypeName]'DebugApiWx.KeyExtractor').Ty
 }
 $logA = [Action[string]] { param($m) Write-Host $m -ForegroundColor Cyan }
 $logV = [Action[string]] { param($m) Write-Verbose $m }
-$extractor = New-Object DebugApiWx.KeyExtractor($weixinExe, [uint64[]]$funcRvas, $page1, $logA, $logV)
+$extractor = New-Object DebugApiWx.KeyExtractor($weixinExe, [uint64[]]$funcRvas, $page1, $logA, $logV, $TimeoutSeconds)
 
 $result = [pscustomobject]@{ FunctionRVA = $funcRvas[0]; FunctionRVAs = $funcRvas; Key = $null }
 try {

@@ -50,8 +50,8 @@ grouped by conversation and day — the way you remember it).
 | Windows | WeChat ≤ 4.0.x | raw-key (`enc_key` used directly) | passive memory scan |
 | Windows | WeChat 4.1.10.31+ | password mode — `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | one-time debugger |
 | Windows | QQ NTQQ 9.9.x | per-DB passphrase | passive scan or one-time debugger |
-| macOS arm64 | WeChat 4.1.9 (build 268575) | raw/password mode selected by page-1 HMAC | passive scan or isolated debug copy |
-| macOS arm64 | QQ 6.9.95 (build 36385) | per-DB passphrase | passive scan or isolated debug copy |
+| macOS arm64 | WeChat 4.1.9 (build 268575) | raw/password mode selected by page-1 HMAC | passive scan; active only when signature preflight passes |
+| macOS arm64 | QQ 6.9.95 (build 36385) | per-DB passphrase | passive scan; active only when signature preflight passes |
 
 On **WeChat 4.1.10.31** (released 2026-05-27) the plaintext key was moved out of
 the process heap, so a passive memory scan — what most existing tools rely on —
@@ -65,7 +65,7 @@ and maintenance status change over time — please check each repo yourself):
 
 | Tool | Stars | Last update | WeChat | QQ | Platform | Notes |
 |---|---|---|---|---|---|---|
-| **chatlog-keeper** (this) | — | 2026-07 | ≤4.0 **+ 4.1.x** | ✅ NTQQ | Windows + macOS arm64 | passive scan + isolated active fallback |
+| **chatlog-keeper** (this) | — | 2026-07 | ≤4.0 **+ 4.1.x** | ✅ NTQQ | Windows + macOS arm64 | passive scan + guarded active fallback |
 | [WeChatMsg / 留痕](https://github.com/LC044/WeChatMsg) | 41k+ | 2025-12 | ≤4.0 | ❌ | Windows | feature-rich GUI; author states it is **no longer updated** |
 | [PyWxDump](https://github.com/xaoyaoo/PyWxDump) | 9k+ | 2025-10 | 3.x–4.0 | ❌ | Windows | repo description now reads "删库"; inactive |
 | [chatlog](https://github.com/sjzar/chatlog) | 9k+ | 2025-10 | ≤4.0 | ❌ | cross-platform | Go; HTTP/MCP API |
@@ -94,6 +94,35 @@ Tagged releases also provide a standalone `chatlog-keeper.exe` for Windows and
 `chatlog-keeper-macos-arm64` for Apple Silicon. The standalone Mac build
 contains its read-only Mach helper; a source install compiles that tiny audited
 C helper on first key scan and therefore needs Xcode Command Line Tools.
+
+Download the executable and its matching `.sha256` file from the same
+[GitHub Release](https://github.com/labazhou2024/chatlog-keeper/releases). Verify
+the original filename before running it:
+
+```powershell
+# Windows PowerShell
+$expected = (Get-Content .\chatlog-keeper.exe.sha256).Split()[0]
+$actual = (Get-FileHash .\chatlog-keeper.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "chatlog-keeper checksum mismatch" }
+.\chatlog-keeper.exe --help
+.\chatlog-keeper.exe message-stream-v1 --capabilities
+.\chatlog-keeper.exe participant-directory-v1 --capabilities
+```
+
+```bash
+# Apple Silicon macOS
+shasum -a 256 -c chatlog-keeper-macos-arm64.sha256
+chmod 755 chatlog-keeper-macos-arm64
+./chatlog-keeper-macos-arm64 --help
+./chatlog-keeper-macos-arm64 message-stream-v1 --capabilities
+./chatlog-keeper-macos-arm64 participant-directory-v1 --capabilities
+```
+
+Each release also contains a deterministic `chatlog-keeper-v*-source.tar.gz`
+made from the tagged commit and one canonical approved artifact descriptor per
+platform. Their adjacent `.sha256` files are verified in the same way. The two
+descriptors identify the same source bundle and list both frozen local IPC
+protocols, so a host can bind the downloaded executable to its exact source.
 
 ## Usage
 
@@ -134,9 +163,13 @@ python -m chatlog_keeper.cli extract-key --source wechat
 # Passive only (lowest ban risk; may find nothing on WeChat 4.1.10.31+)
 python -m chatlog_keeper.cli extract-key --source wechat --method passive
 
-# Active only (newest builds; needs system-administrator authorization and may
-# require one login in a separately launched client)
+# Active only (newest builds; macOS WeChat reuses the current session and does
+# not require account switching; unsafe launch configurations fail closed)
 python -m chatlog_keeper.cli extract-key --source wechat --method active
+
+# Windows starts and debugs only a fresh child under the current user; it does
+# not request UAC/admin. Bundled scripts are hash-pinned and Tencent binaries
+# must have a valid Authenticode signature.
 
 # If you relocated WeChat data, pass its xwechat_files folder explicitly.
 # Windows example:
@@ -146,7 +179,12 @@ python -m chatlog_keeper.cli extract-key --source wechat --method active --data-
 python -m chatlog_keeper.cli extract-key --source wechat --method active \
   --data-root "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
 
-# Paste it yourself (after obtaining the key with any tool)
+# Preferred manual fallback: read exactly one key line from stdin. Paste the
+# key when prompted, then send EOF (Ctrl+Z then Enter on Windows; Ctrl+D on macOS).
+python -m chatlog_keeper.cli set-key --source wechat --key-stdin
+python -m chatlog_keeper.cli set-key --source qq --key-stdin
+
+# Compatibility only: --key exposes the secret in argv and shell history.
 python -m chatlog_keeper.cli set-key --source wechat --key <64-hex>
 python -m chatlog_keeper.cli set-key --source qq --key <16-char passphrase>
 ```
@@ -157,6 +195,8 @@ The key is cached locally and reused on later exports:
 - macOS: `~/Library/Application Support/chatlog-keeper/secrets/`
 
 On macOS the secrets directory is mode `0700` and each key file is `0600`.
+On Windows, protected ACLs grant access only to the current user and
+LocalSystem; an ACL setup or verification failure rejects the secret.
 See [the macOS security and troubleshooting guide](docs/macos.md).
 
 ## Account-ban risk
@@ -174,7 +214,7 @@ The actual risk **depends on how the key is obtained**:
 | Reading the local database file | Negligible (≈0) | Pure file read; no network; the server cannot perceive it |
 | Passive memory scan for the key (default) | Low | Read-only process memory (no injection, no hooks, no debugger); long used by mainstream tools with no reported bans |
 | Windows active extraction | Medium–high | Launches a separate debugged client and reads the key at the cipher boundary. Use only when passive fails |
-| macOS active extraction | Elevated / compatibility-sensitive | Never changes the original app or disables SIP; it launches a private ad-hoc-signed copy and performs an administrator-authorized read-only Mach scan |
+| macOS active extraction | Compatibility-sensitive | Never changes the original app or disables SIP; explicit WeChat active mode loads a fixed startup observer only into its private compatible copy, requires no account switching during automatic login, and DB-HMAC verifies every candidate |
 
 To minimize risk: prefer the default passive method; reuse the cache instead of
 re-extracting; you can even quit the client and decrypt offline afterwards; and

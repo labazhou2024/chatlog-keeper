@@ -52,10 +52,12 @@ def process_pids(app_executables: Iterable[str]) -> List[int]:
     return sorted(set(found))
 
 
-def process_pids_for_executable(executable: Path) -> List[int]:
-    """Return PIDs whose command starts with one exact app executable path."""
+def _process_pids_for_executable_checked(
+    executable: Path,
+) -> tuple[bool, List[int]]:
+    """Return whether exact-path process enumeration succeeded and its PIDs."""
     if not is_macos():
-        return []
+        return False, []
     try:
         proc = subprocess.run(
             ["ps", "-axo", "pid=,comm="],
@@ -67,7 +69,9 @@ def process_pids_for_executable(executable: Path) -> List[int]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return []
+        return False, []
+    if getattr(proc, "returncode", 0) != 0 or not isinstance(proc.stdout, str):
+        return False, []
     expected = str(executable)
     found: List[int] = []
     for line in proc.stdout.splitlines():
@@ -80,8 +84,20 @@ def process_pids_for_executable(executable: Path) -> List[int]:
         try:
             found.append(int(parts[0]))
         except ValueError:
-            continue
-    return sorted(set(found))
+            return False, []
+    return True, sorted(set(found))
+
+
+def process_pids_for_executable(executable: Path) -> List[int]:
+    """Return PIDs whose command is one exact app executable path.
+
+    This compatibility wrapper preserves the historical best-effort ``[]`` on
+    unsupported platforms or ``ps`` failure. Security-sensitive lifecycle code
+    uses :func:`_process_pids_for_executable_checked` so failure cannot be
+    confused with a proven-empty process set.
+    """
+    _complete, pids = _process_pids_for_executable_checked(executable)
+    return pids
 
 
 def wechat_data_roots(home: Path | None = None) -> List[Path]:

@@ -48,8 +48,8 @@
 | Windows | 微信 ≤ 4.0.x | raw-key（`enc_key` 直接用） | 被动内存扫描 |
 | Windows | 微信 4.1.10.31+ | password 模式 —— `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | 一次性调试器 |
 | Windows | QQ NTQQ 9.9.x | 每库口令 | 被动扫描或一次性调试器 |
-| macOS arm64 | 微信 4.1.9（build 268575） | 由 page-1 HMAC 自动选择 raw/password 模式 | 被动扫描或隔离调试副本 |
-| macOS arm64 | QQ 6.9.95（build 36385） | 每库口令 | 被动扫描或隔离调试副本 |
+| macOS arm64 | 微信 4.1.9（build 268575） | 由 page-1 HMAC 自动选择 raw/password 模式 | 被动扫描；主动流程仅在签名预检通过时可用 |
+| macOS arm64 | QQ 6.9.95（build 36385） | 每库口令 | 被动扫描；主动流程仅在签名预检通过时可用 |
 
 **微信 4.1.10.31**（2026-05-27 发布）把明文 key 移出了进程堆，因此被动内存扫描
 ——多数现有工具依赖的方式——在这些版本上**取不到 key**。chatlog-keeper 会对这些
@@ -61,7 +61,7 @@
 
 | 工具 | Star | 最近更新 | 微信 | QQ | 平台 | 备注 |
 |---|---|---|---|---|---|---|
-| **chatlog-keeper**（本项目） | — | 2026-07 | ≤4.0 **+ 4.1.x** | ✅ NTQQ | Windows + macOS arm64 | 被动扫描 + 隔离主动流程兜底 |
+| **chatlog-keeper**（本项目） | — | 2026-07 | ≤4.0 **+ 4.1.x** | ✅ NTQQ | Windows + macOS arm64 | 被动扫描 + 带签名门禁的主动流程 |
 | [WeChatMsg / 留痕](https://github.com/LC044/WeChatMsg) | 41k+ | 2025-12 | ≤4.0 | ❌ | Windows | 功能丰富的 GUI；作者声明**不再更新** |
 | [PyWxDump](https://github.com/xaoyaoo/PyWxDump) | 9k+ | 2025-10 | 3.x–4.0 | ❌ | Windows | 仓库描述现为“删库”；已停更 |
 | [chatlog](https://github.com/sjzar/chatlog) | 9k+ | 2025-10 | ≤4.0 | ❌ | 跨平台 | Go；提供 HTTP/MCP API |
@@ -87,6 +87,34 @@ python -m pip install .
 正式 tag 还提供 Windows `chatlog-keeper.exe` 和 Apple Silicon
 `chatlog-keeper-macos-arm64` 独立文件。Mac 独立包已经内置只读 Mach helper；源码安装
 会在首次取 key 时编译这段可审计的 C helper，因此需要 Xcode Command Line Tools。
+
+请从同一个 [GitHub Release](https://github.com/labazhou2024/chatlog-keeper/releases)
+下载可执行文件及其对应的 `.sha256`，保留原始文件名并在运行前校验：
+
+```powershell
+# Windows PowerShell
+$expected = (Get-Content .\chatlog-keeper.exe.sha256).Split()[0]
+$actual = (Get-FileHash .\chatlog-keeper.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "chatlog-keeper checksum mismatch" }
+.\chatlog-keeper.exe --help
+.\chatlog-keeper.exe message-stream-v1 --capabilities
+.\chatlog-keeper.exe participant-directory-v1 --capabilities
+```
+
+```bash
+# Apple Silicon macOS
+shasum -a 256 -c chatlog-keeper-macos-arm64.sha256
+chmod 755 chatlog-keeper-macos-arm64
+./chatlog-keeper-macos-arm64 --help
+./chatlog-keeper-macos-arm64 message-stream-v1 --capabilities
+./chatlog-keeper-macos-arm64 participant-directory-v1 --capabilities
+```
+
+每个 Release 还包含从对应 tag commit 确定性生成的
+`chatlog-keeper-v*-source.tar.gz`，以及 Windows、macOS 各自的 canonical approved
+artifact descriptor；它们旁边都有独立 `.sha256`，校验方式相同。两个 descriptor
+引用同一个 source bundle，并同时声明两个冻结的本机 IPC 协议，使宿主能够把下载的
+可执行文件与精确源码绑定。
 
 ## 使用
 
@@ -121,8 +149,11 @@ python -m chatlog_keeper.cli extract-key --source wechat
 # 只用被动扫描（封号风险最低；新版微信 4.1.10.31+ 可能取不到）
 python -m chatlog_keeper.cli extract-key --source wechat --method passive
 
-# 只走主动流程（新版；需系统管理员授权，隔离客户端可能要再登录一次）
+# 只走主动流程（新版；macOS 微信自动复用当前会话，无需切换账号）
 python -m chatlog_keeper.cli extract-key --source wechat --method active
+
+# Windows 只以当前用户身份启动并调试一个新子进程，不请求 UAC/管理员权限；
+# 内置脚本固定校验 SHA-256，微信/QQ 可执行文件与模块必须通过腾讯 Authenticode 签名校验。
 
 # 如果移动过微信数据目录，可显式指定 xwechat_files 文件夹（Windows 示例）
 python -m chatlog_keeper.cli extract-key --source wechat --method active --data-root "E:\xwechat_files"
@@ -131,7 +162,12 @@ python -m chatlog_keeper.cli extract-key --source wechat --method active --data-
 python -m chatlog_keeper.cli extract-key --source wechat --method active \
   --data-root "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
 
-# 手动粘贴（你用其它工具拿到 key 之后）
+# 推荐的手动兜底：从 stdin 仅读取一行 key。运行后粘贴 key，再发送 EOF
+#（Windows 按 Ctrl+Z 后回车；macOS 按 Ctrl+D）。
+python -m chatlog_keeper.cli set-key --source wechat --key-stdin
+python -m chatlog_keeper.cli set-key --source qq --key-stdin
+
+# 仅兼容旧用法：--key 会把密钥暴露在进程参数和 shell 历史中。
 python -m chatlog_keeper.cli set-key --source wechat --key <64位十六进制>
 python -m chatlog_keeper.cli set-key --source qq --key <16位口令>
 ```
@@ -141,7 +177,9 @@ python -m chatlog_keeper.cli set-key --source qq --key <16位口令>
 - Windows：`%LOCALAPPDATA%\chatlog-keeper\data\secrets\`
 - macOS：`~/Library/Application Support/chatlog-keeper/secrets/`
 
-macOS 上 secrets 目录权限为 `0700`，每个 key 文件为 `0600`。详细见
+macOS 上 secrets 目录权限为 `0700`，每个 key 文件为 `0600`。Windows 上使用
+受保护 ACL，只允许当前用户和 LocalSystem 访问；ACL 收紧或复核失败时拒绝读取。
+详细见
 [macOS 安全与排障说明](docs/macos.zh.md)。
 
 ## 封号风险
@@ -155,7 +193,7 @@ macOS 上 secrets 目录权限为 `0700`，每个 key 文件为 `0600`。详细�
 | 读本地数据库文件 | 极低（≈0） | 纯文件读取，不碰网络，服务器无从感知 |
 | 被动内存扫描取 key（默认） | 低 | 只读进程内存（不注入、不 hook、不附加调试器）；社区主流工具长期采用，未见因此被封的实证 |
 | Windows 主动取 key | 中–偏高 | 启动独立受调试客户端，在密码边界读取 key；仅在被动方式失败时使用 |
-| macOS 主动取 key | 权限较高 / 兼容性敏感 | 不修改原应用、不关闭 SIP；启动私有 ad-hoc 签名副本，经管理员授权做只读 Mach 扫描 |
+| macOS 主动取 key | 兼容性敏感 | 不修改原应用、不关闭 SIP；微信显式主动模式只在私有兼容副本启动前载入固定捕获器，自动登录无需切号，所有候选仍必须通过数据库 HMAC 验证 |
 
 降低风险：优先用默认的被动方式；能用缓存就不重复取 key；取到 key 后甚至可以退出客户端、离线解密；**绝不**用本工具做任何服务器侧自动化操作（那才是真正的封号高发区）。
 

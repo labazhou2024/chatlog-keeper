@@ -1,14 +1,16 @@
 import hashlib
 import hmac
+import os
 import struct
 import sys
+import time
 
 import pytest
 from Crypto.Cipher import AES
 
 from chatlog_keeper import qq_db, wechat_db
 from chatlog_keeper.core import _snapshot, _wal
-from chatlog_keeper.core._snapshot import snapshot_db_family
+from chatlog_keeper.core._snapshot import snapshot_db_families, snapshot_db_family
 
 
 def test_snapshot_copies_db_and_sidecars(tmp_path):
@@ -40,6 +42,41 @@ def test_snapshot_retries_when_family_changes_during_copy(tmp_path, monkeypatch)
 
     with snapshot_db_family(db) as snap:
         assert snap.read_bytes() == b"db"
+
+
+def test_aggregate_snapshot_retries_wal_only_change_across_families(
+    tmp_path,
+    monkeypatch,
+):
+    first = tmp_path / "message_0.db"
+    second = tmp_path / "contact.db"
+    first.write_bytes(b"message")
+    second.write_bytes(b"contact")
+    first_wal = first.with_name(first.name + "-wal")
+    first_wal.write_bytes(b"wal-v1")
+
+    original_copy = _snapshot._copy_file
+    first_main_copies = 0
+    changed = False
+
+    def copy_with_wal_churn(source, destination):
+        nonlocal changed, first_main_copies
+        original_copy(source, destination)
+        if source == first:
+            first_main_copies += 1
+        if source == second and not changed:
+            # Only the already-copied WAL changes; neither main DB changes.
+            first_wal.write_bytes(b"wal-v2")
+            changed = True
+
+    monkeypatch.setattr(_snapshot, "_copy_file", copy_with_wal_churn)
+
+    with snapshot_db_families([first, second]) as snapshots:
+        copied_wal = snapshots[first].with_name(snapshots[first].name + "-wal")
+        assert copied_wal.read_bytes() == b"wal-v2"
+        assert snapshots[second].read_bytes() == b"contact"
+
+    assert first_main_copies == 2
 
 
 def test_stable_prefix_retries_checkpoint_race(tmp_path, monkeypatch):
@@ -112,13 +149,15 @@ def _shm_bytes(
     frame_checksum,
     salt1=0x11223344,
     salt2=0x55667788,
+    page_size=4096,
 ):
     native = "<" if sys.byteorder == "little" else ">"
     header = bytearray(48)
     struct.pack_into(f"{native}I", header, 0, 3007000)
     header[12] = 1
     header[13] = 0
-    struct.pack_into(f"{native}H", header, 14, 4096)
+    encoded_page_size = 1 if page_size == 65536 else page_size
+    struct.pack_into(f"{native}H", header, 14, encoded_page_size)
     struct.pack_into(f"{native}II", header, 16, mx_frame, n_page)
     struct.pack_into(f"{native}II", header, 24, *frame_checksum)
     header[32:40] = struct.pack(">II", salt1, salt2)
@@ -142,6 +181,320 @@ def test_wechat_wal_page_is_hmac_verified_and_decrypted():
     assert wechat_db._decrypt_wal_page(bytes(tampered), key, salt, 2) is None
 
 
+@pytest.mark.parametrize("key_mode", ["raw", "password"])
+def test_wechat_main_db_authenticates_every_page_before_atomic_publish(
+    tmp_path,
+    key_mode,
+):
+    master_key = bytes(range(32))
+    salt = bytes(range(16))
+    page_key = (
+        master_key
+        if key_mode == "raw"
+        else hashlib.pbkdf2_hmac(
+            "sha512",
+            master_key,
+            salt,
+            wechat_db._WECHAT_KDF_ITER,
+            dklen=32,
+        )
+    )
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(
+        _encrypted_page(page_key, salt, 1, b"A")
+        + _encrypted_page(page_key, salt, 2, b"B")
+    )
+    output = tmp_path / "plain.db"
+
+    assert wechat_db._decrypt_db_v4_snapshot(encrypted, master_key, output)
+    plain = output.read_bytes()
+    assert len(plain) == 8192
+    assert plain[:16] == b"SQLite format 3\x00"
+    assert plain[16:4016] == b"A" * 4000
+    assert plain[4096:8112] == b"B" * 4016
+
+
+@pytest.mark.parametrize(
+    "tamper_offset",
+    [100, 4096 - 80, 4096 - 1],
+    ids=["ciphertext", "iv", "hmac"],
+)
+def test_wechat_main_db_rejects_page_two_tampering_without_mutating_output(
+    tmp_path,
+    tamper_offset,
+):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    page_two = bytearray(_encrypted_page(key, salt, 2, b"B"))
+    page_two[tamper_offset] ^= 1
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(
+        _encrypted_page(key, salt, 1, b"A") + bytes(page_two)
+    )
+    output = tmp_path / "plain.db"
+    original = b"existing-output-must-survive"
+    output.write_bytes(original)
+
+    assert not wechat_db._decrypt_db_v4_snapshot(encrypted, key, output)
+    assert output.read_bytes() == original
+    assert list(tmp_path.glob(".plain.db.*.tmp")) == []
+
+
+def test_wechat_main_db_binds_hmac_to_physical_page_number(tmp_path):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(
+        _encrypted_page(key, salt, 1, b"A")
+        + _encrypted_page(key, salt, 3, b"B")
+    )
+    output = tmp_path / "plain.db"
+
+    assert not wechat_db._decrypt_db_v4_snapshot(encrypted, key, output)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("tail_size", [1, 137, 4095])
+def test_wechat_main_db_rejects_truncated_trailing_page(tmp_path, tail_size):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(
+        _encrypted_page(key, salt, 1, b"A") + b"T" * tail_size
+    )
+    output = tmp_path / "plain.db"
+
+    assert not wechat_db._decrypt_db_v4_snapshot(encrypted, key, output)
+    assert not output.exists()
+
+
+def test_wechat_plaintext_cache_is_private_and_expires_without_next_read(tmp_path):
+    wechat_db._decrypt_cache_clear()
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(_encrypted_page(key, salt, 1, b"A"))
+
+    try:
+        cached = wechat_db._decrypt_with_cache(encrypted, key, ttl=0.05)
+        assert cached is not None and cached.exists()
+        private_dir = cached.parent
+        if os.name != "nt":
+            assert cached.stat().st_mode & 0o777 == 0o600
+            assert private_dir.stat().st_mode & 0o777 == 0o700
+
+        deadline = time.monotonic() + 2
+        while (
+            (cached.exists() or private_dir.exists())
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert not cached.exists()
+        assert not private_dir.exists()
+        assert encrypted not in wechat_db._DECRYPT_CACHE
+    finally:
+        wechat_db._decrypt_cache_clear()
+
+
+def test_wechat_plaintext_cache_hit_refreshes_idle_expiry(tmp_path):
+    wechat_db._decrypt_cache_clear()
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(_encrypted_page(key, salt, 1, b"A"))
+
+    try:
+        first = wechat_db._decrypt_with_cache(encrypted, key, ttl=0.12)
+        assert first is not None
+        time.sleep(0.07)
+        second = wechat_db._decrypt_with_cache(encrypted, key, ttl=0.12)
+        assert second == first
+        time.sleep(0.07)
+        assert first.exists()
+
+        deadline = time.monotonic() + 2
+        while first.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not first.exists()
+    finally:
+        wechat_db._decrypt_cache_clear()
+
+
+def _manual_timer_type():
+    created = []
+
+    class ManualTimer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            self.cancelled = False
+            self.started = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            self.function(*self.args)
+
+    return ManualTimer, created
+
+
+def test_wechat_cancelled_timer_cannot_expire_refreshed_generation(
+    monkeypatch, tmp_path
+):
+    wechat_db._decrypt_cache_clear()
+    timer_type, timers = _manual_timer_type()
+    monkeypatch.setattr(wechat_db.threading, "Timer", timer_type)
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(_encrypted_page(key, salt, 1, b"A"))
+
+    try:
+        first = wechat_db._decrypt_with_cache(encrypted, key, ttl=30)
+        assert first is not None
+        old_timer = timers[-1]
+        assert wechat_db._decrypt_with_cache(encrypted, key, ttl=30) == first
+        assert old_timer.cancelled is True
+
+        # cancel() cannot stop a callback that already started and is waiting
+        # for the cache lock. Its old generation must be harmless.
+        old_timer.fire()
+        assert first.exists()
+        assert wechat_db._DECRYPT_CACHE[encrypted].path == first
+    finally:
+        wechat_db._decrypt_cache_clear()
+
+
+def test_wechat_plaintext_cache_invalidates_when_only_wal_changes(
+    monkeypatch, tmp_path
+):
+    wechat_db._decrypt_cache_clear()
+    timer_type, _timers = _manual_timer_type()
+    monkeypatch.setattr(wechat_db.threading, "Timer", timer_type)
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(b"unchanged-main")
+    wal = encrypted.with_name(encrypted.name + "-wal")
+    wal.write_bytes(b"wal-v1")
+    decrypt_calls = []
+
+    def fake_decrypt(_db_path, _enc_key, output_path):
+        decrypt_calls.append(1)
+        output_path.write_bytes(wal.read_bytes())
+        return True
+
+    monkeypatch.setattr(wechat_db, "_decrypt_db_v4", fake_decrypt)
+    try:
+        first = wechat_db._decrypt_with_cache(encrypted, b"k" * 32, ttl=30)
+        assert first is not None and first.read_bytes() == b"wal-v1"
+        wal.write_bytes(b"wal-v2-with-new-frame")
+
+        second = wechat_db._decrypt_with_cache(encrypted, b"k" * 32, ttl=30)
+        assert second is not None and second.read_bytes() == b"wal-v2-with-new-frame"
+        assert second != first
+        assert len(decrypt_calls) == 2
+    finally:
+        wechat_db._decrypt_cache_clear()
+
+
+def test_wechat_busy_delete_remains_owned_until_retry_succeeds(
+    monkeypatch, tmp_path
+):
+    wechat_db._decrypt_cache_clear()
+    timer_type, _timers = _manual_timer_type()
+    monkeypatch.setattr(wechat_db.threading, "Timer", timer_type)
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(b"first-family")
+
+    def fake_decrypt(db_path, _enc_key, output_path):
+        output_path.write_bytes(db_path.read_bytes())
+        return True
+
+    monkeypatch.setattr(wechat_db, "_decrypt_db_v4", fake_decrypt)
+    original_remove = wechat_db._remove_decrypted_cache_file
+    try:
+        first = wechat_db._decrypt_with_cache(encrypted, b"k" * 32, ttl=30)
+        assert first is not None
+        encrypted.write_bytes(b"second-family-is-larger")
+        failed_once = False
+
+        def fail_first_windows_style_delete(path, private_dir):
+            nonlocal failed_once
+            if path == first and not failed_once:
+                failed_once = True
+                return False
+            return original_remove(path, private_dir)
+
+        monkeypatch.setattr(
+            wechat_db,
+            "_remove_decrypted_cache_file",
+            fail_first_windows_style_delete,
+        )
+        second = wechat_db._decrypt_with_cache(encrypted, b"k" * 32, ttl=30)
+        assert second is not None and second != first
+        assert first.exists()
+        assert first in wechat_db._DECRYPT_PENDING_DELETES
+
+        pending_timer = wechat_db._DECRYPT_PENDING_DELETES[first].timer
+        pending_timer.fire()
+        assert not first.exists()
+        assert first not in wechat_db._DECRYPT_PENDING_DELETES
+    finally:
+        monkeypatch.setattr(
+            wechat_db,
+            "_remove_decrypted_cache_file",
+            original_remove,
+        )
+        wechat_db._decrypt_cache_clear()
+
+
+def test_wechat_startup_scavenger_removes_dead_owner_but_skips_live_owner(
+    monkeypatch, tmp_path
+):
+    from chatlog_keeper.core._secrets import (
+        _prepare_secret_parent,
+        write_secret_text,
+    )
+
+    def make_cache_dir(name, pid, token):
+        private_dir = tmp_path / name
+        _prepare_secret_parent(private_dir)
+        assert write_secret_text(
+            private_dir / wechat_db._DECRYPT_OWNER_FILE,
+            f"pid={pid}\n",
+        )
+        plaintext = private_dir / f"plain-{token * 32}.db"
+        assert write_secret_text(plaintext, "plaintext")
+        return private_dir, plaintext
+
+    dead_dir, _dead_plaintext = make_cache_dir(
+        "chatlog_decrypted_dead123",
+        424242,
+        "a",
+    )
+    live_dir, live_plaintext = make_cache_dir(
+        "chatlog_decrypted_live123",
+        os.getpid(),
+        "b",
+    )
+    monkeypatch.setattr(
+        wechat_db,
+        "_process_is_alive",
+        lambda pid: pid == os.getpid(),
+    )
+
+    assert wechat_db._scavenge_decrypt_cache(temp_root=tmp_path, force=True) == 1
+    assert not dead_dir.exists()
+    assert live_plaintext.exists()
+    assert wechat_db._remove_decrypted_cache_file(live_plaintext, live_dir)
+
+
 def test_apply_wechat_wal_committed_frame(tmp_path):
     key = bytes(range(32))
     salt = bytes(range(16))
@@ -150,6 +503,106 @@ def test_apply_wechat_wal_committed_frame(tmp_path):
     wal = tmp_path / "message.db-wal"
     page = _encrypted_page(key, salt, 2, b"B")
     wal.write_bytes(_wal_bytes([(2, 2, page)])[0])
+    assert wechat_db._apply_wechat_wal(wal, key, salt, output) == 1
+    assert output.read_bytes()[4096:4096 + 4016] == b"B" * 4016
+
+
+def test_apply_wechat_wal_rebuilds_stale_index_from_authenticated_wal(tmp_path):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    output = tmp_path / "decrypted.db"
+    output.write_bytes(b"\0" * 8192)
+    wal = tmp_path / "message.db-wal"
+    page = _encrypted_page(key, salt, 2, b"B")
+    wal_bytes, frame_checksum = _wal_bytes([(2, 2, page)])
+    wal.write_bytes(wal_bytes)
+    wal.with_name("message.db-shm").write_bytes(
+        _shm_bytes(
+            mx_frame=1,
+            n_page=2,
+            frame_checksum=frame_checksum,
+            page_size=8192,
+        )
+    )
+
+    assert wechat_db._apply_wechat_wal(wal, key, salt, output) == 1
+    assert output.read_bytes()[4096:4096 + 4016] == b"B" * 4016
+
+
+def test_apply_wechat_wal_recovers_commit_after_valid_but_stale_index(tmp_path):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    output = tmp_path / "decrypted.db"
+    output.write_bytes(b"\0" * 8192)
+    wal = tmp_path / "message.db-wal"
+    first_page = _encrypted_page(key, salt, 2, b"B")
+    latest_page = _encrypted_page(key, salt, 2, b"C")
+    wal_bytes, _latest_checksum = _wal_bytes(
+        [(2, 2, first_page), (2, 2, latest_page)]
+    )
+    _first_wal, first_checksum = _wal_bytes([(2, 2, first_page)])
+    wal.write_bytes(wal_bytes)
+    wal.with_name("message.db-shm").write_bytes(
+        _shm_bytes(
+            mx_frame=1,
+            n_page=2,
+            frame_checksum=first_checksum,
+        )
+    )
+
+    assert wechat_db._apply_wechat_wal(wal, key, salt, output) == 2
+    assert output.read_bytes()[4096:4096 + 4016] == b"C" * 4016
+
+
+def test_valid_stale_wechat_index_never_masks_later_page_hmac_failure(tmp_path):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    output = tmp_path / "decrypted.db"
+    original = b"\0" * 8192
+    output.write_bytes(original)
+    wal = tmp_path / "message.db-wal"
+    first_page = _encrypted_page(key, salt, 2, b"B")
+    corrupt_page = bytearray(_encrypted_page(key, salt, 2, b"C"))
+    corrupt_page[100] ^= 1
+    wal_bytes, _latest_checksum = _wal_bytes(
+        [(2, 2, first_page), (2, 2, bytes(corrupt_page))]
+    )
+    _first_wal, first_checksum = _wal_bytes([(2, 2, first_page)])
+    wal.write_bytes(wal_bytes)
+    wal.with_name("message.db-shm").write_bytes(
+        _shm_bytes(
+            mx_frame=1,
+            n_page=2,
+            frame_checksum=first_checksum,
+        )
+    )
+
+    with pytest.raises(_wal.WalValidationError, match="SQLCipher"):
+        wechat_db._apply_wechat_wal(wal, key, salt, output)
+    assert output.read_bytes() == original
+
+
+def test_valid_stale_wechat_index_does_not_apply_uncommitted_tail(tmp_path):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    output = tmp_path / "decrypted.db"
+    output.write_bytes(b"\0" * 8192)
+    wal = tmp_path / "message.db-wal"
+    committed_page = _encrypted_page(key, salt, 2, b"B")
+    uncommitted_page = _encrypted_page(key, salt, 2, b"C")
+    wal_bytes, _latest_checksum = _wal_bytes(
+        [(2, 2, committed_page), (2, 0, uncommitted_page)]
+    )
+    _first_wal, first_checksum = _wal_bytes([(2, 2, committed_page)])
+    wal.write_bytes(wal_bytes)
+    wal.with_name("message.db-shm").write_bytes(
+        _shm_bytes(
+            mx_frame=1,
+            n_page=2,
+            frame_checksum=first_checksum,
+        )
+    )
+
     assert wechat_db._apply_wechat_wal(wal, key, salt, output) == 1
     assert output.read_bytes()[4096:4096 + 4016] == b"B" * 4016
 
@@ -182,6 +635,31 @@ def test_wal_shm_mxframe_and_checksums_are_enforced(tmp_path):
         _wal.inspect_wal(wal, shm_path=shm, expected_page_size=4096)
 
 
+def test_wechat_stale_index_fallback_never_masks_corrupt_wal_frame(tmp_path):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    output = tmp_path / "decrypted.db"
+    original = b"\0" * 8192
+    output.write_bytes(original)
+    wal = tmp_path / "message.db-wal"
+    page = _encrypted_page(key, salt, 2, b"B")
+    wal_bytes, frame_checksum = _wal_bytes([(2, 2, page)])
+    corrupted = bytearray(wal_bytes)
+    corrupted[-1] ^= 1
+    wal.write_bytes(corrupted)
+    wal.with_name("message.db-shm").write_bytes(
+        _shm_bytes(
+            mx_frame=1,
+            n_page=2,
+            frame_checksum=frame_checksum,
+        )
+    )
+
+    with pytest.raises(_wal.WalValidationError, match="frame checksum"):
+        wechat_db._apply_wechat_wal(wal, key, salt, output)
+    assert output.read_bytes() == original
+
+
 def test_wal_bad_header_checksum_fails_closed(tmp_path):
     wal = tmp_path / "message.db-wal"
     data = bytearray(_wal_bytes([(2, 2, b"P" * 4096)])[0])
@@ -189,6 +667,41 @@ def test_wal_bad_header_checksum_fails_closed(tmp_path):
     wal.write_bytes(data)
     with pytest.raises(_wal.WalValidationError, match="header checksum"):
         _wal.inspect_wal(wal, expected_page_size=4096)
+
+    output = tmp_path / "decrypted.db"
+    original = b"\0" * 8192
+    output.write_bytes(original)
+    with pytest.raises(_wal.WalValidationError, match="header checksum"):
+        wechat_db._apply_wechat_wal(
+            wal,
+            bytes(range(32)),
+            bytes(range(16)),
+            output,
+        )
+    assert output.read_bytes() == original
+
+
+def test_wechat_stale_index_fallback_never_applies_uncommitted_wal(tmp_path):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    output = tmp_path / "decrypted.db"
+    original = b"\0" * 8192
+    output.write_bytes(original)
+    wal = tmp_path / "message.db-wal"
+    page = _encrypted_page(key, salt, 2, b"B")
+    wal_bytes, frame_checksum = _wal_bytes([(2, 0, page)])
+    wal.write_bytes(wal_bytes)
+    wal.with_name("message.db-shm").write_bytes(
+        _shm_bytes(
+            mx_frame=1,
+            n_page=2,
+            frame_checksum=frame_checksum,
+            page_size=8192,
+        )
+    )
+
+    assert wechat_db._apply_wechat_wal(wal, key, salt, output) == 0
+    assert output.read_bytes() == original
 
 
 def test_wal_stale_preallocated_tail_after_commit_is_ignored(tmp_path):

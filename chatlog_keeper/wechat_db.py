@@ -17,16 +17,21 @@ import hashlib
 import hmac as hmac_mod
 import json
 import logging
+import math
 import os
 import re
+import secrets
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time as _time
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +75,161 @@ class WxMessage:
     def __str__(self):
         t = self.timestamp.strftime("%H:%M")
         return f"[{t}] {self.display_sender()}: {self.content}"
+
+
+_WECHAT_MESSAGE_PAGE_CURSOR_VERSION = 1
+_WECHAT_MESSAGE_PAGE_MAX_ROWS = 1000
+_WECHAT_MESSAGE_SHARD_ID_RE = re.compile(r"[0-9a-f]{24}")
+
+
+class WeChatMessagePageCancelled(RuntimeError):
+    """Raised before a page cursor is advanced when its caller cancels."""
+
+
+@dataclass(frozen=True)
+class WeChatMessagePageCursor:
+    """Serializable per-shard keyset positions for one bounded message read."""
+
+    scope: str
+    topology: str
+    positions: Tuple[Tuple[str, int, int], ...] = ()
+    version: int = _WECHAT_MESSAGE_PAGE_CURSOR_VERSION
+
+    def __post_init__(self) -> None:
+        if self.version != _WECHAT_MESSAGE_PAGE_CURSOR_VERSION:
+            raise ValueError("WeChat message page cursor version is invalid")
+        if not isinstance(self.scope, str) or not _WECHAT_MESSAGE_SHARD_ID_RE.fullmatch(
+            self.scope
+        ):
+            raise ValueError("WeChat message page cursor scope is invalid")
+        if not isinstance(self.topology, str) or not _WECHAT_MESSAGE_SHARD_ID_RE.fullmatch(
+            self.topology
+        ):
+            raise ValueError("WeChat message page cursor topology is invalid")
+        if not isinstance(self.positions, tuple):
+            raise ValueError("WeChat message page cursor positions are invalid")
+        previous_shard = ""
+        for position in self.positions:
+            if not isinstance(position, tuple) or len(position) != 3:
+                raise ValueError("WeChat message page cursor position is invalid")
+            shard_id, create_time, row_id = position
+            if not isinstance(shard_id, str) or not _WECHAT_MESSAGE_SHARD_ID_RE.fullmatch(
+                shard_id
+            ):
+                raise ValueError("WeChat message page cursor shard is invalid")
+            if shard_id <= previous_shard:
+                raise ValueError("WeChat message page cursor shards are not unique")
+            if (
+                isinstance(create_time, bool)
+                or not isinstance(create_time, int)
+                or isinstance(row_id, bool)
+                or not isinstance(row_id, int)
+                or row_id < 0
+            ):
+                raise ValueError("WeChat message page cursor position is invalid")
+            previous_shard = shard_id
+
+    def position_for(self, shard_id: str) -> Optional[Tuple[int, int]]:
+        """Return ``(create_time, rowid)`` for one shard, if it advanced."""
+
+        for current_shard, create_time, row_id in self.positions:
+            if current_shard == shard_id:
+                return create_time, row_id
+        return None
+
+    def to_dict(self) -> dict:
+        """Return a JSON-safe cursor without database paths or conversation IDs."""
+
+        return {
+            "version": self.version,
+            "scope": self.scope,
+            "topology": self.topology,
+            "positions": [
+                {
+                    "shard": shard_id,
+                    "create_time": create_time,
+                    "row_id": row_id,
+                }
+                for shard_id, create_time, row_id in self.positions
+            ],
+        }
+
+    @classmethod
+    def from_value(cls, value: Any) -> "WeChatMessagePageCursor":
+        """Validate an existing cursor instance or its JSON-decoded mapping."""
+
+        if isinstance(value, cls):
+            return cls(
+                scope=value.scope,
+                topology=value.topology,
+                positions=value.positions,
+                version=value.version,
+            )
+        if not isinstance(value, Mapping):
+            raise ValueError("WeChat message page cursor is invalid")
+        raw_positions = value.get("positions")
+        if not isinstance(raw_positions, list):
+            raise ValueError("WeChat message page cursor positions are invalid")
+        positions = []
+        for item in raw_positions:
+            if not isinstance(item, Mapping):
+                raise ValueError("WeChat message page cursor position is invalid")
+            shard_id = item.get("shard")
+            create_time = item.get("create_time")
+            row_id = item.get("row_id")
+            if (
+                not isinstance(shard_id, str)
+                or not _WECHAT_MESSAGE_SHARD_ID_RE.fullmatch(shard_id)
+                or isinstance(create_time, bool)
+                or not isinstance(create_time, int)
+                or isinstance(row_id, bool)
+                or not isinstance(row_id, int)
+            ):
+                raise ValueError("WeChat message page cursor position is invalid")
+            positions.append((shard_id, create_time, row_id))
+        version = value.get("version")
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError("WeChat message page cursor version is invalid")
+        scope = value.get("scope")
+        topology = value.get("topology")
+        if not isinstance(scope, str):
+            raise ValueError("WeChat message page cursor scope is invalid")
+        if not isinstance(topology, str):
+            raise ValueError("WeChat message page cursor topology is invalid")
+        return cls(
+            scope=scope,
+            topology=topology,
+            positions=tuple(sorted(positions, key=lambda item: item[0])),
+            version=version,
+        )
+
+
+@dataclass(frozen=True)
+class WeChatMessagePage:
+    """One bounded raw-row page converted to the existing ``WxMessage`` type."""
+
+    messages: Tuple[WxMessage, ...]
+    next_cursor: Optional[WeChatMessagePageCursor]
+    has_more: bool
+    scanned_rows: int
+
+
+@dataclass(frozen=True)
+class _WeChatConversationPageRow:
+    """One keyset-addressable database row before content normalization."""
+
+    shard_id: str
+    row_id: int
+    create_time: int
+    msg_type: int
+    sender: str
+    message_content: Any
+    server_id: str
+    packed_info_data: Any
+
+    @property
+    def order_key(self) -> Tuple[int, str, int]:
+        return self.create_time, self.shard_id, self.row_id
 
 
 # ─── WeChat process helpers ────────────────────────────────────────────────────
@@ -169,9 +329,12 @@ def find_weixin_data_root() -> Optional[Path]:
 def find_wxid_dirs(data_root: Path) -> list:
     """Return list of wxid subdirectory paths inside data_root."""
     dirs = []
-    for item in data_root.iterdir():
-        if item.is_dir() and (item.name.startswith("wxid_") or len(item.name) > 10):
-            dirs.append(item)
+    try:
+        for item in data_root.iterdir():
+            if item.is_dir() and (item.name.startswith("wxid_") or len(item.name) > 10):
+                dirs.append(item)
+    except OSError as exc:
+        logger.warning("Failed to scan WeChat account directories: %s", type(exc).__name__)
     return dirs
 
 
@@ -264,15 +427,12 @@ def _verify_key_v4(enc_key: bytes, db_page1: bytes) -> bool:
     return _effective_page_key(enc_key, db_page1) is not None
 
 
-# ─── Persistent master-key cache (data/secrets/wechat_db.key, gitignored) ──────
-# The WeChat 4.x master key (32 bytes) is per-install STABLE — it changes only on
-# reinstall / account-switch, never on app restart or WeChat upgrade. A key
-# obtained once (from WCDB setCipherKey or any extractor) is cached and reused
-# indefinitely. On WeChat 4.1.10.31+ the plaintext key is no longer reachable in
-# the heap, so live _scan_memory_for_key returns nothing — the cache is the ONLY
-# working path. Mirrors qq_db.py's qq_db.key cache.
-# Written by `chatlog-keeper wechat set-key` / `extract-key`; read here
-# cache-first so the reader and the CLI stay in lockstep.
+# ─── Persistent master-key cache (data/secrets, gitignored) ───────────────────
+# The WeChat 4.x master key (32 bytes) is stable for one account but can change
+# after an account switch or reinstall. New writes therefore use
+# ``wechat_accounts/SHA256(account_id).key``; the historical ``wechat_db.key``
+# remains a read fallback for existing installations and non-canonical archives.
+# On WeChat 4.1.10.31+ the cache is also the only restart-independent read path.
 
 def _persistent_wechat_key_cache_path() -> Optional[Path]:
     """Persistent app-data secrets path (survives app upgrade/reinstall — NSIS
@@ -296,10 +456,36 @@ def _wechat_key_cache_path() -> Path:
     return p if p is not None else _legacy_wechat_key_cache_path()
 
 
+def _wechat_account_key_cache_path(account_id: str) -> Path:
+    """Return an account-scoped path without exposing the native WeChat ID."""
+    normalized = str(account_id or "").strip()
+    if not normalized:
+        return _wechat_key_cache_path()
+    digest = hashlib.sha256(
+        normalized.encode("utf-8", errors="replace")
+    ).hexdigest()
+    return _wechat_key_cache_path().parent / "wechat_accounts" / f"{digest}.key"
+
+
+def _parse_cached_wechat_key_text(text: str) -> Optional[bytes]:
+    """Parse the on-disk 64-hex master-key representation."""
+    normalized = (text or "").strip()
+    if len(normalized) != 64 or any(
+        char not in "0123456789abcdefABCDEF" for char in normalized
+    ):
+        return None
+    try:
+        return bytes.fromhex(normalized)
+    except ValueError:
+        return None
+
+
 def load_cached_wechat_key() -> Optional[bytes]:
     """Read the cached 32-byte master key (64 hex on disk), persistent dir first.
     Never validates here — the caller HMAC-checks against the live DB so a stale
     key self-heals (it just fails _verify_key_v4 and a re-extract is attempted)."""
+    from chatlog_keeper.core._secrets import read_secret_text
+
     seen: set = set()
     candidates = []
     persistent = _persistent_wechat_key_cache_path()
@@ -314,18 +500,28 @@ def load_cached_wechat_key() -> Optional[bytes]:
         if rp in seen:
             continue
         seen.add(rp)
-        try:
-            if not p.exists():
-                continue
-            text = p.read_text(encoding="utf-8").strip()
-        except OSError:
+        text = read_secret_text(p)
+        if text is None:
             continue
-        if len(text) == 64 and all(c in "0123456789abcdefABCDEF" for c in text):
-            try:
-                return bytes.fromhex(text)
-            except ValueError:
-                continue
+        key = _parse_cached_wechat_key_text(text)
+        if key:
+            return key
     return None
+
+
+def load_cached_wechat_key_for_account(account_id: str) -> Optional[bytes]:
+    """Load one account's key before the legacy global compatibility cache."""
+    from chatlog_keeper.core._secrets import read_secret_text
+
+    normalized = str(account_id or "").strip()
+    if normalized:
+        path = _wechat_account_key_cache_path(normalized)
+        text = read_secret_text(path)
+        if text is not None:
+            key = _parse_cached_wechat_key_text(text)
+            if key:
+                return key
+    return load_cached_wechat_key()
 
 
 def save_cached_wechat_key(key: bytes) -> bool:
@@ -335,6 +531,42 @@ def save_cached_wechat_key(key: bytes) -> bool:
     p = _wechat_key_cache_path()
     from chatlog_keeper.core._secrets import write_secret_text
     return write_secret_text(p, bytes(key).hex())
+
+
+def wechat_account_id_for_database(db_path: Path) -> Optional[str]:
+    """Return the discovered wxid owner of a canonical message database path."""
+    try:
+        path = Path(db_path)
+        if (
+            path.parent.name.casefold() != "message"
+            or path.parent.parent.name.casefold() != "db_storage"
+        ):
+            return None
+        account_id = path.parent.parent.parent.name.strip()
+    except (IndexError, OSError, TypeError):
+        return None
+    return account_id or None
+
+
+def save_cached_wechat_key_for_account(
+    key: bytes,
+    account_id: str,
+    verification_db: Path,
+) -> bool:
+    """HMAC-verify and persist a key only for ``verification_db``'s account."""
+    normalized = str(account_id or "").strip()
+    if not key or len(key) != 32 or not normalized:
+        return False
+    if wechat_account_id_for_database(verification_db) != normalized:
+        return False
+    page1 = _read_stable_page1(Path(verification_db))
+    if not page1 or not _verify_key_v4(bytes(key), page1):
+        return False
+    from chatlog_keeper.core._secrets import write_secret_text
+    return write_secret_text(
+        _wechat_account_key_cache_path(normalized),
+        bytes(key).hex(),
+    )
 
 
 def _read_stable_page1(db_path: Path) -> Optional[bytes]:
@@ -472,14 +704,15 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
 
 
 def extract_key_from_weixin(pid: int, db_path: Path = None,
-                            timeout_s: Optional[float] = None) -> Optional[bytes]:
+                            timeout_s: Optional[float] = None,
+                            account_id: Optional[str] = None) -> Optional[bytes]:
     """
     Obtain the Weixin 4.x master key for db_path. Returns 32-byte key or None.
 
     Acquisition order (cheapest first):
-      1. Persistent cache (data/secrets/wechat_db.key), HMAC-validated against the
-         live DB's page 1 — no scan, works without WeChat running. On 4.1.10.31 this
-         is the only path that yields a key (seed it via `chatlog-keeper wechat set-key`).
+      1. Account cache, then legacy global cache, HMAC-validated against the live
+         DB's page 1 — no scan, works without WeChat running. On 4.1.10.31 this is
+         the only path that yields a key (seed it via `chatlog-keeper wechat set-key`).
       2. Live process-memory scan (works on 4.0.x/older where the plaintext key is
          in the heap; returns nothing on 4.1.10.31). A scanned key that verifies is
          persisted to the cache so future runs skip the scan.
@@ -491,9 +724,13 @@ def extract_key_from_weixin(pid: int, db_path: Path = None,
 
     # 1. Cache fast-path (self-healing: only used if it HMAC-verifies the live DB).
     if db_page1:
-        cached = load_cached_wechat_key()
+        cached = (
+            load_cached_wechat_key_for_account(account_id)
+            if account_id
+            else load_cached_wechat_key()
+        )
         if cached and len(cached) == 32 and _verify_key_v4(cached, db_page1):
-            logger.info("Using cached Weixin master key (data/secrets/wechat_db.key)")
+            logger.info("Using a cached Weixin master key")
             return cached
 
     # 2. Live process-memory scan (fails on 4.1.10.31 — plaintext key not in heap).
@@ -502,7 +739,12 @@ def extract_key_from_weixin(pid: int, db_path: Path = None,
     if key and len(key) == 32:
         # _scan_memory_for_key already HMAC-validates; persist for future runs.
         if db_page1 and _verify_key_v4(key, db_page1):
-            if save_cached_wechat_key(key):
+            saved = (
+                save_cached_wechat_key_for_account(key, account_id, Path(db_path))
+                if account_id and db_path
+                else save_cached_wechat_key(key)
+            )
+            if saved:
                 logger.info("Weixin master key extracted from memory and cached")
         return key
     # DEBUG not WARN — initialize batch-tries pids; per-pid failure is normal.
@@ -534,28 +776,26 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
 
     enc_key is used directly as the AES key (raw-key mode, no PBKDF2).
     """
-    try:
-        from Crypto.Cipher import AES
-    except ImportError:
-        try:
-            from Cryptodome.Cipher import AES
-        except ImportError:
-            logger.warning("pycryptodome not installed — cannot decrypt DB")
-            return False
-
     PAGE_SZ = 4096
-    SALT_SZ = 16
-    RESERVE = 80   # 16 IV + 64 HMAC
 
+    temporary_output: Optional[Path] = None
     try:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            dir=str(output_path.parent),
+        )
+        os.close(fd)
+        temporary_output = Path(temporary_name)
         # Decrypt page-by-page so peak memory stays at a single 4 KB page.
         # Reading the whole DB into memory at once can exhaust RAM (same
         # streaming approach as qq_db).
         pages = 0
-        with open(db_path, "rb") as f, open(output_path, "wb") as out:
+        with open(db_path, "rb") as f, open(temporary_output, "wb") as out:
             first = f.read(PAGE_SZ)
             if len(first) < PAGE_SZ:
-                out.write(first)
                 logger.warning(f"DB too small to decrypt: {db_path.name}")
                 return False
             # Derive the actual AES page key from page-1 salt (handles 4.1.10.31 password
@@ -564,28 +804,38 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
             if page_key is None:
                 logger.warning(f"Decryption: enc_key does not fit {db_path.name} (page-1 HMAC fail)")
                 return False
-            # Page 1: salt(16) + encrypted body + reserve(80)
-            iv = first[PAGE_SZ - RESERVE: PAGE_SZ - 64]
-            dec = AES.new(page_key, AES.MODE_CBC, iv).decrypt(first[SALT_SZ: PAGE_SZ - RESERVE])
-            out.write(b"SQLite format 3\x00" + dec + first[PAGE_SZ - RESERVE:])
+            # Authenticate every main page before publishing any plaintext.
+            plain = _decrypt_wechat_page(first, page_key, first[:16], 1)
+            if plain is None:
+                raise OSError("page 1 authentication failed")
+            out.write(plain)
             pages = 1
             while True:
                 page = f.read(PAGE_SZ)
-                if len(page) < PAGE_SZ:
-                    if page:
-                        out.write(page)
+                if not page:
                     break
-                iv = page[PAGE_SZ - RESERVE: PAGE_SZ - 64]
-                dec = AES.new(page_key, AES.MODE_CBC, iv).decrypt(page[: PAGE_SZ - RESERVE])
-                out.write(dec + page[PAGE_SZ - RESERVE:])
+                if len(page) != PAGE_SZ:
+                    raise OSError("encrypted DB has a truncated trailing page")
+                page_no = pages + 1
+                plain = _decrypt_wechat_page(
+                    page,
+                    page_key,
+                    first[:16],
+                    page_no,
+                )
+                if plain is None:
+                    raise OSError(f"page {page_no} authentication failed")
+                out.write(plain)
                 pages += 1
 
         wal_frames = _apply_wechat_wal(
             db_path.with_name(db_path.name + "-wal"),
             page_key,
-            first[:SALT_SZ],
-            output_path,
+            first[:16],
+            temporary_output,
         )
+        os.replace(temporary_output, output_path)
+        temporary_output = None
         logger.info(
             "Decrypted %d main pages + %d committed WAL frames (streaming) → %s",
             pages,
@@ -596,10 +846,21 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
     except Exception as e:
         logger.warning(f"Decryption failed for {db_path.name}: {e}")
         return False
+    finally:
+        if temporary_output is not None:
+            try:
+                temporary_output.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
-def _decrypt_wal_page(page: bytes, page_key: bytes, salt: bytes, page_no: int) -> Optional[bytes]:
-    """HMAC-verify and decrypt one SQLCipher-4 WAL page image."""
+def _decrypt_wechat_page(
+    page: bytes,
+    page_key: bytes,
+    salt: bytes,
+    page_no: int,
+) -> Optional[bytes]:
+    """HMAC-verify and decrypt one SQLCipher-4 main/WAL page image."""
     try:
         from Crypto.Cipher import AES
     except ImportError:
@@ -627,26 +888,75 @@ def _decrypt_wal_page(page: bytes, page_key: bytes, salt: bytes, page_no: int) -
     return body + page[page_size - reserve:]
 
 
+def _decrypt_wal_page(page: bytes, page_key: bytes, salt: bytes, page_no: int) -> Optional[bytes]:
+    """Backward-compatible wrapper for one authenticated SQLCipher WAL page."""
+    return _decrypt_wechat_page(page, page_key, salt, page_no)
+
+
 def _apply_wechat_wal(
     wal_path: Path,
     page_key: bytes,
     salt: bytes,
     output_path: Path,
 ) -> int:
-    """Apply structurally-valid, HMAC-valid frames through ``mxFrame``."""
-    from chatlog_keeper.core._wal import apply_wal
+    """Apply authenticated frames, rebuilding only a stale copied WAL index.
+
+    A live WeChat snapshot can contain a stable but obsolete ``-shm`` cache
+    beside a newer WAL generation.  If indexed inspection fails, or a WAL-only
+    scan proves a later complete commit, recover exactly as SQLite does without
+    ``-shm``: require a valid header, salts, cumulative frame checksums, and a
+    last complete commit.  WAL corruption and SQLCipher page-HMAC failures
+    remain fail-closed.
+    """
+    from chatlog_keeper.core import _wal
 
     shm_path = wal_path.with_name(
         wal_path.name[:-4] + "-shm"
         if wal_path.name.endswith("-wal")
         else wal_path.name + "-shm"
     )
-    return apply_wal(
+    decrypt_page = lambda page, page_no: _decrypt_wal_page(
+        page, page_key, salt, page_no
+    )
+    try:
+        indexed_plan = _wal.inspect_wal(
+            wal_path,
+            shm_path=shm_path,
+            expected_page_size=4096,
+        )
+    except _wal.WalIndexValidationError:
+        return _wal._apply_wal_without_index(
+            wal_path,
+            output_path,
+            decrypt_page,
+            expected_page_size=4096,
+        )
+
+    # A checksummed SHM header can still lag a newer complete WAL commit (for
+    # example after a crash between the WAL fsync and WAL-index publication).
+    # Only ignore that otherwise-valid index when a WAL-only checksum scan can
+    # prove a strictly later complete commit.  Invalid or uncommitted tails do
+    # not advance ``frames_to_apply`` and therefore remain ignored.
+    if (
+        indexed_plan.used_shm
+        and indexed_plan.physical_frames > indexed_plan.frames_to_apply
+    ):
+        recovered_plan = _wal._inspect_wal_without_index(
+            wal_path,
+            expected_page_size=4096,
+        )
+        if recovered_plan.frames_to_apply > indexed_plan.frames_to_apply:
+            return _wal._apply_wal_without_index(
+                wal_path,
+                output_path,
+                decrypt_page,
+                expected_page_size=4096,
+            )
+
+    return _wal.apply_wal(
         wal_path,
         output_path,
-        lambda page, page_no: _decrypt_wal_page(
-            page, page_key, salt, page_no
-        ),
+        decrypt_page,
         shm_path=shm_path,
         expected_page_size=4096,
     )
@@ -1330,6 +1640,324 @@ def _table_name_to_wxid(table_name: str, name_map: dict) -> str:
     return suffix[:8] + "..."
 
 
+def _wechat_conversation_table_name(conversation_id: str) -> str:
+    """Return the exact WeChat message table for one native conversation."""
+
+    if (
+        not isinstance(conversation_id, str)
+        or not conversation_id
+        or "\x00" in conversation_id
+        or len(conversation_id) > 512
+    ):
+        raise ValueError("WeChat conversation_id is invalid")
+    digest = hashlib.md5(conversation_id.encode("utf-8")).hexdigest()
+    return f"Msg_{digest}"
+
+
+def _wechat_message_shard_id(database: Path, *, root: Optional[Path]) -> str:
+    """Build a stable opaque shard ID from a path relative to the account root."""
+
+    path = Path(database)
+    if root is not None:
+        try:
+            value = path.relative_to(Path(root)).as_posix()
+        except ValueError:
+            value = path.name
+    else:
+        value = path.name
+    return hashlib.sha256(value.casefold().encode("utf-8")).hexdigest()[:24]
+
+
+def _wechat_shard_bound_sender_id(shard_id: str, sender_id: Any) -> str:
+    """Bind a shard-local ``Name2Id.rowid`` to its stable opaque shard.
+
+    ``Name2Id.rowid`` has no account-wide meaning: the same integer can name
+    different people in different message databases.  A missing/empty mapping
+    must therefore never be exposed as a bare numeric participant ID.
+    """
+
+    if not isinstance(shard_id, str) or not _WECHAT_MESSAGE_SHARD_ID_RE.fullmatch(
+        shard_id
+    ):
+        raise ValueError("WeChat message page shard is invalid")
+    if isinstance(sender_id, bool):
+        raise ValueError("WeChat sender identity is invalid")
+    normalized = str(sender_id).strip()
+    if not normalized or not normalized.isascii() or not normalized.isdecimal():
+        raise ValueError("WeChat sender identity is invalid")
+    value = f"wechat_sender:{shard_id}:{normalized}"
+    if len(value) > 512 or any(ord(character) < 32 for character in value):
+        raise ValueError("WeChat sender identity is invalid")
+    return value
+
+
+def _wechat_message_topology(shard_ids) -> str:
+    """Fingerprint the readable shard set without retaining database paths."""
+
+    normalized = tuple(sorted(str(value) for value in shard_ids))
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("WeChat readable database shards are ambiguous")
+    material = "\x00".join(normalized).encode("ascii")
+    return hashlib.sha256(material).hexdigest()[:24]
+
+
+def _wechat_message_page_scope(
+    *,
+    account_id: str,
+    conversation_id: str,
+    since_ts: int,
+    until_ts: Optional[int],
+) -> str:
+    """Hash the immutable account/conversation/window part of a page request."""
+
+    material = json.dumps(
+        {
+            "account_id": str(account_id or ""),
+            "conversation_table": _wechat_conversation_table_name(conversation_id),
+            "since_ts": since_ts,
+            "until_ts": until_ts,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:24]
+
+
+def _wechat_page_cancel_requested(
+    cancel_requested: Optional[Callable[[], bool]],
+) -> bool:
+    """Read a best-effort cancellation callback without treating errors as cancel."""
+
+    if cancel_requested is None:
+        return False
+    try:
+        return bool(cancel_requested())
+    except Exception:
+        return False
+
+
+def _raise_if_wechat_page_cancelled(
+    cancel_requested: Optional[Callable[[], bool]],
+) -> None:
+    if _wechat_page_cancel_requested(cancel_requested):
+        raise WeChatMessagePageCancelled("WeChat message page read cancelled")
+
+
+def _validated_wechat_page_time(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"WeChat message page {field} is invalid")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"WeChat message page {field} is invalid") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"WeChat message page {field} is invalid")
+    return int(numeric)
+
+
+def _validated_wechat_page_size(value: Any, *, query_limit: bool = False) -> int:
+    maximum = _WECHAT_MESSAGE_PAGE_MAX_ROWS + (1 if query_limit else 0)
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise ValueError("WeChat message page_size is invalid")
+    return value
+
+
+def _load_sender_names_for_ids(
+    conn,
+    sender_ids,
+    *,
+    cancel_requested: Optional[Callable[[], bool]] = None,
+) -> dict:
+    """Read only sender names referenced by one bounded raw page."""
+
+    normalized = sorted(
+        {
+            int(value)
+            for value in sender_ids
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+    )
+    names = {}
+    # Stay below conservative SQLite variable limits even at the 1000-row page cap.
+    for start in range(0, len(normalized), 400):
+        _raise_if_wechat_page_cancelled(cancel_requested)
+        chunk = normalized[start:start + 400]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" for _ in chunk)
+        try:
+            rows = conn.execute(
+                f"SELECT rowid, user_name FROM Name2Id "
+                f"WHERE rowid IN ({placeholders}) LIMIT ?",
+                [*chunk, len(chunk)],
+            ).fetchall()
+        except Exception:
+            continue
+        for row_id, user_name in rows:
+            normalized = str(user_name or "").strip()
+            if normalized:
+                names[int(row_id)] = normalized
+    return names
+
+
+def _query_conversation_page_rows(
+    conn,
+    *,
+    conversation_id: str,
+    since_ts: float,
+    until_ts: Optional[float],
+    position: Optional[Tuple[int, int]],
+    limit: int,
+    shard_id: str,
+    cancel_requested: Optional[Callable[[], bool]] = None,
+) -> list:
+    """Read one exact conversation with SQL keyset bounds and a hard LIMIT."""
+
+    import sqlite3
+
+    table = _wechat_conversation_table_name(conversation_id)
+    if not isinstance(shard_id, str) or not _WECHAT_MESSAGE_SHARD_ID_RE.fullmatch(
+        shard_id
+    ):
+        raise ValueError("WeChat message page shard is invalid")
+    row_limit = _validated_wechat_page_size(limit, query_limit=True)
+    since = _validated_wechat_page_time(since_ts, field="since_ts")
+    until = (
+        _validated_wechat_page_time(until_ts, field="until_ts")
+        if until_ts is not None
+        else None
+    )
+    if until is not None and until < since:
+        return []
+    keyset = None
+    if position is not None:
+        if (
+            not isinstance(position, tuple)
+            or len(position) != 2
+            or isinstance(position[0], bool)
+            or not isinstance(position[0], int)
+            or isinstance(position[1], bool)
+            or not isinstance(position[1], int)
+            or position[1] < 0
+        ):
+            raise ValueError("WeChat message page cursor position is invalid")
+        keyset = position
+
+    _raise_if_wechat_page_cancelled(cancel_requested)
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    if exists is None:
+        return []
+
+    predicates = ["create_time > ?"]
+    parameters = [since]
+    if until is not None:
+        predicates.append("create_time <= ?")
+        parameters.append(until)
+    if keyset is not None:
+        predicates.append("(create_time > ? OR (create_time = ? AND rowid > ?))")
+        parameters.extend([keyset[0], keyset[0], keyset[1]])
+    parameters.append(row_limit)
+    statement = (
+        "SELECT rowid, local_type, create_time, real_sender_id, message_content, "
+        f'server_id, packed_info_data FROM "{table}" WHERE '
+        + " AND ".join(predicates)
+        + " ORDER BY create_time ASC, rowid ASC LIMIT ?"
+    )
+
+    progress_handler_installed = False
+    cancelled_during_query = False
+
+    def _progress_handler() -> int:
+        nonlocal cancelled_during_query
+        cancelled_during_query = _wechat_page_cancel_requested(cancel_requested)
+        return 1 if cancelled_during_query else 0
+
+    if cancel_requested is not None and hasattr(conn, "set_progress_handler"):
+        conn.set_progress_handler(_progress_handler, 1000)
+        progress_handler_installed = True
+    try:
+        raw_rows = conn.execute(statement, parameters).fetchall()
+    except sqlite3.OperationalError:
+        if cancelled_during_query or _wechat_page_cancel_requested(cancel_requested):
+            raise WeChatMessagePageCancelled(
+                "WeChat message page read cancelled"
+            ) from None
+        raise
+    finally:
+        if progress_handler_installed:
+            conn.set_progress_handler(None, 0)
+    _raise_if_wechat_page_cancelled(cancel_requested)
+
+    sender_names = _load_sender_names_for_ids(
+        conn,
+        (row[3] for row in raw_rows),
+        cancel_requested=cancel_requested,
+    )
+    rows = []
+    for row in raw_rows:
+        row_id, local_type, create_time, sender_id, content, server_id, packed = row
+        sender = sender_names.get(sender_id)
+        if sender is None:
+            sender = _wechat_shard_bound_sender_id(shard_id, sender_id)
+        rows.append(
+            _WeChatConversationPageRow(
+                shard_id=shard_id,
+                row_id=int(row_id),
+                create_time=int(create_time or 0),
+                msg_type=int(local_type or 0) & 0xFFFF,
+                sender=sender,
+                message_content=content,
+                server_id=(
+                    str(server_id) if server_id not in (None, 0, "") else ""
+                ),
+                packed_info_data=packed,
+            )
+        )
+    return rows
+
+
+def _wechat_message_from_page_row(
+    row: _WeChatConversationPageRow,
+    *,
+    conversation_id: str,
+) -> Optional[WxMessage]:
+    """Apply the legacy content normalization to one bounded database row."""
+
+    if row.msg_type not in _WX_KEPT_TYPES:
+        return None
+    raw = _decompress_message(row.message_content)
+    if row.msg_type == _WX_MSG_TYPE_TEXT:
+        first_line = raw.split("\n")[0].strip().rstrip(":")
+        content = (
+            raw.split("\n", 1)[1]
+            if "\n" in raw and first_line == row.sender
+            else raw
+        ).strip()
+        attachment_meta = None
+    else:
+        content = _extract_wechat_xml(raw, row.msg_type).strip()
+        attachment_meta = _extract_attachment_meta(raw, row.msg_type)
+        if attachment_meta and attachment_meta.get("kind") == "image":
+            file_md5 = _extract_file_md5_from_packed_info(row.packed_info_data)
+            if file_md5:
+                attachment_meta["file_md5"] = file_md5
+    if not content:
+        return None
+    return WxMessage(
+        timestamp=datetime.fromtimestamp(row.create_time),
+        sender=row.sender,
+        content=content,
+        chat_name=conversation_id,
+        msg_type=row.msg_type,
+        attachment_meta=attachment_meta,
+        server_id=row.server_id,
+    )
+
+
 def _query_messages_by_date(conn, target_date: date, name_map: dict) -> list:
     """
     Query all Msg_* tables for messages on target_date.
@@ -1496,13 +2124,38 @@ def _query_messages_since_inner(conn, since_ts: float, name_map: dict, chat_name
     return messages
 
 
-# ─── Decrypt cache (30s TTL + mtime invalidate) ────────────────────────────────
-# Module-level cache: {src_db_path: (decrypted_tmp_path, src_mtime, decrypted_at)}.
-# Cache hit only if src.mtime unchanged AND age < TTL. Cleanup on miss + atexit.
+# ─── Decrypt cache (30s idle TTL + DB-family invalidation) ────────────────────
 
-_DECRYPT_CACHE: dict = {}
-_DECRYPT_CACHE_TTL = 30.0  # seconds
-_DECRYPT_CACHE_LOCK = None  # initialized lazily; threading import deferred
+_DECRYPT_CACHE_TTL = 30.0
+_DECRYPT_DELETE_RETRY = 1.0
+_DECRYPT_OWNER_FILE = ".chatlog-owner-v1"
+_DECRYPT_LEGACY_SCAVENGE_AGE = 24 * 60 * 60.0
+_DECRYPT_MAIN_NAME = re.compile(r"plain-[0-9a-f]{32}\.db")
+_DECRYPT_CACHE_DIR_NAME = re.compile(r"chatlog_decrypted_[A-Za-z0-9_-]+")
+
+
+@dataclass
+class _DecryptCacheEntry:
+    path: Path
+    fingerprint: tuple
+    last_access: float
+    deadline: float
+    timer: Any
+    private_dir: Path
+    generation: object
+
+
+@dataclass
+class _PendingDecryptDelete:
+    private_dir: Path
+    timer: Any
+    generation: object
+
+
+_DECRYPT_CACHE: dict[Path, _DecryptCacheEntry] = {}
+_DECRYPT_PENDING_DELETES: dict[Path, _PendingDecryptDelete] = {}
+_DECRYPT_CACHE_LOCK = threading.Lock()
+_DECRYPT_SCAVENGE_DONE = False
 
 
 def _emit_decrypt_trace(event: str, payload: dict) -> None:
@@ -1513,74 +2166,517 @@ def _emit_decrypt_trace(event: str, payload: dict) -> None:
         pass
 
 
-def _decrypt_with_cache(db_path: Path, enc_key: bytes, ttl: float = _DECRYPT_CACHE_TTL) -> Optional[Path]:
-    """Decrypt db_path → reusable tempfile; cache hit if mtime same + age < ttl.
+def _db_family_fingerprint(db_path: Path) -> Optional[tuple]:
+    """Return an identity/size/mtime fingerprint for main DB, WAL and SHM."""
+    values = []
+    for index, candidate in enumerate(
+        (
+            Path(db_path),
+            Path(db_path).with_name(Path(db_path).name + "-wal"),
+            Path(db_path).with_name(Path(db_path).name + "-shm"),
+        )
+    ):
+        try:
+            value = candidate.stat()
+        except FileNotFoundError:
+            if index == 0:
+                return None
+            values.append(None)
+            continue
+        except OSError:
+            return None
+        if not stat.S_ISREG(value.st_mode):
+            return None
+        values.append(
+            (
+                value.st_dev,
+                value.st_ino,
+                value.st_size,
+                value.st_mtime_ns,
+            )
+        )
+    return tuple(values)
 
-    Returns Path to decrypted tempfile (caller must NOT unlink — cache owns it),
-    or None on decrypt failure.
-    """
-    import threading
-    import time as _time
 
-    global _DECRYPT_CACHE_LOCK
-    if _DECRYPT_CACHE_LOCK is None:
-        _DECRYPT_CACHE_LOCK = threading.Lock()
+def _private_decrypt_dir_is_safe(private_dir: Path) -> bool:
+    try:
+        value = Path(private_dir).lstat()
+    except OSError:
+        return False
+    if (
+        not stat.S_ISDIR(value.st_mode)
+        or Path(private_dir).is_symlink()
+        or getattr(value, "st_file_attributes", 0) & 0x0400
+    ):
+        return False
+    if os.name == "nt":
+        from chatlog_keeper.core._secrets import _windows_acl_is_private
 
-    if not db_path.exists():
-        return None
+        return _windows_acl_is_private(Path(private_dir))
+    return value.st_uid == os.geteuid() and stat.S_IMODE(value.st_mode) == 0o700
 
-    src_mtime = db_path.stat().st_mtime
-    now = _time.time()
 
+def _private_decrypt_file_is_safe(path: Path, private_dir: Path) -> bool:
+    path = Path(path)
+    if path.parent != Path(private_dir) or not _private_decrypt_dir_is_safe(private_dir):
+        return False
+    try:
+        value = path.lstat()
+    except OSError:
+        return False
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or path.is_symlink()
+        or getattr(value, "st_file_attributes", 0) & 0x0400
+    ):
+        return False
+    if os.name == "nt":
+        from chatlog_keeper.core._secrets import _windows_acl_is_private
+
+        return _windows_acl_is_private(path)
+    return value.st_uid == os.geteuid() and stat.S_IMODE(value.st_mode) == 0o600
+
+
+def _cache_artifact_name_is_allowed(name: str, main_name: str) -> bool:
+    return (
+        name == _DECRYPT_OWNER_FILE
+        or name == main_name
+        or name in {
+            main_name + "-wal",
+            main_name + "-shm",
+            main_name + "-journal",
+        }
+        or (name.startswith(f".{main_name}.") and name.endswith(".tmp"))
+    )
+
+
+def _remove_decrypted_cache_file(path: Path, private_dir: Path) -> bool:
+    """Remove one exact private cache family without following links."""
+    path = Path(path)
+    private_dir = Path(private_dir)
+    try:
+        private_dir.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if (
+        path.parent != private_dir
+        or _DECRYPT_MAIN_NAME.fullmatch(path.name) is None
+        or not _private_decrypt_dir_is_safe(private_dir)
+    ):
+        return False
+    try:
+        children = list(private_dir.iterdir())
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    checked = []
+    for child in children:
+        if not _cache_artifact_name_is_allowed(child.name, path.name):
+            return False
+        try:
+            value = child.lstat()
+        except OSError:
+            return False
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or child.is_symlink()
+            or getattr(value, "st_file_attributes", 0) & 0x0400
+        ):
+            return False
+        if os.name != "nt" and value.st_uid != os.geteuid():
+            return False
+        checked.append(child)
+    checked.sort(key=lambda item: item.name == _DECRYPT_OWNER_FILE)
+    for child in checked:
+        try:
+            child.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+    try:
+        private_dir.rmdir()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _queue_pending_decrypt_delete_locked(path: Path, private_dir: Path) -> None:
+    """Keep ownership of a Windows-busy artifact until deletion succeeds."""
+    previous = _DECRYPT_PENDING_DELETES.get(path)
+    if previous is not None and previous.timer is not None:
+        previous.timer.cancel()
+    generation = object()
+    timer = threading.Timer(
+        _DECRYPT_DELETE_RETRY,
+        _retry_pending_decrypt_delete,
+        args=(path, generation),
+    )
+    timer.daemon = True
+    _DECRYPT_PENDING_DELETES[path] = _PendingDecryptDelete(
+        private_dir=private_dir,
+        timer=timer,
+        generation=generation,
+    )
+    timer.start()
+
+
+def _retry_pending_decrypt_delete(path: Path, expected_generation: object) -> None:
+    with _DECRYPT_CACHE_LOCK:
+        pending = _DECRYPT_PENDING_DELETES.get(path)
+        if pending is None or pending.generation is not expected_generation:
+            return
+        if _remove_decrypted_cache_file(path, pending.private_dir):
+            _DECRYPT_PENDING_DELETES.pop(path, None)
+            return
+        _queue_pending_decrypt_delete_locked(path, pending.private_dir)
+
+
+def _normalized_decrypt_ttl(ttl: float) -> float:
+    try:
+        value = float(ttl)
+    except (TypeError, ValueError):
+        value = _DECRYPT_CACHE_TTL
+    if not math.isfinite(value):
+        value = _DECRYPT_CACHE_TTL
+    return max(0.01, value)
+
+
+def _expire_decrypt_cache(
+    db_path: Path,
+    expected_path: Path,
+    expected_generation: object,
+) -> None:
+    """Remove exactly one expired generation; cancelled timers cannot win."""
     with _DECRYPT_CACHE_LOCK:
         cached = _DECRYPT_CACHE.get(db_path)
-        if cached is not None:
-            cached_path, cached_mtime, cached_at = cached
-            if (
-                cached_mtime == src_mtime
-                and (now - cached_at) < ttl
-                and cached_path.exists()
-            ):
-                _emit_decrypt_trace("decrypt_cache_hit", {
-                    "db": db_path.name, "age_sec": round(now - cached_at, 2),
-                })
-                return cached_path
-            # Stale: remove old tempfile (best-effort)
-            try:
-                cached_path.unlink()
-            except OSError:
-                pass
+        if (
+            cached is None
+            or cached.path != expected_path
+            or cached.generation is not expected_generation
+        ):
+            return
+        remaining = cached.deadline - _time.monotonic()
+        if remaining > 0:
+            timer = threading.Timer(
+                max(0.01, remaining),
+                _expire_decrypt_cache,
+                args=(db_path, cached.path, cached.generation),
+            )
+            timer.daemon = True
+            cached.timer = timer
+            timer.start()
+            return
+        _DECRYPT_CACHE.pop(db_path, None)
+        if not _remove_decrypted_cache_file(cached.path, cached.private_dir):
+            _queue_pending_decrypt_delete_locked(cached.path, cached.private_dir)
 
-        # Cache miss: decrypt fresh
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        tmp_path = Path(tmp.name)
-        if not _decrypt_db_v4(db_path, enc_key, tmp_path):
+
+def _refresh_decrypt_expiry(
+    db_path: Path,
+    entry: _DecryptCacheEntry,
+    *,
+    ttl: float,
+    now: float,
+) -> _DecryptCacheEntry:
+    """Cancel an old timer and publish a distinct idle-expiry generation."""
+    if entry.timer is not None:
+        entry.timer.cancel()
+    generation = object()
+    lifetime = _normalized_decrypt_ttl(ttl)
+    timer = threading.Timer(
+        lifetime,
+        _expire_decrypt_cache,
+        args=(db_path, entry.path, generation),
+    )
+    timer.daemon = True
+    refreshed = _DecryptCacheEntry(
+        path=entry.path,
+        fingerprint=entry.fingerprint,
+        last_access=now,
+        deadline=now + lifetime,
+        timer=timer,
+        private_dir=entry.private_dir,
+        generation=generation,
+    )
+    _DECRYPT_CACHE[db_path] = refreshed
+    timer.start()
+    return refreshed
+
+
+def _write_decrypt_owner_marker(private_dir: Path) -> bool:
+    from chatlog_keeper.core._secrets import write_secret_text
+
+    return write_secret_text(
+        Path(private_dir) / _DECRYPT_OWNER_FILE,
+        f"pid={os.getpid()}\n",
+    )
+
+
+def _decrypt_with_cache(
+    db_path: Path,
+    enc_key: bytes,
+    ttl: float = _DECRYPT_CACHE_TTL,
+) -> Optional[Path]:
+    """Decrypt a DB family to one private, idle-expiring plaintext snapshot."""
+    db_path = Path(db_path)
+    with _DECRYPT_CACHE_LOCK:
+        fingerprint = _db_family_fingerprint(db_path)
+        if fingerprint is None:
+            return None
+        now = _time.monotonic()
+        cached = _DECRYPT_CACHE.get(db_path)
+        if cached is not None:
+            if (
+                cached.fingerprint == fingerprint
+                and now < cached.deadline
+                and _private_decrypt_file_is_safe(cached.path, cached.private_dir)
+            ):
+                age = now - cached.last_access
+                cached = _refresh_decrypt_expiry(
+                    db_path,
+                    cached,
+                    ttl=ttl,
+                    now=now,
+                )
+                _emit_decrypt_trace(
+                    "decrypt_cache_hit",
+                    {"db": db_path.name, "age_sec": round(age, 2)},
+                )
+                return cached.path
+            if cached.timer is not None:
+                cached.timer.cancel()
+            _DECRYPT_CACHE.pop(db_path, None)
+            if not _remove_decrypted_cache_file(cached.path, cached.private_dir):
+                _queue_pending_decrypt_delete_locked(
+                    cached.path,
+                    cached.private_dir,
+                )
+
+        private_dir = Path(tempfile.mkdtemp(prefix="chatlog_decrypted_"))
+        try:
+            from chatlog_keeper.core._secrets import _prepare_secret_parent
+
+            _prepare_secret_parent(private_dir)
+            if not _write_decrypt_owner_marker(private_dir):
+                raise PermissionError("could not publish decrypt-cache owner marker")
+        except (OSError, ValueError):
             try:
-                tmp_path.unlink()
+                private_dir.rmdir()
             except OSError:
                 pass
-            _emit_decrypt_trace("decrypt_cache_miss", {"db": db_path.name, "result": "decrypt_failed"})
+            return None
+        tmp_path = private_dir / f"plain-{secrets.token_hex(16)}.db"
+        if not _decrypt_db_v4(db_path, enc_key, tmp_path):
+            if not _remove_decrypted_cache_file(tmp_path, private_dir):
+                _queue_pending_decrypt_delete_locked(tmp_path, private_dir)
+            _emit_decrypt_trace(
+                "decrypt_cache_miss",
+                {"db": db_path.name, "result": "decrypt_failed"},
+            )
             return None
 
-        _DECRYPT_CACHE[db_path] = (tmp_path, src_mtime, now)
-        _emit_decrypt_trace("decrypt_cache_miss", {"db": db_path.name, "result": "decrypted_fresh"})
-        return tmp_path
-
-
-def _decrypt_cache_clear():
-    """Cleanup all cached tempfiles (called by atexit)."""
-    global _DECRYPT_CACHE
-    for path, _, _ in list(_DECRYPT_CACHE.values()):
         try:
-            path.unlink()
-        except OSError:
-            pass
-    _DECRYPT_CACHE.clear()
+            if os.name == "nt":
+                from chatlog_keeper.core._secrets import (
+                    _windows_acl_is_private,
+                    _windows_apply_private_acl,
+                )
 
+                if not _windows_apply_private_acl(tmp_path, directory=False):
+                    raise PermissionError("could not restrict decrypted cache ACL")
+                if not _windows_acl_is_private(tmp_path):
+                    raise PermissionError("decrypted cache ACL verification failed")
+            else:
+                os.chmod(tmp_path, 0o600, follow_symlinks=False)
+        except OSError:
+            if not _remove_decrypted_cache_file(tmp_path, private_dir):
+                _queue_pending_decrypt_delete_locked(tmp_path, private_dir)
+            return None
+        if not _private_decrypt_file_is_safe(tmp_path, private_dir):
+            if not _remove_decrypted_cache_file(tmp_path, private_dir):
+                _queue_pending_decrypt_delete_locked(tmp_path, private_dir)
+            return None
+
+        published_at = _time.monotonic()
+        entry = _DecryptCacheEntry(
+            path=tmp_path,
+            fingerprint=fingerprint,
+            last_access=published_at,
+            deadline=published_at,
+            timer=None,
+            private_dir=private_dir,
+            generation=object(),
+        )
+        entry = _refresh_decrypt_expiry(
+            db_path,
+            entry,
+            ttl=ttl,
+            now=published_at,
+        )
+        _emit_decrypt_trace(
+            "decrypt_cache_miss",
+            {"db": db_path.name, "result": "decrypted_fresh"},
+        )
+        return entry.path
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Fail-safe process liveness check for startup orphan cleanup."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+            ]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.GetLastError.restype = wintypes.DWORD
+            handle = kernel32.OpenProcess(0x00100000, False, pid)
+            if not handle:
+                return kernel32.GetLastError() != 87
+            try:
+                # Only WAIT_OBJECT_0 proves termination. Timeout or API failure
+                # must preserve the directory rather than risk a live cache.
+                return kernel32.WaitForSingleObject(handle, 0) != 0
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _scavenge_decrypt_cache(
+    *,
+    temp_root: Optional[Path] = None,
+    force: bool = False,
+) -> int:
+    """Remove safely-identifiable cache dirs left by terminated processes."""
+    global _DECRYPT_SCAVENGE_DONE
+    with _DECRYPT_CACHE_LOCK:
+        if _DECRYPT_SCAVENGE_DONE and not force:
+            return 0
+        _DECRYPT_SCAVENGE_DONE = True
+    root = Path(temp_root) if temp_root is not None else Path(tempfile.gettempdir())
+    try:
+        candidates = list(root.glob("chatlog_decrypted_*"))
+    except OSError:
+        return 0
+    removed = 0
+    now = _time.time()
+    from chatlog_keeper.core._secrets import read_secret_text
+
+    for candidate in candidates:
+        if (
+            candidate.parent != root
+            or _DECRYPT_CACHE_DIR_NAME.fullmatch(candidate.name) is None
+            or not _private_decrypt_dir_is_safe(candidate)
+        ):
+            continue
+        owner_text = read_secret_text(
+            candidate / _DECRYPT_OWNER_FILE,
+            max_bytes=128,
+        )
+        owner_match = re.fullmatch(r"pid=([0-9]+)\n?", owner_text or "")
+        if owner_match is not None:
+            if _process_is_alive(int(owner_match.group(1))):
+                continue
+        else:
+            try:
+                age = now - candidate.stat().st_mtime
+            except OSError:
+                continue
+            if age < _DECRYPT_LEGACY_SCAVENGE_AGE:
+                continue
+        try:
+            names = [item.name for item in candidate.iterdir()]
+        except OSError:
+            continue
+        main_names = set()
+        for name in names:
+            direct = _DECRYPT_MAIN_NAME.fullmatch(name)
+            if direct is not None:
+                main_names.add(name)
+                continue
+            sidecar = re.fullmatch(
+                r"(plain-[0-9a-f]{32}\.db)-(?:wal|shm|journal)",
+                name,
+            )
+            if sidecar is not None:
+                main_names.add(sidecar.group(1))
+                continue
+            temporary = re.fullmatch(
+                r"\.(plain-[0-9a-f]{32}\.db)\..+\.tmp",
+                name,
+            )
+            if temporary is not None:
+                main_names.add(temporary.group(1))
+        if len(main_names) > 1:
+            continue
+        main_name = next(iter(main_names), "plain-" + "0" * 32 + ".db")
+        if _remove_decrypted_cache_file(candidate / main_name, candidate):
+            removed += 1
+    return removed
+
+
+def _decrypt_cache_clear(*, retry_failed: bool = True):
+    """Cancel timers and retain failed deletions for retry/startup scavenging."""
+    with _DECRYPT_CACHE_LOCK:
+        entries = list(_DECRYPT_CACHE.values())
+        pending_entries = list(_DECRYPT_PENDING_DELETES.items())
+        _DECRYPT_CACHE.clear()
+        _DECRYPT_PENDING_DELETES.clear()
+        for entry in entries:
+            if entry.timer is not None:
+                entry.timer.cancel()
+        for _path, pending in pending_entries:
+            if pending.timer is not None:
+                pending.timer.cancel()
+    artifacts = [(entry.path, entry.private_dir) for entry in entries]
+    artifacts.extend(
+        (path, pending.private_dir) for path, pending in pending_entries
+    )
+    failed = []
+    for path, private_dir in artifacts:
+        if not _remove_decrypted_cache_file(path, private_dir):
+            failed.append((path, private_dir))
+    if failed and retry_failed:
+        with _DECRYPT_CACHE_LOCK:
+            for path, private_dir in failed:
+                _queue_pending_decrypt_delete_locked(path, private_dir)
+
+
+_scavenge_decrypt_cache()
 
 import atexit as _atexit
-_atexit.register(_decrypt_cache_clear)
+_atexit.register(_decrypt_cache_clear, retry_failed=False)
 
 
 def _query_messages_since(db_path: Path, since_ts: float, enc_key: bytes, chat_name: Optional[str] = None, until_ts: Optional[float] = None) -> list:
@@ -1607,6 +2703,57 @@ def _query_messages_since(db_path: Path, since_ts: float, enc_key: bytes, chat_n
     except Exception as e:
         logger.warning(f"_query_messages_since failed for {db_path.name}: {e}")
         return []
+
+
+def _query_conversation_counts(conn, candidate_ids=()) -> dict:
+    """Return ``{native_conversation_id: message_count}`` without reading bodies."""
+    cursor = conn.cursor()
+    name_map = _load_name_map(conn)
+    hash_to_id = {}
+    for candidate in list(name_map.values()) + list(candidate_ids):
+        if candidate:
+            value = str(candidate)
+            hash_to_id[hashlib.md5(value.encode()).hexdigest()] = value
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+    )
+    counts: dict = {}
+    for row in cursor.fetchall():
+        table_name = str(row[0] or "")
+        # Table names originate in sqlite_master, but validate the exact WeChat
+        # shape before quoting them into SQL to keep this metadata path strict.
+        if not re.fullmatch(r"Msg_[0-9a-fA-F]{32}", table_name):
+            continue
+        cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+        count_row = cursor.fetchone()
+        suffix = table_name[4:]
+        conversation_id = hash_to_id.get(suffix, suffix[:8] + "...")
+        if not conversation_id:
+            continue
+        counts[conversation_id] = counts.get(conversation_id, 0) + int(
+            (count_row or (0,))[0] or 0
+        )
+    return counts
+
+
+def _conversation_counts(db_path: Path, enc_key: bytes, candidate_ids=()) -> Optional[dict]:
+    """Decrypt one message DB and read only its conversation directory metadata."""
+    import sqlite3
+
+    if not enc_key:
+        return None
+    decrypted = _decrypt_with_cache(db_path, enc_key)
+    if decrypted is None:
+        return None
+    try:
+        conn = sqlite3.connect(str(decrypted))
+        try:
+            return _query_conversation_counts(conn, candidate_ids=candidate_ids)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("WeChat conversation directory is unavailable: %s", type(exc).__name__)
+        return None
 
 
 def query_messages_by_date(db_path: Path, target_date: date, enc_key: bytes = None) -> list:
@@ -1662,9 +2809,27 @@ class WeChatDBReader:
             print("Use clipboard fallback")
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        data_root: Optional[Path] = None,
+        account_id: Optional[str] = None,
+        *,
+        allow_live_key_extract: bool = True,
+    ):
+        """Create a reader, optionally scoped to one discovered wxid directory.
+
+        The account identifier is compared with discovered directory names and
+        is never used to construct a path.  Omitting it keeps the v0.2.0 first-
+        account behavior. Directory-only callers disable live extraction so a
+        metadata scan never opens or inspects a running WeChat process.
+        """
+        self._configured_data_root = Path(data_root) if data_root is not None else None
+        self._configured_account_id = str(account_id) if account_id is not None else None
+        self._allow_live_key_extract = bool(allow_live_key_extract)
         self.data_root = None
         self.wxid_dir = None
+        self.account_id = None
+        self.account_label = ""
         self.enc_key = None  # backward-compat: first DB's key (deprecated; prefer enc_keys)
         self.enc_keys: dict = {}  # NEW (2026-04-30): {Path: bytes} per-DB key map
         self._initialized = False
@@ -1679,7 +2844,7 @@ class WeChatDBReader:
         message_1.db etc silently fail with "file is not a database", so the
         nested loop below builds a per-DB key dict.
         """
-        self.data_root = find_weixin_data_root()
+        self.data_root = self._configured_data_root or find_weixin_data_root()
         if not self.data_root:
             logger.warning("Weixin data root not found")
             return False
@@ -1688,21 +2853,31 @@ class WeChatDBReader:
         if not wxid_dirs:
             logger.warning("No wxid directories found")
             return False
-        self.wxid_dir = wxid_dirs[0]
-        logger.info(f"Using wxid dir: {self.wxid_dir}")
+        if self._configured_account_id is None:
+            self.wxid_dir = wxid_dirs[0]
+        else:
+            self.wxid_dir = next(
+                (item for item in wxid_dirs if item.name == self._configured_account_id),
+                None,
+            )
+        if self.wxid_dir is None:
+            logger.warning("WeChat account is unavailable for the requested scope")
+            return False
+        self.account_id = self.wxid_dir.name
+        logger.info("Using the selected WeChat account directory")
 
         db_files = find_msg_databases(self.wxid_dir)
         if not db_files:
-            logger.warning(f"No message databases under {self.wxid_dir}")
+            logger.warning("No WeChat message databases are available for the requested scope")
             self._initialized = True
             return True
 
-        # Cache-first — a previously-seeded master key
-        # (data/secrets/wechat_db.key) decrypts every DB without WeChat even
-        # running. On WeChat 4.1.10.31 this is the ONLY working path (the live
-        # heap scan below finds nothing). One master key derives each DB's own
-        # page key from that DB's salt (see _effective_page_key).
-        cached = load_cached_wechat_key()
+        # Cache-first — the selected account's key precedes the legacy global
+        # fallback and decrypts its DBs without WeChat running. On WeChat
+        # 4.1.10.31 this is the ONLY working path (the live heap scan below finds
+        # nothing). One master key derives each DB's own page key from that DB's
+        # salt (see _effective_page_key).
+        cached = load_cached_wechat_key_for_account(self.account_id)
         if cached and len(cached) == 32:
             for db in db_files:
                 page1 = _read_stable_page1(db)
@@ -1718,6 +2893,18 @@ class WeChatDBReader:
         # nothing on 4.1.10.31). If all DBs are already unlocked via cache, skip.
         remaining = [db for db in db_files if db not in self.enc_keys]
         if not remaining:
+            self._initialized = True
+            return True
+
+        if not self._allow_live_key_extract:
+            if self.enc_keys:
+                logger.info(
+                    "Live WeChat key extraction is disabled; using verified cached databases only"
+                )
+            else:
+                logger.warning(
+                    "No verified cached WeChat key is available for the requested account"
+                )
             self._initialized = True
             return True
 
@@ -1763,7 +2950,12 @@ class WeChatDBReader:
                     break
                 tried_pids.append(pid)
                 eff_timeout = min(scan_budget, total_budget - elapsed)
-                key = extract_key_from_weixin(pid, db_path=db, timeout_s=eff_timeout)
+                key = extract_key_from_weixin(
+                    pid,
+                    db_path=db,
+                    timeout_s=eff_timeout,
+                    account_id=self.account_id,
+                )
                 # A truthiness check is insufficient for crypto bytes: also
                 # validate the length is 32 (AES-256).
                 if key and isinstance(key, (bytes, bytearray)) and len(key) == 32:
@@ -1800,7 +2992,10 @@ class WeChatDBReader:
             self.contacts = WeChatContactResolver(self)
             self.contacts.load()
         except Exception as e:
-            logger.warning(f"contact resolver init failed: {e}; messages will use wxid as display")
+            logger.warning(
+                "contact resolver init failed (%s); messages will use wxid as display",
+                type(e).__name__,
+            )
             # Use a stub that returns wxid as-is; never None, to keep contract.
             class _StubResolver:
                 def resolve_display_name(self, w): return w or ""
@@ -1845,7 +3040,7 @@ class WeChatDBReader:
 
         db_files = find_msg_databases(self.wxid_dir)
         if not db_files:
-            logger.warning(f"No message databases found under {self.wxid_dir}")
+            logger.warning("No message databases found for the selected WeChat account")
             return []
 
         all_messages = []
@@ -1864,6 +3059,169 @@ class WeChatDBReader:
         self._decorate_with_displays(all_messages)
         logger.info(f"Total messages for {date_str}: {len(all_messages)}")
         return all_messages
+
+    def read_conversation_page(
+        self,
+        *,
+        conversation_id: str,
+        since_ts: float,
+        until_ts: Optional[float] = None,
+        page_size: int = 500,
+        cursor: Optional[Any] = None,
+        cancel_requested: Optional[Callable[[], bool]] = None,
+    ) -> WeChatMessagePage:
+        """Read one deterministic, bounded keyset page for one conversation.
+
+        The cursor records an independent ``(create_time, rowid)`` position for
+        every readable message database.  Rows from those shards are merged by
+        ``(create_time, opaque_shard_id, rowid)`` so filesystem enumeration
+        order and equal timestamps cannot create gaps or duplicates.
+
+        Cancellation raises before a new cursor is returned.  The caller can
+        therefore retry with its previous cursor without consuming any rows.
+        """
+
+        import sqlite3
+
+        _wechat_conversation_table_name(conversation_id)
+        requested_page_size = _validated_wechat_page_size(page_size)
+        since = _validated_wechat_page_time(since_ts, field="since_ts")
+        until = (
+            _validated_wechat_page_time(until_ts, field="until_ts")
+            if until_ts is not None
+            else None
+        )
+        if until is not None and until < since:
+            raise ValueError("WeChat message page until_ts is before since_ts")
+        page_cursor = (
+            WeChatMessagePageCursor.from_value(cursor)
+            if cursor is not None
+            else None
+        )
+        _raise_if_wechat_page_cancelled(cancel_requested)
+
+        if not self._initialized:
+            self.initialize()
+        _raise_if_wechat_page_cancelled(cancel_requested)
+
+        readable_shards = []
+        if self.wxid_dir:
+            for database in find_msg_databases(self.wxid_dir):
+                key = self.enc_keys.get(database)
+                if key is None:
+                    continue
+                shard_id = _wechat_message_shard_id(
+                    database,
+                    root=self.wxid_dir,
+                )
+                readable_shards.append((shard_id, database, key))
+        readable_shards.sort(key=lambda item: item[0])
+        shard_ids = tuple(item[0] for item in readable_shards)
+        topology = _wechat_message_topology(shard_ids)
+        scope = _wechat_message_page_scope(
+            account_id=str(self.account_id or ""),
+            conversation_id=conversation_id,
+            since_ts=since,
+            until_ts=until,
+        )
+
+        if page_cursor is not None:
+            if page_cursor.scope != scope:
+                raise ValueError(
+                    "WeChat message page cursor request scope changed"
+                )
+            if page_cursor.topology != topology:
+                raise ValueError(
+                    "WeChat message page cursor database topology changed"
+                )
+            readable_ids = set(shard_ids)
+            if any(
+                shard_id not in readable_ids
+                for shard_id, _create_time, _row_id in page_cursor.positions
+            ):
+                raise ValueError(
+                    "WeChat message page cursor database topology changed"
+                )
+
+        _raise_if_wechat_page_cancelled(cancel_requested)
+        candidates = []
+        query_limit = requested_page_size + 1
+        for shard_id, database, key in readable_shards:
+            _raise_if_wechat_page_cancelled(cancel_requested)
+            decrypted = _decrypt_with_cache(database, key)
+            if decrypted is None:
+                raise RuntimeError(
+                    "A readable WeChat message database could not be decrypted"
+                )
+            _raise_if_wechat_page_cancelled(cancel_requested)
+            try:
+                connection = sqlite3.connect(str(decrypted))
+                try:
+                    candidates.extend(
+                        _query_conversation_page_rows(
+                            connection,
+                            conversation_id=conversation_id,
+                            since_ts=since,
+                            until_ts=until,
+                            position=(
+                                page_cursor.position_for(shard_id)
+                                if page_cursor is not None
+                                else None
+                            ),
+                            limit=query_limit,
+                            shard_id=shard_id,
+                            cancel_requested=cancel_requested,
+                        )
+                    )
+                finally:
+                    connection.close()
+            except WeChatMessagePageCancelled:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    "A readable WeChat message database page could not be read"
+                ) from exc
+
+        candidates.sort(key=lambda row: row.order_key)
+        scanned = candidates[:requested_page_size]
+        has_more = len(candidates) > requested_page_size
+
+        positions = {
+            shard_id: (create_time, row_id)
+            for shard_id, create_time, row_id in (
+                page_cursor.positions if page_cursor is not None else ()
+            )
+        }
+        for row in scanned:
+            positions[row.shard_id] = (row.create_time, row.row_id)
+        if scanned:
+            next_cursor = WeChatMessagePageCursor(
+                scope=scope,
+                topology=topology,
+                positions=tuple(
+                    (shard_id, create_time, row_id)
+                    for shard_id, (create_time, row_id) in sorted(positions.items())
+                ),
+            )
+        else:
+            next_cursor = page_cursor
+
+        messages = []
+        for row in scanned:
+            message = _wechat_message_from_page_row(
+                row,
+                conversation_id=conversation_id,
+            )
+            if message is not None:
+                messages.append(message)
+        self._decorate_with_displays(messages)
+        _raise_if_wechat_page_cancelled(cancel_requested)
+        return WeChatMessagePage(
+            messages=tuple(messages),
+            next_cursor=next_cursor,
+            has_more=has_more,
+            scanned_rows=len(scanned),
+        )
 
     def read_after(self, since_ts: float, chat_name: Optional[str] = None, until_ts: Optional[float] = None) -> list:
         """Read messages with create_time > since_ts (incremental).
@@ -1895,6 +3253,100 @@ class WeChatDBReader:
         # decorate so the live watcher emits human-readable names
         self._decorate_with_displays(all_messages)
         return all_messages
+
+    def read_conversation_directory(self) -> Optional[list]:
+        """Return contacts/groups and counts without selecting message bodies.
+
+        The contact resolver is the preferred directory.  When it cannot be
+        loaded, native conversation identifiers are reconstructed from the
+        ``Msg_<md5>`` table directory and ``Name2Id`` metadata.  ``None`` means
+        neither source could be read; an empty list is a successful empty
+        directory.
+        """
+        if not self._initialized:
+            self.initialize()
+        if not self.wxid_dir:
+            return None
+
+        contacts = self._load_contacts()
+        try:
+            displays = contacts.all_displays()
+        except Exception:  # noqa: BLE001
+            displays = {}
+        try:
+            directory_labels = contacts.all_directory_labels()
+        except Exception:  # noqa: BLE001
+            directory_labels = displays
+        try:
+            self.account_label = contacts.account_directory_label(str(self.account_id or ""))
+        except Exception:  # noqa: BLE001
+            account_id = " ".join(str(self.account_id or "").split()).strip()
+            self.account_label = f"微信号：{account_id}" if account_id else "微信账号"
+
+        counts: dict = {}
+        metadata_read = False
+        for db_file in find_msg_databases(self.wxid_dir):
+            db_key = self.enc_keys.get(db_file)
+            if db_key is None:
+                continue
+            db_counts = _conversation_counts(
+                db_file,
+                db_key,
+                candidate_ids=displays,
+            )
+            if db_counts is None:
+                continue
+            metadata_read = True
+            for conversation_id, message_count in db_counts.items():
+                counts[conversation_id] = counts.get(conversation_id, 0) + int(message_count)
+
+        entries = []
+        if displays:
+            metadata_read = True
+            for conversation_id, display in displays.items():
+                label = directory_labels.get(conversation_id) or display
+                is_group = bool(contacts.is_group(conversation_id))
+                entries.append({
+                    "conversation_id": str(conversation_id),
+                    "label": str(label or conversation_id),
+                    "conversation_type": "group" if is_group else "direct",
+                    "message_count": int(counts.get(conversation_id, 0)),
+                })
+            represented = set(displays)
+            for conversation_id, message_count in counts.items():
+                if conversation_id in represented:
+                    continue
+                if conversation_id.endswith("@chatroom"):
+                    conversation_type = "group"
+                elif conversation_id.endswith("..."):
+                    conversation_type = "direct_or_group"
+                else:
+                    conversation_type = "direct"
+                entries.append({
+                    "conversation_id": str(conversation_id),
+                    "label": str(conversation_id),
+                    "conversation_type": conversation_type,
+                    "message_count": int(message_count),
+                })
+        else:
+            for conversation_id, message_count in counts.items():
+                if conversation_id.endswith("@chatroom"):
+                    conversation_type = "group"
+                elif conversation_id.endswith("..."):
+                    conversation_type = "direct_or_group"
+                else:
+                    conversation_type = "direct"
+                entries.append({
+                    "conversation_id": str(conversation_id),
+                    "label": str(conversation_id),
+                    "conversation_type": conversation_type,
+                    "message_count": int(message_count),
+                })
+
+        if not metadata_read:
+            return None
+        entries.sort(key=lambda item: (item["conversation_type"], item["conversation_id"]))
+        return entries
 
     def format_for_ai(self, messages: list) -> str:
         """Format messages as plain text for Claude."""

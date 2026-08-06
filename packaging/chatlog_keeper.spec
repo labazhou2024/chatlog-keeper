@@ -5,9 +5,9 @@ Build from the repo root:
     pyinstaller packaging/chatlog_keeper.spec --noconfirm --clean --distpath dist_exe
 
 Produces one self-contained executable (``.exe`` on Windows) for host apps /
-scheduled tasks to invoke. The Windows PowerShell debugger scripts and macOS
-Mach scanner source are bundled under ``chatlog_keeper/scripts`` so the
-platform key helper can find them through ``sys._MEIPASS`` when frozen.
+scheduled tasks to invoke. The Windows PowerShell debugger scripts plus the
+macOS scanner/capture sources are bundled under ``chatlog_keeper/scripts`` so
+the platform key helpers can find them through ``sys._MEIPASS`` when frozen.
 """
 import os
 import sys as _sys
@@ -28,6 +28,7 @@ datas = [
     (os.path.join(SCRIPTS_SRC, "windows_ntqq_get_key.ps1"), SCRIPTS_DST),
     (os.path.join(SCRIPTS_SRC, "windows_wechat_get_key.ps1"), SCRIPTS_DST),
     (os.path.join(SCRIPTS_SRC, "macos_memory_scan.c"), SCRIPTS_DST),
+    (os.path.join(SCRIPTS_SRC, "macos_wechat_key_capture.c"), SCRIPTS_DST),
 ]
 hiddenimports = []
 
@@ -59,6 +60,40 @@ if _sys.platform == "darwin":
             "failed to compile macOS key helper: " + (_compiled.stderr or "").strip()
         )
     datas.append((_mac_helper, SCRIPTS_DST))
+
+    # Startup capture must be loadable on every supported Apple Silicon macOS,
+    # not just the SDK version installed on the build runner.  A stable install
+    # name also prevents an ephemeral build path from entering LC_ID_DYLIB.
+    _mac_capture = os.path.join(
+        _mac_helper_dir,
+        "macos_wechat_key_capture.dylib",
+    )
+    _capture_compiled = _subprocess.run(
+        [
+            "xcrun",
+            "clang",
+            "-dynamiclib",
+            "-arch",
+            "arm64",
+            "-mmacosx-version-min=11.0",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            os.path.join(SCRIPTS_SRC, "macos_wechat_key_capture.c"),
+            "-Wl,-install_name,@rpath/macos_wechat_key_capture.dylib",
+            "-o",
+            _mac_capture,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if _capture_compiled.returncode != 0:
+        raise RuntimeError(
+            "failed to compile macOS WeChat startup capture helper: "
+            + (_capture_compiled.stderr or "").strip()
+        )
+    datas.append((_mac_capture, SCRIPTS_DST))
 
 # ── conda-env C-extension runtime DLLs (Library/bin) ────────────────────────
 # A conda build's _ctypes.pyd / _ssl / _hashlib / lzma / bz2 / sqlite3 load their
