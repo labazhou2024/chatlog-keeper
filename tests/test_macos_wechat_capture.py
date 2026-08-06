@@ -1,7 +1,16 @@
 import os
+import sys
 from pathlib import Path
 
+import pytest
+
 from chatlog_keeper import macos_wechat_capture
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS capture tests require Darwin FIFO, ownership, and code-signing semantics",
+)
 
 
 def _database_in_container(tmp_path: Path) -> tuple[Path, Path]:

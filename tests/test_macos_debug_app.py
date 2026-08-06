@@ -1,9 +1,18 @@
 import os
 import plistlib
 import shutil
+import sys
 from pathlib import Path
 
+import pytest
+
 from chatlog_keeper import macos_debug_app, macos_wechat_capture
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS debug-copy tests require Darwin process and filesystem semantics",
+)
 
 
 def test_prepare_debug_copy_is_macos_only(monkeypatch):

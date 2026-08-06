@@ -958,7 +958,7 @@ def _set_key(source: str, key: str, data_root: str | None = None) -> dict:
     if source == "qq":
         ok = qq_db.save_cached_key(key)
         return {"source": "qq", "ok": bool(ok),
-                "saved_to": str(qq_db._key_cache_path()) if ok else None,
+                "saved_to": Path(qq_db._key_cache_path()).as_posix() if ok else None,
                 "error": None if ok else "invalid QQ key (expect a 16- or 32-char passphrase)"}
     if source == "wechat":
         if len(key) != 64 or any(char not in "0123456789abcdefABCDEF" for char in key):
@@ -1020,7 +1020,7 @@ def _set_key(source: str, key: str, data_root: str | None = None) -> dict:
             if ok:
                 saved_paths.append(wechat_db._wechat_key_cache_path())
         return {"source": "wechat", "ok": bool(ok),
-                "saved_to": str(saved_paths[0]) if ok else None,
+                "saved_to": Path(saved_paths[0]).as_posix() if ok else None,
                 "error": None if ok else "verified WeChat key could not be stored"}
     return {"ok": False, "error": "unknown source: " + str(source)}
 
@@ -1247,7 +1247,8 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
                     else qq_db._key_cache_path()
                 )
                 return {"source": "qq", "method": "active", "ok": True,
-                        "key_len": len(key), "saved_to": str(saved_path),
+                        "key_len": len(key),
+                        "saved_to": Path(saved_path).as_posix(),
                         "fresh_extraction": True}
             return {"source": "qq", "method": "active", "ok": False,
                     "error": _active_failure(
@@ -1273,7 +1274,8 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
                 else qq_db._key_cache_path()
             )
             return {"source": "qq", "method": "passive", "ok": True,
-                    "key_len": len(reader.key), "saved_to": str(saved_path),
+                    "key_len": len(reader.key),
+                    "saved_to": Path(saved_path).as_posix(),
                     "fresh_extraction": key_source == "live"}
         return {"source": "qq", "method": "passive", "ok": False,
                 "error": "passive scan found no key (QQ not running, or a newer build — "
@@ -1314,7 +1316,8 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
                     saved = wechat_db.save_cached_wechat_key(key)
             if key and saved:
                 return {"source": "wechat", "method": "active", "ok": True,
-                        "key_len": len(key), "saved_to": str(saved_path),
+                        "key_len": len(key),
+                        "saved_to": Path(saved_path).as_posix(),
                         "db_path": str(verified_db) if verified_db else db_path,
                         "fresh_extraction": True}
             if not db_path:
@@ -1348,7 +1351,7 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
             if saved:
                 return {"source": "wechat", "method": "passive", "ok": True,
                         "key_len": len(master),
-                        "saved_to": str(saved_path)}
+                        "saved_to": Path(saved_path).as_posix()}
         return {"source": "wechat", "method": "passive", "ok": False,
                 "error": "passive scan found no key (WeChat not running, or 4.1.10.31+ where the "
                          "key is no longer in plaintext memory — try `--method active` or `set-key`)"}

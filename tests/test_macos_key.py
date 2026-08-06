@@ -1,8 +1,17 @@
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
 from chatlog_keeper import macos_key
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS key-helper tests require Darwin ownership and code-signing semantics",
+)
 
 
 def _debugger_entitlements_xml():
