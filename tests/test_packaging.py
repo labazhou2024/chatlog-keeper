@@ -18,6 +18,11 @@ def test_pyinstaller_spec_bundles_every_platform_key_helper():
     assert 'for _pkg in ("Crypto", "zstandard")' in spec
     assert 'os.path.join(SPEC_DIR, "chatlog_keeper_main.py")' in spec
     assert 'name="chatlog-keeper"' in spec
+    frozen_main = (root / "packaging" / "chatlog_keeper_main.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'sys.argv[1:2] == ["--_qq-sqlite-helper"]' in frozen_main
+    assert "chatlog_keeper._qq_sqlite_helper" in frozen_main
 
 
 def test_release_workflow_freezes_source_capabilities_and_descriptors():
@@ -39,6 +44,46 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert "windows-x86_64.artifact.json.sha256" in workflow
     assert "macos-arm64.artifact.json.sha256" in workflow
     assert "verify-checksum" in workflow
+    assert (
+        "python -I chatlog_keeper/_qq_sqlite_helper.py --runtime-probe"
+        in workflow
+    )
+    assert (
+        ".\\dist_exe\\chatlog-keeper.exe --_qq-sqlite-helper --runtime-probe"
+        in workflow
+    )
+    assert (
+        "conda-incubator/setup-miniconda@"
+        "835234971496cad1653abb28a638a281cf32541f"
+    ) in workflow
+    assert "packaging/windows-release-environment.yml" in workflow
+    assert 'miniconda-version: "py311_26.5.3-2"' in workflow
+
+
+def test_ci_covers_release_python_and_runs_the_runtime_probe_on_windows():
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'python-version: ["3.9", "3.11", "3.12"]' in workflow
+    assert "windows-release-runtime:" in workflow
+    assert 'python-version: "3.11"' in workflow
+    assert "conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f" in workflow
+    assert "packaging/windows-release-environment.yml" in workflow
+    assert "_qq_sqlite_helper.py --runtime-probe" in workflow
+
+
+def test_windows_release_environment_pins_the_validated_python_and_sqlite_builds():
+    root = Path(__file__).resolve().parents[1]
+    environment = (
+        root / "packaging" / "windows-release-environment.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "name: chatlog-release-windows" in environment
+    assert "python=3.11.15=hb00fc5c_1" in environment
+    assert "sqlite=3.53.2=hee5a0db_0" in environment
+    assert "pip=26.1.2=pyhc872135_0" in environment
 
 
 def test_release_output_directories_are_ignored():

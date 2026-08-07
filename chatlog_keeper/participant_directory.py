@@ -208,7 +208,8 @@ def _read_qq(request: participant_protocol.ParticipantRequest, data_root: str | 
         relevant.append(profile_source)
     if group_source.is_file():
         relevant.append(group_source)
-    temporary_root = Path(tempfile.mkdtemp(prefix="qq_participants_"))
+    temporary_root = qq_db._create_qq_plaintext_temp_dir("qq_participants_")
+    connection = None
     try:
         with snapshot_db_families(relevant) as snapshots:
             profile_decrypted = (
@@ -237,39 +238,46 @@ def _read_qq(request: participant_protocol.ParticipantRequest, data_root: str | 
             if request.view == "member":
                 if group_decrypted is None:
                     raise participant_protocol.ParticipantProtocolError("bad_schema")
-                connection = sqlite3.connect(str(group_decrypted))
-                try:
-                    return _qq_group_members(
-                        connection,
-                        conversation_id=request.conversation_id,
-                        profile_identities=profile_identities,
-                    )
-                finally:
-                    connection.close()
+                connection = qq_db._open_qq_sqlite_connection(group_decrypted)
+                return _qq_group_members(
+                    connection,
+                    conversation_id=request.conversation_id,
+                    profile_identities=profile_identities,
+                )
             no_header = temporary_root / "nt_msg_no_header.db"
             if not qq_db._skip_header(snapshots[primary], no_header):
                 raise participant_protocol.ParticipantProtocolError("source_unavailable")
             decrypted = temporary_root / "nt_msg_decrypted.db"
-            if not qq_db._decrypt_db_qq(no_header, reader.key, decrypted):
-                decrypted = no_header
+            decrypt_result = qq_db._decrypt_db_qq_result(
+                no_header,
+                reader.key,
+                decrypted,
+                source_wrapper_size=qq_db._NTQQ_WRAPPER_SIZE,
+            )
+            if decrypt_result.ok:
+                database = qq_db._QQDecryptedDatabase(
+                    path=decrypted,
+                    shifted_pending_byte=decrypt_result.shifted_pending_byte,
+                )
+            elif decrypt_result.shifted_pending_byte:
+                raise participant_protocol.ParticipantProtocolError("source_unavailable")
+            else:
+                database = no_header
             group_labels = (
                 qq_db._build_group_member_map(group_decrypted)
                 if group_decrypted is not None
                 else {}
             )
-            connection = sqlite3.connect(str(decrypted))
-            try:
-                return _qq_observed_senders(
-                    connection,
-                    conversation_id=request.conversation_id,
-                    conversation_type=request.conversation_type,
-                    profile_identities=profile_identities,
-                    group_labels=group_labels,
-                )
-            finally:
-                connection.close()
+            connection = qq_db._open_qq_sqlite_connection(database)
+            return _qq_observed_senders(
+                connection,
+                conversation_id=request.conversation_id,
+                conversation_type=request.conversation_type,
+                profile_identities=profile_identities,
+                group_labels=group_labels,
+            )
     finally:
-        shutil.rmtree(temporary_root, ignore_errors=True)
+        qq_db._finalize_qq_plaintext_temp(connection, temporary_root)
 
 
 def _wechat_current_members(

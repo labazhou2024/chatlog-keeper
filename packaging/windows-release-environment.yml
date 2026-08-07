@@ -1,0 +1,9 @@
+name: chatlog-release-windows
+channels:
+  - defaults
+dependencies:
+  # Exact win-64 builds validated by the source/frozen runtime probes and the
+  # real >1 GiB NTQQ regression.  Do not loosen these without re-running both.
+  - python=3.11.15=hb00fc5c_1
+  - sqlite=3.53.2=hee5a0db_0
+  - pip=26.1.2=pyhc872135_0

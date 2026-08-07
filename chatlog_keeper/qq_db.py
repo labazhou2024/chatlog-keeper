@@ -22,16 +22,21 @@ import logging
 import math
 import os
 import re
-import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import unicodedata
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Iterator, Callable
+
+from chatlog_keeper.core._private_temp import (
+    PrivateTempLifecycleError,
+    cleanup_private_temp_dir,
+    create_private_temp_dir,
+    scavenge_private_temp_dirs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -801,6 +806,87 @@ def extract_key_from_qq(pid: int, db_path: Path = None,
 
 # ─── Database decryption ─────────────────────────────────────────────────────
 
+_NTQQ_WRAPPER_SIZE = 1024
+_NTQQ_PAGE_SIZE = 4096
+_SQLITE_STANDARD_PENDING_BYTE = 0x40000000
+_NTQQ_STRIPPED_PENDING_BYTE = _SQLITE_STANDARD_PENDING_BYTE - _NTQQ_WRAPPER_SIZE
+_NTQQ_WRAPPED_LOCK_PAGE_NO = (_NTQQ_STRIPPED_PENDING_BYTE // _NTQQ_PAGE_SIZE) + 1
+_QQ_PLAINTEXT_TEMP_PREFIXES = (
+    "qq_page_",
+    "qq_db_",
+    "qq_directory_",
+    "qq_participants_",
+)
+
+# The 1024-byte NTQQ wrapper shifts Windows' absolute lock-byte range into the
+# fourth quarter of one SQLCipher page.  After stripping the wrapper, that page
+# is 262144 (1-indexed), not stock SQLite's 262145 lock-byte page.
+assert _NTQQ_STRIPPED_PENDING_BYTE == 0x3FFFFC00
+assert _NTQQ_WRAPPED_LOCK_PAGE_NO == 262144
+
+
+def _create_qq_plaintext_temp_dir(prefix: str) -> Path:
+    if prefix not in _QQ_PLAINTEXT_TEMP_PREFIXES:
+        raise RuntimeError("QQ private temporary directory setup failed")
+    try:
+        return create_private_temp_dir(prefix)
+    except PrivateTempLifecycleError:
+        raise RuntimeError("QQ private temporary directory setup failed") from None
+
+
+def _finalize_qq_plaintext_temp(connection, temporary_root: Path) -> None:
+    """Close SQLite first, then unconditionally delete all plaintext files."""
+
+    close_failed = False
+    if connection is not None:
+        try:
+            connection.close()
+        except BaseException:  # noqa: BLE001 - cleanup must still run
+            close_failed = True
+    try:
+        cleanup_private_temp_dir(Path(temporary_root))
+    except BaseException:  # noqa: BLE001 - never expose cleanup internals
+        raise RuntimeError("QQ temporary plaintext cleanup failed") from None
+    if close_failed:
+        raise RuntimeError("QQ SQLite helper close failed") from None
+
+
+try:
+    scavenge_private_temp_dirs(_QQ_PLAINTEXT_TEMP_PREFIXES)
+except PrivateTempLifecycleError:
+    raise RuntimeError("QQ stale temporary plaintext cleanup failed") from None
+
+
+@dataclass(frozen=True)
+class _QQDecryptResult:
+    ok: bool
+    shifted_pending_byte: bool = False
+
+
+@dataclass(frozen=True)
+class _QQDecryptedDatabase:
+    path: Path
+    shifted_pending_byte: bool = False
+
+
+def _is_wrapped_windows_lock_placeholder(
+    page: bytes,
+    *,
+    page_no: int,
+    source_wrapper_size: int,
+    platform_name: str,
+) -> bool:
+    """Recognize only NTQQ's exact Windows lock-page/HMAC exception."""
+
+    return (
+        platform_name == "nt"
+        and source_wrapper_size == _NTQQ_WRAPPER_SIZE
+        and page_no == _NTQQ_WRAPPED_LOCK_PAGE_NO
+        and len(page) == _NTQQ_PAGE_SIZE
+        and not any(page)
+    )
+
+
 def _skip_header(db_path: Path, output_path: Path) -> bool:
     """
     Skip the first 1024 bytes of QQ NT database header.
@@ -813,10 +899,10 @@ def _skip_header(db_path: Path, output_path: Path) -> bool:
             # Stream the copy in chunks (skipping the 1024-byte header) to bound memory.
             with open(snapshot, "rb") as f:
                 f.seek(0, 2)
-                if f.tell() < 1024 + 4096:
-                    logger.warning(f"File too small: {db_path}")
+                if f.tell() < _NTQQ_WRAPPER_SIZE + _NTQQ_PAGE_SIZE:
+                    logger.warning("QQ database snapshot is too small")
                     return False
-                f.seek(1024)
+                f.seek(_NTQQ_WRAPPER_SIZE)
                 with open(output_path, "wb") as out:
                     while True:
                         chunk = f.read(1 << 20)
@@ -833,10 +919,10 @@ def _skip_header(db_path: Path, output_path: Path) -> bool:
                 destination.unlink(missing_ok=True)
                 if source.is_file():
                     shutil.copy2(source, destination)
-        logger.info(f"Header removed (streaming): {db_path.name} -> {output_path.name}")
+        logger.info("QQ database wrapper removed (streaming)")
         return True
     except Exception as e:
-        logger.warning(f"Header removal failed: {e}")
+        logger.warning("QQ header removal failed: %s", type(e).__name__)
         return False
 
 
@@ -901,7 +987,14 @@ def _decrypt_qq_page(
     return plain + page[4096 - reserve:]
 
 
-def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
+def _decrypt_db_qq_result(
+    db_path: Path,
+    key,
+    output_path: Path,
+    *,
+    source_wrapper_size: int,
+    platform_name: Optional[str] = None,
+) -> _QQDecryptResult:
     """Decrypt NTQQ nt_msg.db (post-1024-header-strip) to plain SQLite.
 
     Resolves the DB's HMAC-verified current/legacy cipher tuple from page 1,
@@ -921,10 +1014,12 @@ def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
     else:
         key_bytes = bytes(key)
 
-    PAGE_SZ = 4096
+    PAGE_SZ = _NTQQ_PAGE_SIZE
     SALT_SZ = 16
     KEY_SZ = 32
 
+    shifted_pending_byte = False
+    effective_platform = os.name if platform_name is None else platform_name
     try:
         # Decrypt page-by-page so peak memory stays at a single 4 KB page.
         # Reading a whole (potentially multi-GB) DB into memory at once can
@@ -933,8 +1028,7 @@ def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
         with open(db_path, "rb") as f, open(output_path, "wb") as out:
             first = f.read(PAGE_SZ)
             if len(first) < PAGE_SZ:
-                logger.warning(f"DB too small to decrypt: {db_path.name}")
-                return False
+                raise OSError("encrypted DB is too small to decrypt")
             salt = first[:SALT_SZ]
             resolved = _resolve_qq_cipher(key_bytes, first)
             if resolved is None:
@@ -977,7 +1071,20 @@ def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
                     reserve=reserve,
                 )
                 if plain is None:
-                    raise OSError(f"page {page_no} authentication failed")
+                    if _is_wrapped_windows_lock_placeholder(
+                        page,
+                        page_no=page_no,
+                        source_wrapper_size=source_wrapper_size,
+                        platform_name=effective_platform,
+                    ):
+                        # The original Windows VFS reserved this whole page
+                        # because its 512 lock bytes overlap the page after the
+                        # NTQQ wrapper shift.  It is the only unauthenticated
+                        # main-page exception we accept.
+                        plain = b"\0" * PAGE_SZ
+                        shifted_pending_byte = True
+                    else:
+                        raise OSError(f"page {page_no} authentication failed")
                 out.write(plain)
                 pages += 1
 
@@ -1001,22 +1108,69 @@ def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
         )
         logger.info(
             "Decrypted %d main pages + %d committed WAL frames "
-            "kdf=%s hmac=%s reserve=%d (streaming) -> %s",
+            "kdf=%s hmac=%s reserve=%d (streaming)",
             pages,
             wal_frames,
             kdf,
             hmac_algo,
             reserve,
-            output_path,
         )
-        return True
+        return _QQDecryptResult(
+            ok=True,
+            shifted_pending_byte=shifted_pending_byte,
+        )
     except Exception as e:
         try:
             output_path.unlink(missing_ok=True)
         except OSError:
             pass
-        logger.warning(f"Decryption failed for {db_path.name}: {e}")
-        return False
+        logger.warning("QQ database decryption failed: %s", type(e).__name__)
+        return _QQDecryptResult(
+            ok=False,
+            shifted_pending_byte=shifted_pending_byte,
+        )
+
+
+def _decrypt_db_qq(db_path: Path, key, output_path: Path) -> bool:
+    """Compatibility wrapper for ordinary stripped NTQQ databases.
+
+    The shifted Windows lock-page exception is intentionally unavailable here:
+    callers must have just removed and explicitly attested the 1024-byte NTQQ
+    wrapper via :func:`_decrypt_db_qq_result`.
+    """
+
+    return _decrypt_db_qq_result(
+        db_path,
+        key,
+        output_path,
+        source_wrapper_size=0,
+    ).ok
+
+
+def _open_qq_sqlite_connection(database):
+    """Open a decrypted QQ DB, isolating the shifted Windows format."""
+
+    if isinstance(database, _QQDecryptedDatabase):
+        path = database.path
+        shifted_pending_byte = database.shifted_pending_byte
+    else:
+        path = Path(database)
+        shifted_pending_byte = False
+    if shifted_pending_byte:
+        if os.name != "nt":
+            raise OSError("shifted NTQQ lock-page databases are Windows-only")
+        from chatlog_keeper._qq_sqlite_proxy import open_shifted_pending_connection
+
+        return open_shifted_pending_connection(path)
+    import sqlite3
+
+    return sqlite3.connect(str(path))
+
+
+def _qq_decrypted_database_path(database) -> Path:
+    if isinstance(database, _QQDecryptedDatabase):
+        return database.path
+    return Path(database)
 
 
 # ─── Message reading ─────────────────────────────────────────────────────────
@@ -1918,24 +2072,40 @@ _NTQQ_GROUP_MEMBER_COL_UIN = "1002"     # BIGINT — member QQ number
 _NTQQ_GROUP_COL_NAME = "60007"           # TEXT — group display name
 
 
-def _decrypt_aux_db(src_db: Path, key, tmp_dir: Path) -> Optional[Path]:
+def _decrypt_aux_db(
+    src_db: Path,
+    key,
+    tmp_dir: Path,
+) -> Optional[_QQDecryptedDatabase]:
     """Decrypt an auxiliary NTQQ database (profile_info.db, group_info.db)
-    using the same cipher chain as nt_msg.db. Returns decrypted SQLite path
-    or None on failure. Used by buddy/group nickname lookups.
+    using the same cipher chain as nt_msg.db. Returns the decrypted database
+    descriptor or None on failure. Used by buddy/group nickname lookups.
 
     Aux dbs share the same key as nt_msg.db, so we bypass the QQDBReader path
-    and just use _skip_header + _decrypt_db_qq directly.
+    and just use the same header-strip/decrypt result path directly.
     """
     try:
         no_hdr = tmp_dir / f"{src_db.stem}_no_hdr.db"
         if not _skip_header(src_db, no_hdr):
             return None
         dec = tmp_dir / f"{src_db.stem}_dec.db"
-        if not _decrypt_db_qq(no_hdr, key, dec):
+        result = _decrypt_db_qq_result(
+            no_hdr,
+            key,
+            dec,
+            source_wrapper_size=_NTQQ_WRAPPER_SIZE,
+        )
+        if not result.ok:
             return None
-        return dec
+        return _QQDecryptedDatabase(
+            path=dec,
+            shifted_pending_byte=result.shifted_pending_byte,
+        )
     except Exception as e:
-        logger.warning(f"Decrypt aux db {src_db.name} failed: {e}")
+        logger.warning(
+            "QQ auxiliary database decryption failed: %s",
+            type(e).__name__,
+        )
         return None
 
 
@@ -1975,7 +2145,7 @@ def _clean_qq_display_name(value) -> str:
     return " ".join(value.split()).strip()[:120]
 
 
-def _build_buddy_identity_map(profile_db: Path) -> Dict[int, QQBuddyIdentity]:
+def _build_buddy_identity_map(profile_db) -> Dict[int, QQBuddyIdentity]:
     """读取 profile_info_v6，建立 QQ 号到备注和昵称的映射。
 
     Returns {} on any failure (db missing, table missing, etc.) so callers
@@ -1983,10 +2153,10 @@ def _build_buddy_identity_map(profile_db: Path) -> Dict[int, QQBuddyIdentity]:
     """
     import sqlite3
     out: Dict[int, QQBuddyIdentity] = {}
-    if not profile_db.exists():
+    if not _qq_decrypted_database_path(profile_db).exists():
         return out
     try:
-        conn = sqlite3.connect(str(profile_db))
+        conn = _open_qq_sqlite_connection(profile_db)
         try:
             cursor = conn.cursor()
             columns = _qq_table_columns(cursor, "profile_info_v6")
@@ -2026,7 +2196,7 @@ def _build_buddy_identity_map(profile_db: Path) -> Dict[int, QQBuddyIdentity]:
     return out
 
 
-def _build_buddy_name_map(profile_db: Path) -> Dict[int, str]:
+def _build_buddy_name_map(profile_db) -> Dict[int, str]:
     """建立聊天正文使用的 QQ 展示名映射，备注优先于昵称。"""
 
     return {
@@ -2035,7 +2205,7 @@ def _build_buddy_name_map(profile_db: Path) -> Dict[int, str]:
     }
 
 
-def _build_buddy_directory_label_map(profile_db: Path) -> Dict[int, str]:
+def _build_buddy_directory_label_map(profile_db) -> Dict[int, str]:
     """建立 GUI 目录标签映射，同时明确显示本机备注和公开昵称。"""
 
     return {
@@ -2045,7 +2215,7 @@ def _build_buddy_directory_label_map(profile_db: Path) -> Dict[int, str]:
     }
 
 
-def _build_buddy_directory_map(profile_db: Path) -> Dict[int, str]:
+def _build_buddy_directory_map(profile_db) -> Dict[int, str]:
     """读取 ``buddy_list``，建立只包含好友的 QQ 会话目录。
 
     ``profile_info_v6`` 还缓存群成员和其他见过的账号，不能直接当作好友
@@ -2057,10 +2227,10 @@ def _build_buddy_directory_map(profile_db: Path) -> Dict[int, str]:
 
     identities = _build_buddy_identity_map(profile_db)
     out: Dict[int, str] = {}
-    if not profile_db.exists():
+    if not _qq_decrypted_database_path(profile_db).exists():
         return out
     try:
-        conn = sqlite3.connect(str(profile_db))
+        conn = _open_qq_sqlite_connection(profile_db)
         try:
             cursor = conn.cursor()
             columns = _qq_table_columns(cursor, "buddy_list")
@@ -2111,16 +2281,16 @@ def _exclude_self_from_buddy_directory(
     buddy_directory_map.pop(int(normalized), None)
 
 
-def _build_account_qq_number_map(profile_db: Path) -> Dict[str, str]:
+def _build_account_qq_number_map(profile_db) -> Dict[str, str]:
     """按 QQ UIN 和 NT UID 建立本机账号到 QQ 号的映射。"""
 
     import sqlite3
 
     out: Dict[str, str] = {}
-    if not profile_db.exists():
+    if not _qq_decrypted_database_path(profile_db).exists():
         return out
     try:
-        conn = sqlite3.connect(str(profile_db))
+        conn = _open_qq_sqlite_connection(profile_db)
         try:
             cursor = conn.cursor()
             columns = _qq_table_columns(cursor, "profile_info_v6")
@@ -2182,7 +2352,7 @@ def _query_account_qq_number(conn) -> str:
     return next(iter(candidates)) if len(candidates) == 1 else ""
 
 
-def _build_group_member_map(group_db: Path) -> Dict[Tuple[int, int], str]:
+def _build_group_member_map(group_db) -> Dict[Tuple[int, int], str]:
     """Read group_member3 and build {(group_id, qq_uin): nickname}.
 
     Group nickname > buddy nickname (a friend may have a custom name inside
@@ -2190,10 +2360,10 @@ def _build_group_member_map(group_db: Path) -> Dict[Tuple[int, int], str]:
     """
     import sqlite3
     out: Dict[Tuple[int, int], str] = {}
-    if not group_db.exists():
+    if not _qq_decrypted_database_path(group_db).exists():
         return out
     try:
-        conn = sqlite3.connect(str(group_db))
+        conn = _open_qq_sqlite_connection(group_db)
         try:
             cursor = conn.cursor()
             columns = _qq_table_columns(cursor, "group_member3")
@@ -2230,7 +2400,7 @@ def _build_group_member_map(group_db: Path) -> Dict[Tuple[int, int], str]:
     return out
 
 
-def _build_group_name_map(group_db: Path) -> Dict[int, str]:
+def _build_group_name_map(group_db) -> Dict[int, str]:
     """Read QQ group metadata and build ``{group_id: display_name}``.
 
     Both ``group_list`` and ``group_detail_info_ver1`` occur in current NTQQ
@@ -2243,10 +2413,10 @@ def _build_group_name_map(group_db: Path) -> Dict[int, str]:
     import sqlite3
 
     out: Dict[int, str] = {}
-    if not group_db.exists():
+    if not _qq_decrypted_database_path(group_db).exists():
         return out
     try:
-        conn = sqlite3.connect(str(group_db))
+        conn = _open_qq_sqlite_connection(group_db)
         try:
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -3194,16 +3364,29 @@ class QQDBReader:
         if not self.db_path or not self.key:
             return
 
-        tmp_dir = tempfile.mkdtemp(prefix="qq_page_")
+        tmp_dir = _create_qq_plaintext_temp_dir("qq_page_")
         conn = None
         try:
             no_header_path = Path(tmp_dir) / "no_header.db"
             if not _skip_header(self.db_path, no_header_path):
                 raise OSError("failed to prepare the selected QQ database snapshot")
             decrypted_path = Path(tmp_dir) / "decrypted.db"
-            if not _decrypt_db_qq(no_header_path, self.key, decrypted_path):
+            decrypt_result = _decrypt_db_qq_result(
+                no_header_path,
+                self.key,
+                decrypted_path,
+                source_wrapper_size=_NTQQ_WRAPPER_SIZE,
+            )
+            if decrypt_result.ok:
+                database = _QQDecryptedDatabase(
+                    path=decrypted_path,
+                    shifted_pending_byte=decrypt_result.shifted_pending_byte,
+                )
+            elif decrypt_result.shifted_pending_byte:
+                raise OSError("shifted NTQQ database failed authenticated decryption")
+            else:
                 logger.warning("QQ page snapshot decryption failed, trying as plaintext")
-                decrypted_path = no_header_path
+                database = no_header_path
             _raise_if_qq_message_page_cancelled(cancel_requested)
 
             buddy_map: Dict[int, str] = {}
@@ -3227,9 +3410,7 @@ class QQDBReader:
                     group_map = _build_group_member_map(group_dec)
                     group_name_map = _build_group_name_map(group_dec)
 
-            import sqlite3
-
-            conn = sqlite3.connect(str(decrypted_path))
+            conn = _open_qq_sqlite_connection(database)
             account_number = _query_account_qq_number(conn)
             if account_number:
                 self.account_label = account_number
@@ -3260,12 +3441,7 @@ class QQDBReader:
                     raise RuntimeError("QQ message keyset page did not advance")
                 current_cursor = page.cursor_after
         finally:
-            if conn is not None:
-                conn.close()
-            try:
-                shutil.rmtree(tmp_dir)
-            except Exception:
-                pass
+            _finalize_qq_plaintext_temp(conn, tmp_dir)
     
     def read_recent(self, days: int = 1, hours: Optional[float] = None) -> List[QQMessage]:
         """Read messages from the last N days (or hours).
@@ -3290,7 +3466,8 @@ class QQDBReader:
         if hours is not None:
             days = max(1, int(hours / 24) or 1)
 
-        tmp_dir = tempfile.mkdtemp(prefix="qq_db_")
+        tmp_dir = _create_qq_plaintext_temp_dir("qq_db_")
+        conn = None
 
         try:
             no_header_path = Path(tmp_dir) / "no_header.db"
@@ -3299,9 +3476,23 @@ class QQDBReader:
                 return []
 
             decrypted_path = Path(tmp_dir) / "decrypted.db"
-            if not _decrypt_db_qq(no_header_path, self.key, decrypted_path):
+            decrypt_result = _decrypt_db_qq_result(
+                no_header_path,
+                self.key,
+                decrypted_path,
+                source_wrapper_size=_NTQQ_WRAPPER_SIZE,
+            )
+            if decrypt_result.ok:
+                database = _QQDecryptedDatabase(
+                    path=decrypted_path,
+                    shifted_pending_byte=decrypt_result.shifted_pending_byte,
+                )
+            elif decrypt_result.shifted_pending_byte:
+                logger.warning("Shifted NTQQ database failed authenticated decryption")
+                return []
+            else:
                 logger.warning("Decryption failed, trying as plaintext")
-                decrypted_path = no_header_path
+                database = no_header_path
 
             # Decrypt profile_info.db + group_info.db side-by-side and build
             # name lookup maps. Failure is non-fatal (= numeric uin fallback).
@@ -3337,11 +3528,13 @@ class QQDBReader:
                         logger.info(f"group_member_map loaded: {len(group_map)} entries")
                         logger.info(f"group_name_map loaded: {len(group_name_map)} entries")
             except Exception as e:
-                logger.warning(f"Aux db decrypt for name lookup failed: {e}")
+                logger.warning(
+                    "QQ auxiliary name lookup failed: %s",
+                    type(e).__name__,
+                )
 
             try:
-                import sqlite3
-                conn = sqlite3.connect(str(decrypted_path))
+                conn = _open_qq_sqlite_connection(database)
                 account_number = _query_account_qq_number(conn)
                 if account_number:
                     self.account_label = account_number
@@ -3351,17 +3544,13 @@ class QQDBReader:
                     group_map=group_map,
                     group_name_map=group_name_map,
                 )
-                conn.close()
                 return messages
             except Exception as e:
-                logger.warning(f"SQLite query failed: {e}")
+                logger.warning("QQ SQLite query failed: %s", type(e).__name__)
                 return []
 
         finally:
-            try:
-                shutil.rmtree(tmp_dir)
-            except Exception:
-                pass
+            _finalize_qq_plaintext_temp(conn, tmp_dir)
 
     def read_conversation_directory(self) -> Optional[List[Dict]]:
         """Return native QQ conversations and counts without reading bodies.
@@ -3375,14 +3564,28 @@ class QQDBReader:
             return None
 
         self.account_label = ""
-        tmp_dir = tempfile.mkdtemp(prefix="qq_directory_")
+        tmp_dir = _create_qq_plaintext_temp_dir("qq_directory_")
+        conn = None
         try:
             no_header_path = Path(tmp_dir) / "no_header.db"
             if not _skip_header(self.db_path, no_header_path):
                 return None
             decrypted_path = Path(tmp_dir) / "decrypted.db"
-            if not _decrypt_db_qq(no_header_path, self.key, decrypted_path):
-                decrypted_path = no_header_path
+            decrypt_result = _decrypt_db_qq_result(
+                no_header_path,
+                self.key,
+                decrypted_path,
+                source_wrapper_size=_NTQQ_WRAPPER_SIZE,
+            )
+            if decrypt_result.ok:
+                database = _QQDecryptedDatabase(
+                    path=decrypted_path,
+                    shifted_pending_byte=decrypt_result.shifted_pending_byte,
+                )
+            elif decrypt_result.shifted_pending_byte:
+                return None
+            else:
+                database = no_header_path
 
             buddy_map: Dict[int, str] = {}
             buddy_directory_map: Dict[int, str] = {}
@@ -3405,32 +3608,25 @@ class QQDBReader:
                 if group_dec:
                     group_name_map = _build_group_name_map(group_dec)
 
-            import sqlite3
-            conn = sqlite3.connect(str(decrypted_path))
-            try:
-                account_number = _query_account_qq_number(conn)
-                if account_number:
-                    self.account_label = account_number
-                _exclude_self_from_buddy_directory(
-                    buddy_directory_map,
-                    self.account_label,
-                )
-                return _query_conversation_directory(
-                    conn,
-                    buddy_map=buddy_map,
-                    buddy_directory_map=buddy_directory_map,
-                    group_name_map=group_name_map,
-                )
-            finally:
-                conn.close()
+            conn = _open_qq_sqlite_connection(database)
+            account_number = _query_account_qq_number(conn)
+            if account_number:
+                self.account_label = account_number
+            _exclude_self_from_buddy_directory(
+                buddy_directory_map,
+                self.account_label,
+            )
+            return _query_conversation_directory(
+                conn,
+                buddy_map=buddy_map,
+                buddy_directory_map=buddy_directory_map,
+                group_name_map=group_name_map,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("QQ conversation directory is unavailable: %s", type(exc).__name__)
             return None
         finally:
-            try:
-                shutil.rmtree(tmp_dir)
-            except Exception:
-                pass
+            _finalize_qq_plaintext_temp(conn, tmp_dir)
     
     def format_for_ai(self, messages: List[QQMessage]) -> str:
         """Format messages as plain text for AI."""

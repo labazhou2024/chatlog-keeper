@@ -16,7 +16,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-15]
-        python-version: ["3.9", "3.12"]
+        python-version: ["3.9", "3.11", "3.12"]
+        exclude:
+          # Windows 3.11 is exercised by the release-identical locked-runtime
+          # job below; floating setup-python must never gate/build NTQQ.
+          - os: windows-latest
+            python-version: "3.11"
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -30,4 +35,34 @@ jobs:
       - name: Test
         run: python -m pytest -q
       - name: Compile entry points
+        run: python -m compileall -q chatlog_keeper tests
+
+  windows-release-runtime:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up exact release Python and SQLite
+        uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
+        with:
+          miniconda-version: "py311_26.5.3-2"
+          activate-environment: chatlog-release-windows
+          environment-file: packaging/windows-release-environment.yml
+          auto-activate-base: false
+          channels: defaults
+          channel-priority: strict
+      - name: Verify exact runtime and shifted pending-byte gate
+        shell: pwsh
+        run: |
+          python -c "import sqlite3, sys; assert sys.version_info[:3] == (3, 11, 15); assert sqlite3.sqlite_version == '3.53.2'"
+          python -I chatlog_keeper/_qq_sqlite_helper.py --runtime-probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check . pytest
+      - name: Test
+        shell: pwsh
+        run: python -m pytest -q
+      - name: Compile entry points
+        shell: pwsh
         run: python -m compileall -q chatlog_keeper tests

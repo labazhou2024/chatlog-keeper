@@ -2527,50 +2527,11 @@ def _decrypt_with_cache(
 
 
 def _process_is_alive(pid: int) -> bool:
-    """Fail-safe process liveness check for startup orphan cleanup."""
-    if pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
-    if os.name == "nt":
-        try:
-            from ctypes import wintypes
+    """Use the shared fail-safe owner-PID check for orphan cleanup."""
 
-            kernel32 = ctypes.windll.kernel32
-            kernel32.OpenProcess.argtypes = [
-                wintypes.DWORD,
-                wintypes.BOOL,
-                wintypes.DWORD,
-            ]
-            kernel32.OpenProcess.restype = wintypes.HANDLE
-            kernel32.WaitForSingleObject.argtypes = [
-                wintypes.HANDLE,
-                wintypes.DWORD,
-            ]
-            kernel32.WaitForSingleObject.restype = wintypes.DWORD
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel32.CloseHandle.restype = wintypes.BOOL
-            kernel32.GetLastError.restype = wintypes.DWORD
-            handle = kernel32.OpenProcess(0x00100000, False, pid)
-            if not handle:
-                return kernel32.GetLastError() != 87
-            try:
-                # Only WAIT_OBJECT_0 proves termination. Timeout or API failure
-                # must preserve the directory rather than risk a live cache.
-                return kernel32.WaitForSingleObject(handle, 0) != 0
-            finally:
-                kernel32.CloseHandle(handle)
-        except Exception:
-            return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
-    return True
+    from chatlog_keeper.core._private_temp import process_is_alive
+
+    return process_is_alive(pid)
 
 
 def _scavenge_decrypt_cache(

@@ -10,7 +10,15 @@ The bundled PowerShell debugger scripts are located at runtime via
 """
 import sys
 
-from chatlog_keeper.cli import main
-
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--_qq-sqlite-helper"]:
+        # Private frozen-child entry point.  The parent starts the same signed
+        # executable as a separate process because a PyInstaller executable
+        # cannot be used as ``python -I helper.py``.
+        from chatlog_keeper._qq_sqlite_helper import main as helper_main
+
+        sys.exit(helper_main(sys.argv[2:]))
+
+    from chatlog_keeper.cli import main
+
     sys.exit(main())
