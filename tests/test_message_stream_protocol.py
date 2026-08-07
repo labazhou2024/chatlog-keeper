@@ -95,6 +95,27 @@ def _wechat_cursor_payload(row_id: int = 1) -> dict:
     }
 
 
+def _unreadable_qq_record(
+    *,
+    conversation_id: str = "conversation-a",
+    failure_code: str = "qq_message_body_unavailable",
+    rowid: int = 2,
+) -> dict:
+    return {
+        "account_id": "account-a",
+        "conversation_id": conversation_id,
+        "conversation_type": "group",
+        "thread_id": f"account-a::{conversation_id}",
+        "ts": 1_800_000_001.0,
+        "ts_iso": "2027-01-15T08:00:01+00:00",
+        "msg_id": None,
+        "source_offset": f"qq_db:{conversation_id}:group:{rowid}",
+        "decode_status": "unreadable",
+        "decode_error_code": failure_code,
+        "recoverable": True,
+    }
+
+
 def test_capability_negotiation_is_one_bounded_versioned_frame(monkeypatch, capsys) -> None:
     assert cli.main(["message-stream-v1", "--capabilities"]) == 0
     captured = capsys.readouterr()
@@ -117,6 +138,7 @@ def test_capability_negotiation_is_one_bounded_versioned_frame(monkeypatch, caps
         ],
         "ordering": "scope_index,page_index,record_order",
         "checkpoint": "after_each_page",
+        "unreadable_record_policy": "quarantine-v1",
         "limits": {
             "max_request_bytes": 262_144,
             "max_frame_bytes": 1_048_576,
@@ -274,6 +296,159 @@ def test_qq_records_flush_before_iterator_resumes_and_each_page_checkpoints(
     )
     assert calls[1][3]["page_size"] == 2
     assert callable(calls[1][3]["cancel_requested"])
+    assert calls[1][3]["recover_unreadable_rows"] is False
+
+
+def test_opt_in_unreadable_record_continues_current_and_later_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recover_flags: list[bool] = []
+
+    class RecoveringQQReader:
+        def __init__(self, **_kwargs):
+            pass
+
+        def iter_message_dict_pages(self, _since_ts, _until_ts, **kwargs):
+            recover_flags.append(kwargs["recover_unreadable_rows"])
+            conversation_id = kwargs["conversation_id"]
+            if conversation_id == "conversation-a":
+                records = (
+                    {
+                        "account_id": "account-a",
+                        "conversation_id": conversation_id,
+                        "conversation_type": "group",
+                        "content": "valid before",
+                        "ts": 1_800_000_000.0,
+                    },
+                    _unreadable_qq_record(conversation_id=conversation_id),
+                    {
+                        "account_id": "account-a",
+                        "conversation_id": conversation_id,
+                        "conversation_type": "group",
+                        "content": "valid after",
+                        "ts": 1_800_000_002.0,
+                    },
+                )
+                rowid = 3
+            else:
+                records = ({
+                    "account_id": "account-a",
+                    "conversation_id": conversation_id,
+                    "conversation_type": "group",
+                    "content": "later scope",
+                    "ts": 1_800_000_003.0,
+                },)
+                rowid = 1
+            yield SimpleNamespace(
+                records=records,
+                cursor_after=_qq_cursor(
+                    "account-a", conversation_id, "group", rowid
+                ),
+                has_more=False,
+            )
+
+    monkeypatch.setattr(cli.qq_db, "QQDBReader", RecoveringQQReader)
+    request = _request(
+        "qq",
+        [
+            _scope("account-a", "conversation-b", "group"),
+            _scope("account-a", "conversation-a", "group"),
+        ],
+        page_size=3,
+        unreadable_record_policy="quarantine-v1",
+    )
+
+    code, frames, stderr = _run(monkeypatch, request)
+
+    assert code == 0
+    assert stderr == ""
+    assert recover_flags == [True, True]
+    assert all(frame["frame"] != "error" for frame in frames)
+    records = [frame["record"] for frame in frames if frame["frame"] == "record"]
+    assert [record.get("content") for record in records] == [
+        "valid before",
+        None,
+        "valid after",
+        "later scope",
+    ]
+    assert records[1]["decode_error_code"] == "qq_message_body_unavailable"
+    checkpoints = [frame for frame in frames if frame["frame"] == "checkpoint"]
+    assert [frame["record_count"] for frame in checkpoints] == [3, 1]
+    assert frames[-1]["frame"] == "complete"
+    assert frames[-1]["scope_count"] == 2
+    assert frames[-1]["record_count"] == 4
+
+
+def test_unreadable_marker_without_request_opt_in_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnexpectedUnreadableReader:
+        def __init__(self, **_kwargs):
+            pass
+
+        def iter_message_dict_pages(self, _since_ts, _until_ts, **kwargs):
+            assert kwargs["recover_unreadable_rows"] is False
+            yield SimpleNamespace(
+                records=(_unreadable_qq_record(),),
+                cursor_after=_qq_cursor("account-a", "conversation-a", "group", 2),
+                has_more=False,
+            )
+
+    monkeypatch.setattr(cli.qq_db, "QQDBReader", UnexpectedUnreadableReader)
+    code, frames, stderr = _run(
+        monkeypatch,
+        _request("qq", [_scope(conversation_type="group")]),
+    )
+
+    assert code == 1
+    assert stderr == ""
+    assert frames[-1]["frame"] == "error"
+    assert frames[-1]["code"] == "invalid_record"
+    assert all(frame["frame"] != "checkpoint" for frame in frames)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update(thread_id="account-a::wrong-scope"),
+        lambda value: value.update(ts_iso="2027-01-15T08:00:02+00:00"),
+        lambda value: value.update(source_offset="qq_db:wrong-scope:group:2"),
+        lambda value: value.update(ts=0),
+        lambda value: value.update(decode_error_code="private_exception_text"),
+        lambda value: value.update(content="not a real message"),
+    ],
+)
+def test_unreadable_record_exact_schema_and_identity_invariants_fail_closed(
+    mutate,
+) -> None:
+    record = _unreadable_qq_record()
+    mutate(record)
+
+    with pytest.raises(stream_protocol.MessageStreamProtocolError) as error:
+        stream_protocol.validate_message_stream_record(record)
+
+    assert error.value.code == "invalid_record"
+    assert "private_exception_text" not in str(error.value)
+
+
+def test_normal_record_shape_remains_open_and_invalid_policy_is_rejected() -> None:
+    normal = {
+        "account_id": "account-a",
+        "conversation_id": "conversation-a",
+        "conversation_type": "direct",
+        "content": "normal record remains additive",
+        "future_field": {"nested": True},
+    }
+    assert stream_protocol.validate_message_stream_record(normal) is normal
+
+    request = _request(
+        "qq",
+        [_scope()],
+        unreadable_record_policy="silent-drop",
+    )
+    with pytest.raises(stream_protocol.MessageStreamProtocolError) as error:
+        stream_protocol.parse_message_stream_request(request)
+    assert error.value.code == "invalid_request"
 
 
 def test_qq_bounded_page_content_round_trips_to_ndjson_without_truncation(

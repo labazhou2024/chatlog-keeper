@@ -74,6 +74,15 @@ def test_ci_covers_release_python_and_runs_the_runtime_probe_on_windows():
     assert "_qq_sqlite_helper.py --runtime-probe" in workflow
 
 
+def test_ci_push_runs_for_main_and_release_branches() -> None:
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "  push:\n    branches:\n      - main\n      - \"release/**\"\n" in workflow
+
+
 def test_windows_release_environment_pins_the_validated_python_and_sqlite_builds():
     root = Path(__file__).resolve().parents[1]
     environment = (

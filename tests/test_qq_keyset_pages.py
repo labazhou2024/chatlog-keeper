@@ -83,6 +83,7 @@ def _page(
     conversation_id: str = "scope-a",
     page_size: int = 2,
     cursor=None,
+    recover_unreadable_rows: bool = False,
 ):
     return qq_db._query_message_dict_page(
         conn,
@@ -93,6 +94,7 @@ def _page(
         until_ts=_BASE_TS + 10,
         page_size=page_size,
         cursor=cursor,
+        recover_unreadable_rows=recover_unreadable_rows,
     )
 
 
@@ -250,6 +252,151 @@ def test_zero_uin_without_sender_uid_fails_closed() -> None:
             _page(conn, page_size=1)
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "failure_code"),
+    [
+        ("missing_sender", "qq_sender_identity_unavailable"),
+        ("unsupported_body", "qq_message_body_unsupported"),
+        ("missing_body", "qq_message_body_unavailable"),
+    ],
+)
+def test_opt_in_preserves_unreadable_row_identity_without_private_payload(
+    case: str,
+    failure_code: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _connection()
+    try:
+        _insert(
+            conn,
+            conversation_type="group",
+            conversation_id="scope-a",
+            msg_uid=7,
+            timestamp=_BASE_TS + 1,
+            body="" if case == "missing_body" else "opaque-body",
+            sender_uin=0 if case == "missing_sender" else 10001,
+            sender_uid="",
+        )
+        if case == "unsupported_body":
+            monkeypatch.setattr(qq_db, "_extract_msg_text", lambda _value: "")
+
+        page = _page(
+            conn,
+            conversation_type="group",
+            page_size=1,
+            recover_unreadable_rows=True,
+        )
+
+        assert page.has_more is False
+        assert page.cursor_after is not None and page.cursor_after.rowid == 1
+        assert len(page.records) == 1
+        record = page.records[0]
+        assert record == {
+            "account_id": "account-a",
+            "conversation_id": "scope-a",
+            "conversation_type": "group",
+            "thread_id": "account-a::scope-a",
+            "ts": float(_BASE_TS + 1),
+            "ts_iso": "2027-01-15T08:00:01+00:00",
+            "msg_id": 7,
+            "source_offset": "qq_db:scope-a:group:1",
+            "decode_status": "unreadable",
+            "decode_error_code": failure_code,
+            "recoverable": True,
+        }
+        assert not {
+            "content",
+            "sender_name",
+            "sender_uid",
+            "sender_qq",
+            "attachment_meta",
+            "msg_body",
+            "path",
+            "key",
+        }.intersection(record)
+    finally:
+        conn.close()
+
+
+def test_valid_unreadable_valid_rows_continue_across_keyset_pages() -> None:
+    conn = _connection()
+    try:
+        for msg_uid, sender_uin in ((1, 10001), (2, 0), (3, 10001)):
+            _insert(
+                conn,
+                conversation_type="group",
+                conversation_id="scope-a",
+                msg_uid=msg_uid,
+                timestamp=_BASE_TS + msg_uid,
+                body=f"message {msg_uid}",
+                sender_uin=sender_uin,
+                sender_uid="",
+            )
+
+        first = _page(
+            conn,
+            conversation_type="group",
+            page_size=2,
+            recover_unreadable_rows=True,
+        )
+        second = _page(
+            conn,
+            conversation_type="group",
+            page_size=2,
+            cursor=first.cursor_after,
+            recover_unreadable_rows=True,
+        )
+
+        assert [record["msg_id"] for record in first.records] == [1, 2]
+        assert first.records[1]["decode_error_code"] == "qq_sender_identity_unavailable"
+        assert [record["msg_id"] for record in second.records] == [3]
+        assert first.has_more is True
+        assert second.has_more is False
+        assert first.cursor_after is not None and first.cursor_after.rowid == 2
+        assert second.cursor_after is not None and second.cursor_after.rowid == 3
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("row_index", "replacement"),
+    [
+        (1, float("nan")),
+        (5, "different-scope"),
+        (6, 0),
+        (7, 0),
+    ],
+)
+def test_unstable_time_scope_or_locator_never_becomes_an_unreadable_marker(
+    row_index: int,
+    replacement,
+) -> None:
+    row = [
+        7,
+        float(_BASE_TS + 1),
+        "Synthetic sender",
+        10001,
+        b"message",
+        "scope-a",
+        1,
+        1,
+        "group",
+        "",
+    ]
+    row[row_index] = replacement
+
+    with pytest.raises(RuntimeError):
+        qq_db._qq_message_page_record(
+            tuple(row),
+            account_id="account-a",
+            conversation_id="scope-a",
+            buddy_map={},
+            group_map={},
+            group_name_map={},
+            recover_unreadable_rows=True,
+        )
 
 
 def test_requested_existing_table_with_missing_columns_fails_closed() -> None:

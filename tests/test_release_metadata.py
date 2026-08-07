@@ -54,6 +54,7 @@ def _message_capability() -> dict:
         ],
         "ordering": "scope_index,page_index,record_order",
         "checkpoint": "after_each_page",
+        "unreadable_record_policy": "quarantine-v1",
         "limits": {
             "max_request_bytes": 262_144,
             "max_frame_bytes": 1_048_576,

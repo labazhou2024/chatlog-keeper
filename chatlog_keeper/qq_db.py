@@ -37,6 +37,7 @@ from chatlog_keeper.core._private_temp import (
     create_private_temp_dir,
     scavenge_private_temp_dirs,
 )
+from chatlog_keeper.stream_protocol import QQ_UNREADABLE_DECODE_ERROR_CODES
 
 logger = logging.getLogger(__name__)
 
@@ -2768,7 +2769,8 @@ def _qq_message_page_record(
     buddy_map: Dict[int, str],
     group_map: Dict[Tuple[int, int], str],
     group_name_map: Dict[int, str],
-) -> Optional[Dict]:
+    recover_unreadable_rows: bool = False,
+) -> Dict:
     """Decode one already-bounded raw row into the legacy dictionary shape."""
 
     from datetime import timezone
@@ -2785,36 +2787,106 @@ def _qq_message_page_record(
         conversation_type,
         sender_uid,
     ) = row
+    if not isinstance(recover_unreadable_rows, bool):
+        raise ValueError("recover_unreadable_rows must be a boolean")
     try:
         ts = float(msg_time)
     except (TypeError, ValueError):
-        return None
-    if not math.isfinite(ts):
-        return None
-    if not msg_body:
-        raise RuntimeError("QQ message body is unavailable")
-    content = _extract_msg_text(msg_body)
-    content = str(content or "")
-    if not content.strip():
-        raise RuntimeError("QQ message body has no safe narrative")
+        raise RuntimeError("QQ message timestamp is invalid") from None
+    if not math.isfinite(ts) or ts <= 0:
+        raise RuntimeError("QQ message timestamp is invalid")
+    try:
+        normalized_source_rowid = int(source_rowid)
+        normalized_table_rank = int(_table_rank)
+    except (TypeError, ValueError):
+        raise RuntimeError("QQ message locator is invalid") from None
+    if normalized_source_rowid < 1 or normalized_table_rank not in (0, 1):
+        raise RuntimeError("QQ message locator is invalid")
+    if conversation_type not in {"direct", "group"}:
+        raise RuntimeError("QQ message conversation type is invalid")
+    if str(_raw_conversation_id) != conversation_id:
+        raise RuntimeError("QQ message conversation scope is invalid")
+    expected_table_rank = 0 if conversation_type == "direct" else 1
+    if normalized_table_rank != expected_table_rank:
+        raise RuntimeError("QQ message locator is invalid")
     is_group = conversation_type == "group"
+    try:
+        normalized_msg_uid = int(msg_uid) if msg_uid is not None else None
+    except (TypeError, ValueError):
+        normalized_msg_uid = None
+    source_offset = (
+        f"qq_db:{conversation_id}:{conversation_type}:{normalized_source_rowid}"
+    )
+    ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+    def unreadable(failure_code: str, legacy_error: str) -> Dict:
+        if not recover_unreadable_rows:
+            raise RuntimeError(legacy_error)
+        if failure_code not in QQ_UNREADABLE_DECODE_ERROR_CODES:
+            raise RuntimeError("QQ message decode failure code is invalid")
+        return {
+            "account_id": account_id,
+            "conversation_id": conversation_id,
+            "conversation_type": conversation_type,
+            "thread_id": f"{account_id}::{conversation_id}",
+            "ts": ts,
+            "ts_iso": ts_iso,
+            "msg_id": normalized_msg_uid,
+            "source_offset": source_offset,
+            "decode_status": "unreadable",
+            "decode_error_code": failure_code,
+            "recoverable": True,
+        }
+
+    if not msg_body:
+        return unreadable(
+            "qq_message_body_unavailable",
+            "QQ message body is unavailable",
+        )
+    try:
+        content = str(_extract_msg_text(msg_body) or "")
+    except Exception:  # noqa: BLE001 - one malformed body is a recoverable source row
+        return unreadable(
+            "qq_message_body_unsupported",
+            "QQ message body has no safe narrative",
+        )
+    if not content.strip():
+        return unreadable(
+            "qq_message_body_unsupported",
+            "QQ message body has no safe narrative",
+        )
     raw_sender_uin = str(sender_uin).strip() if sender_uin is not None else ""
     if not raw_sender_uin:
-        raise RuntimeError("QQ message sender identity is unavailable")
+        return unreadable(
+            "qq_sender_identity_unavailable",
+            "QQ message sender identity is unavailable",
+        )
     try:
         sender_uin_int = int(raw_sender_uin)
     except (TypeError, ValueError):
-        raise RuntimeError("QQ message sender identity is invalid") from None
+        return unreadable(
+            "qq_sender_identity_unavailable",
+            "QQ message sender identity is invalid",
+        )
     if sender_uin_int < 0:
-        raise RuntimeError("QQ message sender identity is invalid")
+        return unreadable(
+            "qq_sender_identity_unavailable",
+            "QQ message sender identity is invalid",
+        )
     normalized_sender_uid = str(sender_uid or "").strip()
     if normalized_sender_uid and (
         len(normalized_sender_uid) > 512
         or any(ord(character) < 32 for character in normalized_sender_uid)
     ):
-        raise RuntimeError("QQ message sender identity is invalid")
+        return unreadable(
+            "qq_sender_identity_unavailable",
+            "QQ message sender identity is invalid",
+        )
     if sender_uin_int == 0 and not normalized_sender_uid:
-        raise RuntimeError("QQ message sender identity is unavailable")
+        return unreadable(
+            "qq_sender_identity_unavailable",
+            "QQ message sender identity is unavailable",
+        )
     raw_sender_name = sender_name.strip() if isinstance(sender_name, str) else ""
     resolved_name = _resolve_sender_name(
         raw_name=raw_sender_name,
@@ -2839,14 +2911,10 @@ def _qq_message_page_record(
         except (TypeError, ValueError):
             chat_name = ""
         chat_name = chat_name or f"qq_friend_{conversation_id}"
-    try:
-        normalized_msg_uid = int(msg_uid) if msg_uid is not None else None
-    except (TypeError, ValueError):
-        normalized_msg_uid = None
     wxid_hash = hashlib.sha256(sender_identity.encode("utf-8")).hexdigest()[:16]
     return {
         "ts": ts,
-        "ts_iso": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+        "ts_iso": ts_iso,
         "wxid_hash": wxid_hash,
         "sender_qq": sender_uin_int,
         "sender_uid": normalized_sender_uid,
@@ -2865,9 +2933,7 @@ def _qq_message_page_record(
         "thread_id": f"{account_id}::{conversation_id}",
         "conversation_type": conversation_type,
         "is_group_chat": is_group,
-        "source_offset": (
-            f"qq_db:{conversation_id}:{conversation_type}:{int(source_rowid)}"
-        ),
+        "source_offset": source_offset,
         "attachment_meta": (
             _extract_qq_attachment_meta(msg_body) if msg_body else None
         ),
@@ -2887,6 +2953,7 @@ def _query_message_dict_page(
     buddy_map: Optional[Dict[int, str]] = None,
     group_map: Optional[Dict[Tuple[int, int], str]] = None,
     group_name_map: Optional[Dict[int, str]] = None,
+    recover_unreadable_rows: bool = False,
 ) -> _QQMessageDictPage:
     """Read one bounded, deterministic keyset page from a decrypted QQ DB.
 
@@ -2898,6 +2965,9 @@ def _query_message_dict_page(
     """
 
     import sqlite3
+
+    if not isinstance(recover_unreadable_rows, bool):
+        raise ValueError("recover_unreadable_rows must be a boolean")
 
     (
         account_id,
@@ -3000,19 +3070,16 @@ def _query_message_dict_page(
         rowid=int(last_row[7]),
     )
     records = tuple(
-        record
-        for record in (
-            _qq_message_page_record(
-                row,
-                account_id=account_id,
-                conversation_id=conversation_id,
-                buddy_map=buddy_map,
-                group_map=group_map,
-                group_name_map=group_name_map,
-            )
-            for row in consumed_rows
+        _qq_message_page_record(
+            row,
+            account_id=account_id,
+            conversation_id=conversation_id,
+            buddy_map=buddy_map,
+            group_map=group_map,
+            group_name_map=group_name_map,
+            recover_unreadable_rows=recover_unreadable_rows,
         )
-        if record is not None
+        for row in consumed_rows
     )
     return _QQMessageDictPage(
         records=records,
@@ -3327,6 +3394,7 @@ class QQDBReader:
         page_size: int = _QQ_MESSAGE_PAGE_DEFAULT_SIZE,
         cursor: Optional[_QQMessagePageCursor] = None,
         cancel_requested: Optional[Callable[[], bool]] = None,
+        recover_unreadable_rows: bool = False,
     ) -> Iterator[_QQMessageDictPage]:
         """Yield bounded keyset pages for one explicitly selected QQ scope.
 
@@ -3339,6 +3407,8 @@ class QQDBReader:
 
         if cancel_requested is not None and not callable(cancel_requested):
             raise ValueError("cancel_requested must be callable")
+        if not isinstance(recover_unreadable_rows, bool):
+            raise ValueError("recover_unreadable_rows must be a boolean")
         (
             account_id,
             conversation_id,
@@ -3429,6 +3499,7 @@ class QQDBReader:
                     buddy_map=buddy_map,
                     group_map=group_map,
                     group_name_map=group_name_map,
+                    recover_unreadable_rows=recover_unreadable_rows,
                 )
                 _raise_if_qq_message_page_cancelled(cancel_requested)
                 progressed = page.cursor_after != current_cursor

@@ -12,6 +12,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional, TextIO, Tuple
 
 
@@ -28,6 +29,12 @@ FRAME_TYPES = (
     "complete",
     "error",
 )
+UNREADABLE_RECORD_POLICY = "quarantine-v1"
+QQ_UNREADABLE_DECODE_ERROR_CODES = frozenset({
+    "qq_sender_identity_unavailable",
+    "qq_message_body_unsupported",
+    "qq_message_body_unavailable",
+})
 
 MAX_REQUEST_BYTES = 262_144
 MAX_FRAME_BYTES = 1_048_576
@@ -51,6 +58,7 @@ REQUEST_FIELDS = frozenset({
     "page_size",
     "scopes",
 })
+REQUEST_OPTIONAL_FIELDS = frozenset({"unreadable_record_policy"})
 SCOPE_REQUIRED_FIELDS = frozenset({
     "account_id",
     "conversation_id",
@@ -127,6 +135,7 @@ class MessageStreamRequest:
     until_ts: float
     page_size: int
     scopes: Tuple[MessageStreamScope, ...]
+    unreadable_record_policy: Optional[str] = None
 
 
 class MessageStreamCancellation:
@@ -352,7 +361,13 @@ def normalize_page_cursor(
 def parse_message_stream_request(value: Any) -> MessageStreamRequest:
     """Validate the exact v1 request and canonicalize its scope order."""
 
-    if not isinstance(value, dict) or set(value) != REQUEST_FIELDS:
+    if not isinstance(value, dict):
+        raise MessageStreamProtocolError("invalid_request")
+    fields = set(value)
+    if (
+        not REQUEST_FIELDS.issubset(fields)
+        or not fields.issubset(REQUEST_FIELDS | REQUEST_OPTIONAL_FIELDS)
+    ):
         raise MessageStreamProtocolError("invalid_request")
     if value.get("protocol") != PROTOCOL or value.get("version") != VERSION:
         raise MessageStreamProtocolError("invalid_request")
@@ -364,6 +379,9 @@ def parse_message_stream_request(value: Any) -> MessageStreamRequest:
     since_ts = _finite_number(value.get("since_ts"))
     until_ts = _finite_number(value.get("until_ts"))
     if since_ts > until_ts:
+        raise MessageStreamProtocolError("invalid_request")
+    unreadable_record_policy = value.get("unreadable_record_policy")
+    if unreadable_record_policy not in (None, UNREADABLE_RECORD_POLICY):
         raise MessageStreamProtocolError("invalid_request")
     page_size = _positive_int(value.get("page_size"), maximum=MAX_PAGE_SIZE)
     raw_scopes = value.get("scopes")
@@ -398,6 +416,7 @@ def parse_message_stream_request(value: Any) -> MessageStreamRequest:
         until_ts=until_ts,
         page_size=page_size,
         scopes=scopes,
+        unreadable_record_policy=unreadable_record_policy,
     )
 
 
@@ -434,6 +453,7 @@ def message_stream_capabilities_frame() -> dict:
         "frames": list(FRAME_TYPES[1:]),
         "ordering": "scope_index,page_index,record_order",
         "checkpoint": "after_each_page",
+        "unreadable_record_policy": UNREADABLE_RECORD_POLICY,
         "limits": {
             "max_request_bytes": MAX_REQUEST_BYTES,
             "max_frame_bytes": MAX_FRAME_BYTES,
@@ -445,6 +465,99 @@ def message_stream_capabilities_frame() -> dict:
             "max_pages_per_scope": MAX_PAGES_PER_SCOPE,
         },
     }
+
+
+_QQ_UNREADABLE_RECORD_FIELDS = frozenset({
+    "account_id",
+    "conversation_id",
+    "conversation_type",
+    "thread_id",
+    "ts",
+    "ts_iso",
+    "msg_id",
+    "source_offset",
+    "decode_status",
+    "decode_error_code",
+    "recoverable",
+})
+
+
+def validate_message_stream_record(value: Any) -> dict:
+    """Validate the additive opt-in unreadable-row shape without narrowing normal rows."""
+
+    if not isinstance(value, dict):
+        raise MessageStreamProtocolError("invalid_record")
+    if "decode_status" not in value:
+        if "decode_error_code" in value:
+            raise MessageStreamProtocolError("invalid_record")
+        return value
+    if (
+        set(value) != _QQ_UNREADABLE_RECORD_FIELDS
+        or value.get("decode_status") != "unreadable"
+        or value.get("decode_error_code") not in QQ_UNREADABLE_DECODE_ERROR_CODES
+        or value.get("recoverable") is not True
+    ):
+        raise MessageStreamProtocolError("invalid_record")
+    timestamp = value.get("ts")
+    if (
+        isinstance(timestamp, bool)
+        or not isinstance(timestamp, (int, float))
+        or not math.isfinite(float(timestamp))
+        or float(timestamp) <= 0
+    ):
+        raise MessageStreamProtocolError("invalid_record")
+    message_id = value.get("msg_id")
+    if message_id is not None and (
+        isinstance(message_id, bool) or not isinstance(message_id, int)
+    ):
+        raise MessageStreamProtocolError("invalid_record")
+    for field in (
+        "account_id",
+        "conversation_id",
+        "conversation_type",
+        "thread_id",
+        "ts_iso",
+        "source_offset",
+    ):
+        candidate = value.get(field)
+        if (
+            not isinstance(candidate, str)
+            or not candidate
+            or len(candidate) > MAX_ID_CHARS * 3
+            or any(ord(character) < 32 for character in candidate)
+        ):
+            raise MessageStreamProtocolError("invalid_record")
+    if value.get("conversation_type") not in CONVERSATION_TYPES:
+        raise MessageStreamProtocolError("invalid_record")
+    if value["thread_id"] != f"{value['account_id']}::{value['conversation_id']}":
+        raise MessageStreamProtocolError("invalid_record")
+    try:
+        parsed_timestamp = datetime.fromisoformat(value["ts_iso"])
+    except (TypeError, ValueError):
+        raise MessageStreamProtocolError("invalid_record") from None
+    if (
+        parsed_timestamp.tzinfo is None
+        or parsed_timestamp.utcoffset() != timedelta(0)
+        or not math.isclose(
+            parsed_timestamp.astimezone(timezone.utc).timestamp(),
+            float(timestamp),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+    ):
+        raise MessageStreamProtocolError("invalid_record")
+    locator_prefix = (
+        f"qq_db:{value['conversation_id']}:{value['conversation_type']}:"
+    )
+    locator_rowid = value["source_offset"][len(locator_prefix):]
+    if (
+        not value["source_offset"].startswith(locator_prefix)
+        or not locator_rowid.isascii()
+        or not locator_rowid.isdigit()
+        or int(locator_rowid) < 1
+    ):
+        raise MessageStreamProtocolError("invalid_record")
+    return value
 
 
 def error_frame(code: str) -> dict:

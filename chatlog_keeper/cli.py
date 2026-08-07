@@ -1496,10 +1496,15 @@ def _message_stream_record(
     record: Any,
     *,
     scope: stream_protocol.MessageStreamScope,
+    unreadable_record_policy: str | None = None,
 ) -> dict:
     """Fail closed if a bounded reader returns a row outside its exact scope."""
 
-    if not isinstance(record, dict):
+    record = stream_protocol.validate_message_stream_record(record)
+    if (
+        record.get("decode_status") == "unreadable"
+        and unreadable_record_policy != stream_protocol.UNREADABLE_RECORD_POLICY
+    ):
         raise stream_protocol.MessageStreamProtocolError("invalid_record")
     if str(record.get("account_id") or "") != scope.account_id:
         raise stream_protocol.MessageStreamProtocolError("scope_mismatch")
@@ -1574,6 +1579,10 @@ def _qq_message_stream_scope(
         page_size=request.page_size,
         cursor=initial_cursor,
         cancel_requested=cancellation,
+        recover_unreadable_rows=(
+            request.unreadable_record_policy
+            == stream_protocol.UNREADABLE_RECORD_POLICY
+        ),
     )
     page_index = 0
     record_count = 0
@@ -1602,7 +1611,11 @@ def _qq_message_stream_scope(
             if not isinstance(has_more, bool):
                 raise stream_protocol.MessageStreamProtocolError("read_failed")
             for raw_record in records:
-                record = _message_stream_record(raw_record, scope=scope)
+                record = _message_stream_record(
+                    raw_record,
+                    scope=scope,
+                    unreadable_record_policy=request.unreadable_record_policy,
+                )
                 record_count = _emit_message_stream_record(
                     writer,
                     scope_index=scope_index,
