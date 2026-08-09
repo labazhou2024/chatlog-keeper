@@ -1,0 +1,11 @@
+# 正式二进制发布在两平台都使用 Python 3.11.15；平台 lock 由经官方
+# SHA-256 校验的 uv 0.11.30 从本文件生成。
+# 更新任一版本后必须同时重建两份带哈希 lock，并重跑双平台 Release。
+numpy==2.4.6
+pip==26.1.2
+pycryptodome==3.23.0
+pyinstaller==6.20.0
+pytest==9.1.1
+setuptools==83.0.0
+wheel==0.47.0
+zstandard==0.25.0

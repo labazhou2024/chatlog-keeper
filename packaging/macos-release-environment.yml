@@ -1,0 +1,8 @@
+name: chatlog-release-macos
+channels:
+  - defaults
+dependencies:
+  # Exact osx-arm64 builds used by both release CI and the tag-bound build.
+  - python=3.11.15=h478e877_1
+  - sqlite=3.53.2=h1cce5ff_0
+  - pip=26.1.2=pyhc872135_0
