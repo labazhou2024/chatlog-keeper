@@ -436,6 +436,14 @@ def test_source_lease_serializes_across_config_overrides(
     first.release_active_lease()
 
 
+def test_windows_source_lock_uses_last_error_aware_kernel32():
+    source = Path(protocol.__file__).read_text(encoding="utf-8")
+    acquire = source.split("    def _acquire_windows(self) -> bool:\n", 1)[1]
+    acquire = acquire.split("    def release(self) -> None:\n", 1)[0]
+    assert 'ctypes.WinDLL("kernel32", use_last_error=True)' in acquire
+    assert "ctypes.windll.kernel32" not in acquire
+
+
 def test_damaged_status_after_owner_crash_recovers_and_deletes_key_transcript(
     private_runtime,
     tmp_path,
@@ -813,6 +821,7 @@ def test_windows_artifact_validation_never_calls_posix_geteuid(
         protocol.os,
         "geteuid",
         lambda: pytest.fail("Windows artifact cleanup called os.geteuid"),
+        raising=False,
     )
     assert protocol._recorded_artifact_is_safe(
         artifact,

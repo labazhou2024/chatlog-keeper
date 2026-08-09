@@ -30,11 +30,12 @@ def test_macos_exact_executable_pid_uses_comm_not_argument_substrings(
 ):
     monkeypatch.setattr(_macos, "is_macos", lambda: True)
     expected = Path("/Applications/QQ.app/Contents/MacOS/QQ")
+    canonical = os.path.realpath(expected)
     stdout = "\n".join(
         [
-            f" 43 {expected}",
-            f" 44 {expected} --flag",
-            f" 45 /usr/bin/python3 {expected}",
+            f" 43 {canonical}",
+            f" 44 {canonical} --flag",
+            f" 45 /usr/bin/python3 {canonical}",
         ]
     )
     monkeypatch.setattr(

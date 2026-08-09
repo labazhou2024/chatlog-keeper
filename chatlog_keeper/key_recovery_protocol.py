@@ -414,7 +414,11 @@ class _SourceLock:
                     ("hEvent", wintypes.HANDLE),
                 ]
 
-            kernel32 = ctypes.windll.kernel32
+            # ``ctypes.get_last_error()`` is only reliable when the DLL was
+            # loaded with ``use_last_error=True``.  Without this, a legitimate
+            # ERROR_LOCK_VIOLATION from the non-blocking lease can surface as
+            # errno 0 and be misreported as ``status_unavailable``.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             kernel32.CreateMutexW.argtypes = [
                 ctypes.c_void_p,
                 wintypes.BOOL,
@@ -485,7 +489,19 @@ class _SourceLock:
                 import msvcrt
                 from ctypes import wintypes
 
-                kernel32 = ctypes.windll.kernel32
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.UnlockFileEx.argtypes = [
+                    wintypes.HANDLE,
+                    wintypes.DWORD,
+                    wintypes.DWORD,
+                    wintypes.DWORD,
+                    ctypes.POINTER(type(self._overlapped)),
+                ]
+                kernel32.UnlockFileEx.restype = wintypes.BOOL
+                kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+                kernel32.ReleaseMutex.restype = wintypes.BOOL
+                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                kernel32.CloseHandle.restype = wintypes.BOOL
                 handle = wintypes.HANDLE(msvcrt.get_osfhandle(self.fd))
                 kernel32.UnlockFileEx(
                     handle,
