@@ -94,7 +94,7 @@ jobs:
       - name: Verify exact runtime and shifted pending-byte gate
         shell: pwsh
         run: |
-          python -c "import os, platform, sqlite3, sys; assert sys.version_info[:3] == (3, 11, 15); assert sqlite3.sqlite_version == '3.53.2'; assert sys.prefix == os.environ['CONDA_PREFIX']; assert os.environ.get('CONDA_DEFAULT_ENV') == 'chatlog-release-windows'; assert platform.machine().lower() in {'amd64', 'x86_64'}"
+          python -c "import os, platform, sqlite3, sys; assert sys.version_info[:3] == (3, 11, 15); assert sqlite3.sqlite_version == '3.53.2'; assert sys.prefix == sys.base_prefix; assert os.path.samefile(os.path.dirname(sys.executable), os.environ['CONDA_PREFIX']); assert os.path.isdir(os.path.join(sys.prefix, 'Library', 'bin')); assert os.environ.get('CONDA_DEFAULT_ENV') == 'chatlog-release-windows'; assert platform.machine().lower() in {'amd64', 'x86_64'}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -I chatlog_keeper/_qq_sqlite_helper.py --runtime-probe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -113,3 +113,36 @@ jobs:
       - name: Compile entry points
         shell: pwsh
         run: python -m compileall -q chatlog_keeper tests
+      - name: Build standalone executable
+        shell: pwsh
+        run: python -m PyInstaller packaging/chatlog_keeper.spec --noconfirm --clean --distpath dist_exe
+      - name: Verify standalone executable outside the build environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $executable = (Resolve-Path -LiteralPath .\dist_exe\chatlog-keeper.exe).Path
+          $standaloneWorkdir = Join-Path $env:RUNNER_TEMP ("chatlog-keeper-smoke-" + [Guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $standaloneWorkdir | Out-Null
+          $originalPath = $env:PATH
+          Push-Location $standaloneWorkdir
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+            & $executable --help
+            if ($LASTEXITCODE -ne 0) { throw "standalone help probe failed" }
+            & $executable --_qq-sqlite-helper --runtime-probe
+            if ($LASTEXITCODE -ne 0) { throw "standalone SQLite probe failed" }
+            & $executable message-stream-v1 --capabilities
+            if ($LASTEXITCODE -ne 0) { throw "standalone message-stream capability failed" }
+            & $executable participant-directory-v1 --capabilities
+            if ($LASTEXITCODE -ne 0) { throw "standalone participant-directory capability failed" }
+            & $executable key-identity-v1 --capabilities
+            if ($LASTEXITCODE -ne 0) { throw "standalone key-identity capability failed" }
+            & $executable probe
+            if ($LASTEXITCODE -ne 0) { throw "standalone connector probe failed" }
+          } finally {
+            $env:PATH = $originalPath
+            Pop-Location
+          }
+          python packaging/release_metadata.py validate-capabilities `
+            --executable $executable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

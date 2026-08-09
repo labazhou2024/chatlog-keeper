@@ -133,10 +133,7 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
         "python -I chatlog_keeper/_qq_sqlite_helper.py --runtime-probe"
         in workflow
     )
-    assert (
-        ".\\dist_exe\\chatlog-keeper.exe --_qq-sqlite-helper --runtime-probe"
-        in workflow
-    )
+    assert "& $executable --_qq-sqlite-helper --runtime-probe" in workflow
     assert (
         "conda-incubator/setup-miniconda@"
         "835234971496cad1653abb28a638a281cf32541f"
@@ -188,7 +185,13 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
         in workflow
     )
     assert workflow.count("sys.version_info[:3] == (3, 11, 15)") == 2
-    assert workflow.count("sys.prefix == os.environ['CONDA_PREFIX']") == 2
+    assert workflow.count("sys.prefix == sys.base_prefix") == 1
+    assert workflow.count(
+        "os.path.samefile(os.path.dirname(sys.executable), os.environ['CONDA_PREFIX'])"
+    ) == 1
+    assert workflow.count(
+        "os.path.isdir(os.path.join(sys.prefix, 'Library', 'bin'))"
+    ) == 1
     assert workflow.count("CONDA_DEFAULT_ENV") == 2
     assert workflow.count("platform.machine() == 'arm64'") == 1
     assert workflow.count("platform.machine().lower() in {'amd64', 'x86_64'}") == 1
@@ -201,10 +204,26 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert ". pytest pyinstaller==" not in workflow
     assert workflow.count("shell: bash -el {0}") == 1
     assert workflow.count("set -euo pipefail") == 7
+    assert "Verify standalone executable outside the build environment" in workflow
+    assert '$ErrorActionPreference = "Stop"' in workflow
+    assert "$originalPath = $env:PATH" in workflow
+    assert "Resolve-Path -LiteralPath .\\dist_exe\\chatlog-keeper.exe" in workflow
+    assert "Join-Path $env:RUNNER_TEMP" in workflow
+    assert "New-Item -ItemType Directory -Path $standaloneWorkdir" in workflow
+    assert "Push-Location $standaloneWorkdir" in workflow
     assert (
-        ".\\dist_exe\\chatlog-keeper.exe --help\n"
-        "          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+        '$env:PATH = "$env:SystemRoot\\System32;$env:SystemRoot;'
+        '$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0"'
     ) in workflow
+    assert "$env:PATH = $originalPath" in workflow
+    assert "Pop-Location" in workflow
+    assert "& $executable --help" in workflow
+    assert "standalone help probe failed" in workflow
+    assert "standalone SQLite probe failed" in workflow
+    assert "& $executable message-stream-v1 --capabilities" in workflow
+    assert "& $executable participant-directory-v1 --capabilities" in workflow
+    assert "& $executable key-identity-v1 --capabilities" in workflow
+    assert "& $executable probe" in workflow
 
 
 def test_ci_covers_release_python_and_runs_the_runtime_probe_on_windows():
@@ -248,10 +267,40 @@ def test_ci_covers_release_python_and_runs_the_runtime_probe_on_windows():
         + "\n          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
         in workflow
     )
-    assert workflow.count("sys.prefix == os.environ['CONDA_PREFIX']") == 2
+    assert workflow.count("sys.prefix == sys.base_prefix") == 1
+    assert workflow.count(
+        "os.path.samefile(os.path.dirname(sys.executable), os.environ['CONDA_PREFIX'])"
+    ) == 1
+    assert workflow.count(
+        "os.path.isdir(os.path.join(sys.prefix, 'Library', 'bin'))"
+    ) == 1
     assert workflow.count("CONDA_DEFAULT_ENV") == 2
     assert workflow.count("platform.machine() == 'arm64'") == 1
     assert workflow.count("platform.machine().lower() in {'amd64', 'x86_64'}") == 1
+    assert "python -m PyInstaller packaging/chatlog_keeper.spec" in workflow
+    assert "Verify standalone executable outside the build environment" in workflow
+    assert '$ErrorActionPreference = "Stop"' in workflow
+    assert "$originalPath = $env:PATH" in workflow
+    assert "Resolve-Path -LiteralPath .\\dist_exe\\chatlog-keeper.exe" in workflow
+    assert "Join-Path $env:RUNNER_TEMP" in workflow
+    assert "New-Item -ItemType Directory -Path $standaloneWorkdir" in workflow
+    assert "Push-Location $standaloneWorkdir" in workflow
+    assert (
+        '$env:PATH = "$env:SystemRoot\\System32;$env:SystemRoot;'
+        '$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0"'
+    ) in workflow
+    assert "$env:PATH = $originalPath" in workflow
+    assert "Pop-Location" in workflow
+    assert "& $executable --help" in workflow
+    assert (
+        "& $executable --_qq-sqlite-helper --runtime-probe"
+        in workflow
+    )
+    assert "& $executable message-stream-v1 --capabilities" in workflow
+    assert "& $executable participant-directory-v1 --capabilities" in workflow
+    assert "& $executable key-identity-v1 --capabilities" in workflow
+    assert "& $executable probe" in workflow
+    assert "release_metadata.py validate-capabilities" in workflow
 
 
 def test_ci_push_runs_for_main_and_release_branches() -> None:
