@@ -1,4 +1,6 @@
+import os
 import plistlib
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +21,16 @@ def _debugger_entitlements_xml():
         {"com.apple.security.cs.debugger": True},
         fmt=plistlib.FMT_XML,
     ).decode("utf-8")
+
+
+def _watchdog_launch_fixture(tmp_path):
+    app = tmp_path / "debug-apps" / "WeChat.app"
+    executable = app / "Contents" / "MacOS" / "WeChat"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fixture")
+    executable.chmod(0o700)
+    app.chmod(0o700)
+    return app, executable
 
 
 def test_parse_candidates_deduplicates_and_rejects_noise():
@@ -451,6 +463,7 @@ def test_process_identity_parser_keeps_path_internal(monkeypatch, tmp_path):
     helper = tmp_path / "scanner"
     helper.write_text("", encoding="utf-8")
     expected_path = b"/tmp/isolated-client"
+    monkeypatch.setattr(macos_key, "_LAST_ERROR", "stale_failure")
     monkeypatch.setattr(
         macos_key.subprocess,
         "run",
@@ -470,6 +483,7 @@ def test_process_identity_parser_keeps_path_internal(monkeypatch, tmp_path):
         100,
         200,
     )
+    assert macos_key.last_error() == ""
 
 
 def test_mach_helper_enforces_kernel_path_and_start_generation():
@@ -480,6 +494,262 @@ def test_mach_helper_enforces_kernel_path_and_start_generation():
     assert source.index("identity_matches(pid, &expected)") < source.index(
         "task_for_pid"
     )
+
+
+def test_watchdog_is_durably_recorded_before_launch_authorization(
+    monkeypatch,
+    tmp_path,
+):
+    helper = tmp_path / "bin" / "macos-memory-scan-0123456789ab"
+    helper.parent.mkdir(mode=0o700)
+    helper.write_bytes(b"helper")
+    helper.chmod(0o700)
+    app, executable = _watchdog_launch_fixture(tmp_path)
+    events = []
+    spawned_argv = []
+
+    class Input:
+        def write(self, value):
+            events.append(("write", value))
+            return len(value)
+
+        def flush(self):
+            events.append(("flush", None))
+
+        def close(self):
+            events.append(("close", None))
+
+    class Process:
+        pid = 4321
+        stdin = Input()
+        stdout = object()
+
+        def poll(self):
+            return None
+
+    process = Process()
+    markers = iter([b"WATCH_ARMED", b"WATCH_LAUNCHED"])
+    monkeypatch.setattr(macos_key, "ensure_helper", lambda: helper)
+    monkeypatch.setattr(macos_key, "_trusted_helper_for_launch", lambda _path: True)
+    monkeypatch.setattr(
+        macos_key.subprocess,
+        "Popen",
+        lambda argv, **_kwargs: spawned_argv.append(argv) or process,
+    )
+    monkeypatch.setattr(
+        macos_key,
+        "_watchdog_marker",
+        lambda _process, expected, **_kwargs: (
+            events.append(("marker", expected)) or next(markers) == expected
+        ),
+    )
+    monkeypatch.setattr(
+        macos_key,
+        "process_identity",
+        lambda *_args, **_kwargs: (str(helper).encode(), 100, 200),
+    )
+    monkeypatch.setattr(
+        macos_key,
+        "_file_digest_and_identity",
+        lambda *_args, **_kwargs: (b"d" * 32, 1, 2),
+    )
+
+    def durable(record):
+        events.append(("durable", record["pid"]))
+
+    macos_key._LAST_ERROR = ""
+    result = macos_key.launch_debug_copy_watchdog(
+        "wechat",
+        executable,
+        app,
+        durable_record=durable,
+    )
+    assert result is process
+    executable_info = executable.lstat()
+    app_info = app.lstat()
+    assert spawned_argv[0][3:] == [
+        os.fsencode(executable.resolve(strict=True)).hex(),
+        str(executable_info.st_uid),
+        str(executable_info.st_dev),
+        str(executable_info.st_ino),
+        str(stat.S_IFMT(executable_info.st_mode)),
+        os.fsencode(app.resolve(strict=True)).hex(),
+        str(app_info.st_uid),
+        str(app_info.st_dev),
+        str(app_info.st_ino),
+        str(stat.S_IFMT(app_info.st_mode)),
+    ]
+    assert events.index(("marker", b"WATCH_ARMED")) < events.index(
+        ("durable", 4321)
+    ) < events.index(("write", b"L")) < events.index(
+        ("marker", b"WATCH_LAUNCHED")
+    )
+
+
+def test_watchdog_durable_failure_never_authorizes_launch(monkeypatch, tmp_path):
+    helper = tmp_path / "bin" / "macos-memory-scan-0123456789ab"
+    helper.parent.mkdir(mode=0o700)
+    helper.write_bytes(b"helper")
+    helper.chmod(0o700)
+    app, executable = _watchdog_launch_fixture(tmp_path)
+    writes = []
+
+    class Input:
+        def write(self, value):
+            writes.append(value)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            writes.append(b"closed")
+
+    class Process:
+        pid = 4322
+        stdin = Input()
+        stdout = object()
+        exited = False
+
+        def poll(self):
+            return 0 if self.exited else None
+
+        def wait(self, timeout=None):
+            self.exited = True
+            return 6
+
+    process = Process()
+    monkeypatch.setattr(macos_key, "ensure_helper", lambda: helper)
+    monkeypatch.setattr(macos_key, "_trusted_helper_for_launch", lambda _path: True)
+    monkeypatch.setattr(macos_key.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(macos_key, "_watchdog_marker", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        macos_key,
+        "process_identity",
+        lambda *_args, **_kwargs: (str(helper).encode(), 100, 200),
+    )
+    monkeypatch.setattr(
+        macos_key,
+        "_file_digest_and_identity",
+        lambda *_args, **_kwargs: (b"d" * 32, 1, 2),
+    )
+    macos_key._LAST_ERROR = ""
+    assert macos_key.launch_debug_copy_watchdog(
+        "wechat",
+        executable,
+        app,
+        durable_record=lambda _record: (_ for _ in ()).throw(RuntimeError("disk")),
+    ) is None
+    assert b"L" not in writes
+    assert b"closed" in writes
+
+
+def test_watchdog_freezes_capture_library_and_fifo_identity(monkeypatch, tmp_path):
+    helper = tmp_path / "bin" / "macos-memory-scan-0123456789ab"
+    helper.parent.mkdir(mode=0o700)
+    helper.write_bytes(b"helper")
+    helper.chmod(0o700)
+    app, executable = _watchdog_launch_fixture(tmp_path)
+    capture_library = tmp_path / "capture.dylib"
+    capture_library.write_bytes(b"capture")
+    capture_library.chmod(0o700)
+    capture_fifo = tmp_path / "capture.fifo"
+    os.mkfifo(capture_fifo, 0o600)
+    spawned_argv = []
+
+    class Input:
+        def write(self, value):
+            return len(value)
+
+        def flush(self):
+            pass
+
+    class Process:
+        pid = 4323
+        stdin = Input()
+        stdout = object()
+
+        def poll(self):
+            return None
+
+    process = Process()
+    monkeypatch.setattr(macos_key, "ensure_helper", lambda: helper)
+    monkeypatch.setattr(macos_key, "_trusted_helper_for_launch", lambda _path: True)
+    monkeypatch.setattr(
+        macos_key.subprocess,
+        "Popen",
+        lambda argv, **_kwargs: spawned_argv.append(argv) or process,
+    )
+    monkeypatch.setattr(macos_key, "_watchdog_marker", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        macos_key,
+        "process_identity",
+        lambda *_args, **_kwargs: (str(helper).encode(), 100, 200),
+    )
+    monkeypatch.setattr(
+        macos_key,
+        "_file_digest_and_identity",
+        lambda *_args, **_kwargs: (b"d" * 32, 1, 2),
+    )
+
+    assert macos_key.launch_debug_copy_watchdog(
+        "wechat",
+        executable,
+        app,
+        capture_library=capture_library,
+        capture_fifo=capture_fifo,
+    ) is process
+    library_info = capture_library.lstat()
+    fifo_info = capture_fifo.lstat()
+    assert spawned_argv[0][13:] == [
+        os.fsencode(capture_library.resolve(strict=True)).hex(),
+        str(library_info.st_uid),
+        str(library_info.st_dev),
+        str(library_info.st_ino),
+        str(stat.S_IFMT(library_info.st_mode)),
+        os.fsencode(capture_fifo.resolve(strict=True)).hex(),
+        str(fifo_info.st_uid),
+        str(fifo_info.st_dev),
+        str(fifo_info.st_ino),
+        str(stat.S_IFMT(fifo_info.st_mode)),
+    ]
+
+
+def test_launch_path_identity_rejects_symlink_and_unsafe_permissions(tmp_path):
+    target = tmp_path / "target"
+    target.write_bytes(b"target")
+    target.chmod(0o700)
+    link = tmp_path / "link"
+    link.symlink_to(target)
+
+    assert macos_key._launch_path_identity(
+        link,
+        expected_type=stat.S_IFREG,
+    ) is None
+    target.chmod(0o722)
+    assert macos_key._launch_path_identity(
+        target,
+        expected_type=stat.S_IFREG,
+    ) is None
+
+
+def test_launch_path_arguments_use_kernel_canonical_parent_alias(tmp_path):
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    target = real_parent / "target"
+    target.write_bytes(b"target")
+    target.chmod(0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    alias_target = alias / "target"
+    identity = macos_key._launch_path_identity(
+        alias_target,
+        expected_type=stat.S_IFREG,
+        expected_permissions=0o700,
+    )
+
+    assert identity is not None
+    arguments = macos_key._launch_path_arguments(alias_target, identity)
+    assert bytes.fromhex(arguments[0]) == os.fsencode(target.resolve(strict=True))
 
 
 def test_runtime_flag_parser_rejects_path_only_runtime_word(

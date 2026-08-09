@@ -6,20 +6,23 @@ import hashlib
 import os
 import plistlib
 import re
+import select
+import signal
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from chatlog_keeper.core._path_resolver import data_dir
 
 _LAST_ERROR = ""
 _DEBUGGER_ENTITLEMENTS = {"com.apple.security.cs.debugger": True}
-_HELPER_FORMAT = b"hardened-runtime-same-uid-pid-identity-v3"
+_HELPER_FORMAT = b"hardened-runtime-same-uid-pid-identity-owner-watch-v6"
 _RUNTIME_FLAGS_RE = re.compile(
     r"^CodeDirectory\b[^\n]*\bflags=0x[0-9a-f]+\([^\n)]*\bruntime\b[^\n)]*\)",
     re.IGNORECASE | re.MULTILINE,
@@ -33,6 +36,7 @@ _MAX_UNIQUE_CANDIDATES = 250_000
 _TRUSTED_HELPER: Optional[tuple[bytes, Path, bytes, int, int]] = None
 
 _ProcessIdentity = tuple[bytes, int, int]
+_LaunchPathIdentity = tuple[int, int, int, int]
 
 
 def _source_path() -> Path:
@@ -497,6 +501,8 @@ def _stderr_codes(text: str) -> set[str]:
             codes.add("process_identity_unavailable")
         elif "invalid_process_identity" in line:
             codes.add("invalid_process_identity")
+        elif "owner_process_lost" in line:
+            codes.add("owner_process_lost")
         elif line.strip():
             codes.add("helper_error")
     return codes
@@ -507,6 +513,7 @@ def _safe_helper_error(returncode: int, codes: set[str]) -> str:
         "process_identity_mismatch",
         "process_identity_unavailable",
         "invalid_process_identity",
+        "owner_process_lost",
         "process_access_denied",
     ):
         if preferred in codes:
@@ -522,6 +529,7 @@ def process_identity(
 ) -> Optional[_ProcessIdentity]:
     """Return exact path bytes and kernel start sec/usec for one PID."""
     global _LAST_ERROR
+    _LAST_ERROR = ""
     if not isinstance(pid, int) or pid <= 0:
         _LAST_ERROR = "invalid_process_identity"
         return None
@@ -584,6 +592,446 @@ def process_identity(
     return path, start_sec, start_usec
 
 
+def _parsed_recorded_helper(
+    record: dict[str, Any],
+) -> tuple[Path, _ProcessIdentity, bytes, tuple[int, int]]:
+    """验证持久化字段，但不要求旧 artifact 仍存在。"""
+
+    required = {
+        "schema",
+        "operation_id",
+        "source",
+        "path_hex",
+        "pid",
+        "start_sec",
+        "start_usec",
+        "file_digest_hex",
+        "file_device",
+        "file_inode",
+    }
+    if (
+        type(record) is not dict
+        or set(record) != required
+        or record.get("schema") not in {
+            "chatlog-keeper.key-recovery-macos-helper.v1",
+            "chatlog-keeper.key-recovery-macos-watchdog.v1",
+        }
+        or record.get("source") not in {"qq", "wechat"}
+        or type(record.get("operation_id")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", record["operation_id"]) is None
+        or type(record.get("path_hex")) is not str
+        or type(record.get("file_digest_hex")) is not str
+        or type(record.get("pid")) is not int
+        or record["pid"] <= 0
+        or type(record.get("start_sec")) is not int
+        or record["start_sec"] <= 0
+        or type(record.get("start_usec")) is not int
+        or not 0 <= record["start_usec"] < 1_000_000
+        or type(record.get("file_device")) is not int
+        or record["file_device"] < 0
+        or type(record.get("file_inode")) is not int
+        or record["file_inode"] <= 0
+    ):
+        raise ValueError("invalid recorded helper")
+    try:
+        path_bytes = bytes.fromhex(record["path_hex"])
+        artifact_digest = bytes.fromhex(record["file_digest_hex"])
+    except ValueError as exc:
+        raise ValueError("invalid recorded helper") from exc
+    if (
+        not path_bytes.startswith(b"/")
+        or b"\0" in path_bytes
+        or len(path_bytes) > 4095
+        or len(artifact_digest) != 32
+    ):
+        raise ValueError("invalid recorded helper")
+    helper = Path(os.fsdecode(path_bytes))
+    try:
+        canonical_bytes = os.fsencode(os.path.abspath(os.fspath(helper)))
+    except OSError as exc:
+        raise ValueError("invalid recorded helper") from exc
+    if (
+        canonical_bytes != path_bytes
+        or re.fullmatch(r"macos-memory-scan-[0-9a-f]{12}", helper.name) is None
+        or helper.parent.name != "bin"
+    ):
+        raise ValueError("invalid recorded helper")
+    return (
+        helper,
+        (path_bytes, record["start_sec"], record["start_usec"]),
+        artifact_digest,
+        (record["file_device"], record["file_inode"]),
+    )
+
+
+def _validated_recorded_helper(
+    record: dict[str, Any],
+) -> tuple[Path, _ProcessIdentity]:
+    """重新验证一个 live helper artifact 及其已记录代际。"""
+
+    helper, expected, artifact_digest, file_identity = _parsed_recorded_helper(
+        record
+    )
+    try:
+        parent = helper.parent.lstat()
+    except OSError as exc:
+        raise ValueError("invalid recorded helper") from exc
+    if (
+        helper.parent.is_symlink()
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        raise ValueError("invalid recorded helper")
+    if _validate_helper_artifact(
+        helper,
+        expected_digest=artifact_digest,
+        expected_identity=file_identity,
+        require_canonical_path=False,
+    ) is None:
+        raise ValueError("invalid recorded helper")
+    return helper, expected
+
+
+def _recorded_pid_is_absent(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return False
+
+
+def _recorded_helper_current_identity(
+    helper: Path,
+    pid: int,
+) -> Optional[_ProcessIdentity]:
+    identity = process_identity(pid, helper=helper, timeout=5)
+    if identity is not None:
+        return identity
+    if _recorded_pid_is_absent(pid):
+        return None
+    # A live/reused PID that cannot be enumerated is not proof that the exact
+    # helper generation ended.  Force callers to retain the lease/journal.
+    raise OSError("recorded helper process identity is unavailable")
+
+
+def recorded_helper_is_running(record: dict[str, Any]) -> bool:
+    """返回 journal 中 helper 精确代际是否仍存活。"""
+
+    if sys.platform != "darwin":
+        return False
+    _helper, _expected, _digest, _identity = _parsed_recorded_helper(record)
+    if _recorded_pid_is_absent(record["pid"]):
+        return False
+    try:
+        helper, expected = _validated_recorded_helper(record)
+    except ValueError:
+        if _recorded_pid_is_absent(record["pid"]):
+            return False
+        raise
+    current = _recorded_helper_current_identity(helper, record["pid"])
+    return current == expected
+
+
+def terminate_recorded_helper(record: dict[str, Any]) -> bool:
+    """只终止 helper 的精确代际，绝不终止日常聊天客户端。"""
+
+    if sys.platform != "darwin":
+        return True
+    pid = record["pid"]
+    _helper, _expected, _digest, _identity = _parsed_recorded_helper(record)
+    if _recorded_pid_is_absent(pid):
+        return True
+    try:
+        helper, expected = _validated_recorded_helper(record)
+    except ValueError:
+        if _recorded_pid_is_absent(pid):
+            return True
+        raise
+    current = _recorded_helper_current_identity(helper, pid)
+    if current is None or current != expected:
+        return True
+    os.kill(pid, signal.SIGTERM)
+    watchdog = (
+        record.get("schema")
+        == "chatlog-keeper.key-recovery-macos-watchdog.v1"
+    )
+    deadline = time.monotonic() + (40 if watchdog else 5)
+    while time.monotonic() < deadline:
+        current = _recorded_helper_current_identity(helper, pid)
+        if current is None or current != expected:
+            return True
+        time.sleep(0.05)
+    if watchdog:
+        # The watcher owns a bounded late-launch cleanup grace.  SIGKILL here
+        # could strand the exact private target it is responsible for.
+        return False
+    # Revalidate the generation immediately before escalation.  PID reuse or
+    # any identity uncertainty fails closed without signaling the new process.
+    current = _recorded_helper_current_identity(helper, pid)
+    if current != expected:
+        return current is None
+    os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        current = _recorded_helper_current_identity(helper, pid)
+        if current is None or current != expected:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _watchdog_marker(
+    process: subprocess.Popen,
+    expected: bytes,
+    *,
+    timeout: float,
+) -> bool:
+    if process.stdout is None:
+        return False
+    ready, _, _ = select.select([process.stdout.fileno()], [], [], max(0.1, timeout))
+    if not ready:
+        return False
+    line = process.stdout.readline(len(expected) + 2)
+    return line == expected + b"\n"
+
+
+def request_debug_copy_watchdog_cleanup(
+    process: subprocess.Popen,
+    *,
+    timeout: float = 45.0,
+) -> bool:
+    """请求已就绪 watcher 清理其私有目标的精确进程代际。"""
+
+    if process.poll() is None and process.stdin is not None:
+        try:
+            process.stdin.write(b"C")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    try:
+        return process.wait(timeout=max(1.0, timeout)) == 0
+    except subprocess.TimeoutExpired:
+        # Killing an uncertain watcher could strand the target it owns.  Keep
+        # the durable record active so cross-process control can retry.
+        return False
+    finally:
+        if process.poll() is not None and process.stdout is not None:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+
+
+def debug_copy_watchdog_is_running(process: subprocess.Popen) -> bool:
+    return process.poll() is None
+
+
+def _launch_path_identity(
+    path: Path,
+    *,
+    expected_type: int,
+    expected_permissions: Optional[int] = None,
+) -> Optional[_LaunchPathIdentity]:
+    """冻结启动路径的属主、设备、inode 和文件类型，并拒绝符号链接。"""
+
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    file_type = stat.S_IFMT(info.st_mode)
+    permissions = stat.S_IMODE(info.st_mode)
+    if (
+        info.st_uid != os.geteuid()
+        or file_type != expected_type
+        or stat.S_ISLNK(info.st_mode)
+        or permissions & 0o022
+        or (
+            expected_permissions is not None
+            and permissions != expected_permissions
+        )
+    ):
+        return None
+    return info.st_uid, info.st_dev, info.st_ino, file_type
+
+
+def _launch_path_arguments(
+    path: Path,
+    identity: _LaunchPathIdentity,
+) -> list[str]:
+    """把已冻结路径编码为不经 shell 解析的 watchdog 参数。"""
+
+    canonical = Path(os.path.realpath(os.fspath(path), strict=True))
+    current = canonical.lstat()
+    current_identity = (
+        current.st_uid,
+        current.st_dev,
+        current.st_ino,
+        stat.S_IFMT(current.st_mode),
+    )
+    if current_identity != identity or stat.S_ISLNK(current.st_mode):
+        raise ValueError("launch path generation changed")
+    path_bytes = os.fsencode(canonical)
+    if not path_bytes.startswith(b"/") or b"\0" in path_bytes:
+        raise ValueError("invalid launch path")
+    return [path_bytes.hex(), *(str(value) for value in identity)]
+
+
+def launch_debug_copy_watchdog(
+    source: str,
+    executable: Path,
+    app_bundle: Path,
+    *,
+    capture_library: Optional[Path] = None,
+    capture_fifo: Optional[Path] = None,
+    durable_record: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> Optional[subprocess.Popen]:
+    """先冻结并记录 watchdog，再授权它启动和清理私有客户端。"""
+
+    global _LAST_ERROR
+    _LAST_ERROR = ""
+    if sys.platform != "darwin" or source not in {"qq", "wechat"}:
+        _LAST_ERROR = "watchdog_unavailable"
+        return None
+    helper = ensure_helper()
+    if helper is None or not _trusted_helper_for_launch(helper):
+        if not _LAST_ERROR:
+            _LAST_ERROR = "watchdog_unavailable"
+        return None
+    capture_requested = capture_library is not None or capture_fifo is not None
+    if capture_requested and (
+        source != "wechat" or capture_library is None or capture_fifo is None
+    ):
+        _LAST_ERROR = "watchdog_launch_invalid"
+        return None
+    try:
+        executable_identity = _launch_path_identity(
+            executable,
+            expected_type=stat.S_IFREG,
+        )
+        app_identity = _launch_path_identity(
+            app_bundle,
+            expected_type=stat.S_IFDIR,
+            expected_permissions=0o700,
+        )
+        if executable_identity is None or app_identity is None:
+            raise ValueError("invalid launch identity")
+        argv = [
+            str(helper),
+            "watch-launch",
+            str(os.getpid()),
+            *_launch_path_arguments(executable, executable_identity),
+            *_launch_path_arguments(app_bundle, app_identity),
+        ]
+        if capture_requested:
+            capture_library_identity = _launch_path_identity(
+                capture_library,
+                expected_type=stat.S_IFREG,
+                expected_permissions=0o700,
+            )
+            capture_fifo_identity = _launch_path_identity(
+                capture_fifo,
+                expected_type=stat.S_IFIFO,
+                expected_permissions=0o600,
+            )
+            if (
+                capture_library_identity is None
+                or capture_fifo_identity is None
+            ):
+                raise ValueError("invalid capture identity")
+            argv.extend(
+                _launch_path_arguments(
+                    capture_library,
+                    capture_library_identity,
+                )
+            )
+            argv.extend(
+                _launch_path_arguments(
+                    capture_fifo,
+                    capture_fifo_identity,
+                )
+            )
+    except (OSError, TypeError, ValueError):
+        _LAST_ERROR = "watchdog_launch_invalid"
+        return None
+
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+            close_fds=True,
+        )
+    except OSError as exc:
+        _LAST_ERROR = f"watchdog_launch_failed:{type(exc).__name__}"
+        return None
+    launch_authorized = False
+    try:
+        if not _watchdog_marker(process, b"WATCH_ARMED", timeout=10):
+            _LAST_ERROR = "watchdog_arm_failed"
+            return None
+        helper_process_identity = process_identity(
+            process.pid,
+            helper=helper,
+            timeout=5,
+        )
+        helper_file_identity = _file_digest_and_identity(helper, expected_mode=0o700)
+        if helper_process_identity is None or helper_file_identity is None:
+            _LAST_ERROR = "watchdog_durable_record_failed"
+            return None
+        if durable_record is not None:
+            helper_path, start_sec, start_usec = helper_process_identity
+            durable_record(
+                {
+                    "source": source,
+                    "path_hex": helper_path.hex(),
+                    "pid": process.pid,
+                    "start_sec": start_sec,
+                    "start_usec": start_usec,
+                    "file_digest_hex": helper_file_identity[0].hex(),
+                    "file_device": helper_file_identity[1],
+                    "file_inode": helper_file_identity[2],
+                }
+            )
+        if process.stdin is None:
+            _LAST_ERROR = "watchdog_arm_failed"
+            return None
+        process.stdin.write(b"L")
+        process.stdin.flush()
+        launch_authorized = True
+        if not _watchdog_marker(process, b"WATCH_LAUNCHED", timeout=30):
+            _LAST_ERROR = "watchdog_launch_failed"
+            return None
+        return process
+    except Exception:
+        _LAST_ERROR = "watchdog_durable_record_failed"
+        return None
+    finally:
+        if process.poll() is None and not launch_authorized:
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+                process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        elif process.poll() is None and launch_authorized and _LAST_ERROR.startswith(
+            "watchdog_"
+        ):
+            request_debug_copy_watchdog_cleanup(process)
+
+
 def _run_helper_candidates(
     source: str,
     pid: int,
@@ -591,6 +1039,7 @@ def _run_helper_candidates(
     elevate: bool,
     timeout: int,
     expected_identity: Optional[_ProcessIdentity] = None,
+    _recovery_helper_notify: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> list[bytes]:
     """Stream bounded candidates without retaining the helper transcript."""
     global _LAST_ERROR
@@ -643,6 +1092,7 @@ def _run_helper_candidates(
         str(start_sec),
         str(start_usec),
         path.hex(),
+        str(os.getpid()),
     ]
     try:
         process = subprocess.Popen(
@@ -657,6 +1107,49 @@ def _run_helper_candidates(
     except OSError as exc:
         _LAST_ERROR = f"helper_launch_failed:{type(exc).__name__}"
         return []
+
+    if _recovery_helper_notify is not None:
+        helper_process_identity = process_identity(
+            process.pid,
+            helper=helper,
+            timeout=min(max(1, int(timeout)), 5),
+        )
+        helper_file_identity = _file_digest_and_identity(
+            helper,
+            expected_mode=0o700,
+        )
+        if helper_process_identity is None or helper_file_identity is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            _LAST_ERROR = "helper_durable_record_failed"
+            return []
+        helper_path, helper_start_sec, helper_start_usec = helper_process_identity
+        try:
+            _recovery_helper_notify(
+                {
+                    "source": source,
+                    "path_hex": helper_path.hex(),
+                    "pid": process.pid,
+                    "start_sec": helper_start_sec,
+                    "start_usec": helper_start_usec,
+                    "file_digest_hex": helper_file_identity[0].hex(),
+                    "file_device": helper_file_identity[1],
+                    "file_inode": helper_file_identity[2],
+                }
+            )
+        except Exception:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            _LAST_ERROR = "helper_durable_record_failed"
+            return []
 
     def fail_output() -> None:
         state["invalid"] = True
@@ -815,6 +1308,7 @@ def extract_verified(
     elevate: bool = False,
     timeout: int = 120,
     expected_identity: Optional[_ProcessIdentity] = None,
+    _recovery_helper_notify: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> Optional[bytes]:
     """Return the first DB-verified candidate; unverified bytes are discarded.
 
@@ -829,6 +1323,7 @@ def extract_verified(
         elevate=elevate,
         timeout=timeout,
         expected_identity=expected_identity,
+        _recovery_helper_notify=_recovery_helper_notify,
     )
     if primary_verify is not None:
         for candidate in candidates:

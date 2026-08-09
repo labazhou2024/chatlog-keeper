@@ -35,6 +35,11 @@ def test_probe_wechat_never_scans(monkeypatch):
     monkeypatch.setattr(wechat_db, "_get_weixin_pids", lambda: [4321])
     monkeypatch.setattr(wechat_db, "find_weixin_data_root", lambda: Path("X:/fake/xwechat_files"))
     monkeypatch.setattr(wechat_db, "find_wxid_dirs", lambda root: [Path("X:/fake/xwechat_files/wxid_demo")])
+    monkeypatch.setattr(
+        wechat_db,
+        "find_msg_databases",
+        lambda _root: [Path("X:/fake/xwechat_files/wxid_demo/message_0.db")],
+    )
     monkeypatch.setattr(wechat_db, "load_cached_wechat_key_for_account", lambda _account: None)
 
     r = cli._probe_wechat()
@@ -42,6 +47,43 @@ def test_probe_wechat_never_scans(monkeypatch):
     assert r["available"] is False        # no cached key → can't decrypt yet
     assert r["client_running"] is True    # process located
     assert r["needs_key"] is True         # running + data + no key → guide to 取密钥
+
+
+def test_probe_wechat_closed_client_with_database_still_needs_key(monkeypatch):
+    """A local archive remains recoverable/actionable after WeChat exits."""
+
+    from chatlog_keeper import cli, wechat_db
+
+    monkeypatch.setattr(wechat_db, "_get_weixin_pids", lambda: [])
+    monkeypatch.setattr(
+        wechat_db,
+        "find_weixin_data_root",
+        lambda: Path("X:/fake/xwechat_files"),
+    )
+    monkeypatch.setattr(
+        wechat_db,
+        "find_wxid_dirs",
+        lambda _root: [Path("X:/fake/xwechat_files/wxid_demo")],
+    )
+    monkeypatch.setattr(
+        wechat_db,
+        "find_msg_databases",
+        lambda _root: [Path("X:/fake/xwechat_files/wxid_demo/message_0.db")],
+    )
+    monkeypatch.setattr(
+        cli,
+        "_wechat_key_target_snapshots",
+        lambda _root: (_ for _ in ()).throw(
+            cli.wechat_key_identity.TargetError("database_unavailable")
+        ),
+    )
+
+    result = cli._probe_wechat()
+
+    assert result["available"] is False
+    assert result["client_running"] is False
+    assert result["enc_keys_present"] is False
+    assert result["needs_key"] is True
 
 
 def test_probe_wechat_available_with_cached_key(monkeypatch, tmp_path):

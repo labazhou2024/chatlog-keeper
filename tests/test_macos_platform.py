@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,7 +58,8 @@ def test_macos_process_pids_fail_closed_off_macos(monkeypatch):
 def test_macos_exact_executable_pid_match(monkeypatch):
     monkeypatch.setattr(_macos, "is_macos", lambda: True)
     exact = Path("/tmp/WeChat-copy.app/Contents/MacOS/WeChat")
-    stdout = f" 7 {exact}\n 8 {exact} --flag\n 9 /Applications/WeChat.app/Contents/MacOS/WeChat"
+    canonical = os.path.realpath(exact)
+    stdout = f" 7 {canonical}\n 8 {canonical} --flag\n 9 /Applications/WeChat.app/Contents/MacOS/WeChat"
     monkeypatch.setattr(
         _macos.subprocess,
         "run",

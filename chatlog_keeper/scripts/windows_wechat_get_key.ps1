@@ -52,6 +52,7 @@ param(
     [Parameter()] [string]$DbPath,
     [Parameter()] [switch]$NoDebugForKey,
     [Parameter()] [bool]$KillExisting = $true,
+    [Parameter()] [switch]$RequireClosedClient,
     [Parameter()] [ValidateRange(1, 3600)] [int]$TimeoutSeconds = 600
 )
 
@@ -351,6 +352,7 @@ namespace DebugApiWx
             { var sb = new StringBuilder(); foreach (var r in _functionRvas) sb.Append("0x" + r.ToString("X") + " "); _log("  目标函数 RVA (" + _functionRvas.Length + "): " + sb.ToString().Trim()); }
             if (!StartDebugProcess())
                 throw new Exception("CreateProcessW(DEBUG) 失败, 错误: " + Marshal.GetLastWin32Error());
+            _log("CHATLOG_KEY_RECOVERY_CLIENT_OPEN_V1");
             _log("微信主进程已启动, PID=" + _mainPid + " — 请在弹出的微信里扫码/登录目标账号。");
             try { return DebugLoop(); }
             finally { Cleanup(); }
@@ -945,9 +947,11 @@ Write-Host ("HMAC 校验库: {0}" -f $DbPath) -ForegroundColor Cyan
 $page1 = Get-DbPage1 -Path $DbPath
 
 $weixinExe = $info.WeixinExe
-
-if ($KillExisting) {
-    $running = @(Get-Process -Name 'Weixin' -ErrorAction SilentlyContinue)
+$running = @(Get-Process -Name 'Weixin' -ErrorAction SilentlyContinue)
+if ($RequireClosedClient -and $running.Count -gt 0) {
+    throw '日常微信客户端仍在运行；私有恢复协议禁止自动关闭正常客户端'
+}
+if ($KillExisting -and -not $RequireClosedClient) {
     if ($running.Count -gt 0) {
         Write-Host ("检测到微信正在运行 (PID: {0}) — 临时关闭以便调试实例接管…" -f ($running.Id -join ', ')) -ForegroundColor Yellow
         foreach ($p in $running) { try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {} }

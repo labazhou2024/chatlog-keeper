@@ -43,14 +43,17 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
-from pathlib import Path
-from typing import List, Optional
+from pathlib import Path, PureWindowsPath
+from typing import Callable, List, Optional
+
+from chatlog_keeper.core._private_temp import (
+    cleanup_private_temp_dir,
+    create_private_temp_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +65,11 @@ _MACOS_WECHAT_SCAN_SLICE_SECONDS = 60
 _MACOS_WECHAT_LOGIN_POLL_SECONDS = 2.0
 _MACOS_WECHAT_MAX_ORACLES = 64
 _MAX_ACTIVE_TRANSCRIPT_BYTES = 1024 * 1024
+_RECOVERY_CLIENT_OPEN_MARKER = "CHATLOG_KEY_RECOVERY_CLIENT_OPEN_V1"
+_RECOVERY_OPERATION_ID_RE = re.compile(r"[0-9a-f]{64}")
 _BUNDLED_SCRIPT_SHA256 = {
-    "windows_ntqq_get_key.ps1": "78502d5357a73633df9d6d784986c3297460ac87a9a15d4a5f726480a1cd3161",
-    "windows_wechat_get_key.ps1": "26757546e0c6da0cb156c41f8ee7582e69db2cd38a5576399c1e7b9ebb4e74da",
+    "windows_ntqq_get_key.ps1": "afae9d5c54352bb796d70715a2860d96c1ef7181ce765cf2ebd297534a0d4ada",
+    "windows_wechat_get_key.ps1": "8e0e91d32ce6a09cc760b8304f33c6cf782346b0c953cd6abcbdff3753c456f1",
 }
 
 
@@ -409,7 +414,618 @@ def _read_active_transcript(path: Path) -> str:
         os.close(fd)
 
 
-def _run_active(script: Path, args: List[str], timeout: int) -> str:
+def _windows_recovery_job_name(operation_id: str) -> str:
+    if (
+        type(operation_id) is not str
+        or _RECOVERY_OPERATION_ID_RE.fullmatch(operation_id) is None
+    ):
+        raise ValueError("invalid recovery operation id")
+    return f"Local\\chatlog-keeper-key-recovery-{operation_id}"
+
+
+def _trusted_windows_powershell_path() -> str:
+    """只从内核报告的系统目录解析 PowerShell。"""
+
+    if not _is_windows_host():
+        raise OSError("Windows PowerShell is unavailable")
+    kernel32, wintypes = _windows_job_api()
+    import ctypes
+
+    kernel32.GetSystemDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    kernel32.GetSystemDirectoryW.restype = wintypes.UINT
+    kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetFileAttributesW.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = int(kernel32.GetSystemDirectoryW(buffer, len(buffer)))
+    if length <= 0 or length >= len(buffer):
+        raise OSError(kernel32.GetLastError(), "GetSystemDirectoryW failed")
+    system_directory = PureWindowsPath(buffer.value)
+    if not system_directory.is_absolute() or ".." in system_directory.parts:
+        raise OSError("invalid Windows system directory")
+    executable = system_directory / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    attributes = int(kernel32.GetFileAttributesW(str(executable)))
+    if (
+        attributes == 0xFFFFFFFF
+        or attributes & 0x00000010  # FILE_ATTRIBUTE_DIRECTORY
+        or attributes & 0x00000400  # FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise OSError(
+            kernel32.GetLastError(),
+            "trusted Windows PowerShell is unavailable",
+        )
+    return str(executable)
+
+
+class _WindowsRecoveryJob:
+    """负责一棵私有 PowerShell 进程树的命名 kill-on-close Job Object。"""
+
+    def __init__(self, operation_id: str):
+        if os.name != "nt":
+            raise OSError("Windows Job Objects are unavailable")
+        import ctypes
+        from ctypes import wintypes
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._kernel32 = ctypes.windll.kernel32
+        self._kernel32.CreateJobObjectW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+        ]
+        self._kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        self._kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        self._kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        self._kernel32.TerminateJobObject.argtypes = [
+            wintypes.HANDLE,
+            wintypes.UINT,
+        ]
+        self._kernel32.TerminateJobObject.restype = wintypes.BOOL
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self.name = _windows_recovery_job_name(operation_id)
+        self._kernel32.SetLastError(0)
+        self.handle = self._kernel32.CreateJobObjectW(None, self.name)
+        if not self.handle:
+            raise OSError(self._kernel32.GetLastError(), "CreateJobObjectW failed")
+        if self._kernel32.GetLastError() == 183:
+            self.close()
+            raise FileExistsError("recovery Job Object already exists")
+        limits = ExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = 0x00002000
+        if not self._kernel32.SetInformationJobObject(
+            self.handle,
+            9,
+            self._ctypes.byref(limits),
+            self._ctypes.sizeof(limits),
+        ):
+            error = self._kernel32.GetLastError()
+            self.close()
+            raise OSError(error, "SetInformationJobObject failed")
+
+    def create_suspended_process(
+        self,
+        command: list[str],
+        *,
+        env: dict[str, str],
+    ) -> "_WindowsAtomicRecoveryProcess":
+        """在任何代码运行前，创建已属于本 Job 的 PowerShell。
+
+        即使子进程处于 suspended 状态，在 ``CreateProcess`` 后调用
+        ``AssignProcessToJobObject`` 仍存在硬崩溃窗口。Windows 10 的
+        ``PROC_THREAD_ATTRIBUTE_JOB_LIST`` 会在 ``CreateProcessW`` 内原子关联；独立的 handle
+        list 属性还会把继承范围限制为三个标准流共用的 NUL 句柄。
+        """
+
+        ctypes = self._ctypes
+        wintypes = self._wintypes
+        kernel32 = self._kernel32
+
+        class SecurityAttributes(ctypes.Structure):
+            _fields_ = [
+                ("nLength", wintypes.DWORD),
+                ("lpSecurityDescriptor", ctypes.c_void_p),
+                ("bInheritHandle", wintypes.BOOL),
+            ]
+
+        class StartupInfoW(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("lpReserved", wintypes.LPWSTR),
+                ("lpDesktop", wintypes.LPWSTR),
+                ("lpTitle", wintypes.LPWSTR),
+                ("dwX", wintypes.DWORD),
+                ("dwY", wintypes.DWORD),
+                ("dwXSize", wintypes.DWORD),
+                ("dwYSize", wintypes.DWORD),
+                ("dwXCountChars", wintypes.DWORD),
+                ("dwYCountChars", wintypes.DWORD),
+                ("dwFillAttribute", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("wShowWindow", wintypes.WORD),
+                ("cbReserved2", wintypes.WORD),
+                ("lpReserved2", ctypes.POINTER(wintypes.BYTE)),
+                ("hStdInput", wintypes.HANDLE),
+                ("hStdOutput", wintypes.HANDLE),
+                ("hStdError", wintypes.HANDLE),
+            ]
+
+        class StartupInfoExW(ctypes.Structure):
+            _fields_ = [
+                ("StartupInfo", StartupInfoW),
+                ("lpAttributeList", ctypes.c_void_p),
+            ]
+
+        class ProcessInformation(ctypes.Structure):
+            _fields_ = [
+                ("hProcess", wintypes.HANDLE),
+                ("hThread", wintypes.HANDLE),
+                ("dwProcessId", wintypes.DWORD),
+                ("dwThreadId", wintypes.DWORD),
+            ]
+
+        kernel32.InitializeProcThreadAttributeList.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+        kernel32.UpdateProcThreadAttribute.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+        kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+        kernel32.DeleteProcThreadAttributeList.restype = None
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(SecurityAttributes),
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateProcessW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            ctypes.POINTER(StartupInfoW),
+            ctypes.POINTER(ProcessInformation),
+        ]
+        kernel32.CreateProcessW.restype = wintypes.BOOL
+
+        attribute_size = ctypes.c_size_t()
+        # The sizing call is specified to fail with insufficient-buffer while
+        # returning the exact allocation size.
+        kernel32.InitializeProcThreadAttributeList(
+            None,
+            2,
+            0,
+            ctypes.byref(attribute_size),
+        )
+        if attribute_size.value <= 0:
+            raise OSError(
+                kernel32.GetLastError(),
+                "InitializeProcThreadAttributeList sizing failed",
+            )
+        attribute_storage = ctypes.create_string_buffer(attribute_size.value)
+        attribute_list = ctypes.cast(attribute_storage, ctypes.c_void_p)
+        if not kernel32.InitializeProcThreadAttributeList(
+            attribute_list,
+            2,
+            0,
+            ctypes.byref(attribute_size),
+        ):
+            raise OSError(
+                kernel32.GetLastError(),
+                "InitializeProcThreadAttributeList failed",
+            )
+
+        nul_handle = None
+        invalid_handle = ctypes.c_void_p(-1).value
+        process_info = ProcessInformation()
+        created = False
+        try:
+            security = SecurityAttributes(
+                ctypes.sizeof(SecurityAttributes),
+                None,
+                True,
+            )
+            # GENERIC_READ | GENERIC_WRITE; FILE_SHARE_READ | FILE_SHARE_WRITE;
+            # OPEN_EXISTING; FILE_ATTRIBUTE_NORMAL.
+            nul_handle = kernel32.CreateFileW(
+                "NUL",
+                0xC0000000,
+                0x00000003,
+                ctypes.byref(security),
+                3,
+                0x00000080,
+                None,
+            )
+            if nul_handle in (None, 0, invalid_handle):
+                raise OSError(kernel32.GetLastError(), "opening NUL failed")
+
+            job_handles = (wintypes.HANDLE * 1)(self.handle)
+            inherited_handles = (wintypes.HANDLE * 1)(nul_handle)
+            # PROC_THREAD_ATTRIBUTE_JOB_LIST and HANDLE_LIST.  The Job list is
+            # the crash-consistency boundary: a successful CreateProcessW can
+            # never return an unassociated suspended process.
+            if not kernel32.UpdateProcThreadAttribute(
+                attribute_list,
+                0,
+                0x0002000D,
+                ctypes.cast(job_handles, ctypes.c_void_p),
+                ctypes.sizeof(job_handles),
+                None,
+                None,
+            ):
+                raise OSError(
+                    kernel32.GetLastError(),
+                    "PROC_THREAD_ATTRIBUTE_JOB_LIST failed",
+                )
+            if not kernel32.UpdateProcThreadAttribute(
+                attribute_list,
+                0,
+                0x00020002,
+                ctypes.cast(inherited_handles, ctypes.c_void_p),
+                ctypes.sizeof(inherited_handles),
+                None,
+                None,
+            ):
+                raise OSError(
+                    kernel32.GetLastError(),
+                    "PROC_THREAD_ATTRIBUTE_HANDLE_LIST failed",
+                )
+
+            startup = StartupInfoExW()
+            startup.StartupInfo.cb = ctypes.sizeof(StartupInfoExW)
+            startup.StartupInfo.dwFlags = 0x00000100  # STARTF_USESTDHANDLES
+            startup.StartupInfo.hStdInput = nul_handle
+            startup.StartupInfo.hStdOutput = nul_handle
+            startup.StartupInfo.hStdError = nul_handle
+            startup.lpAttributeList = attribute_list
+
+            command_line = ctypes.create_unicode_buffer(
+                subprocess.list2cmdline(command)
+            )
+            environment_values = []
+            for key, value in sorted(env.items(), key=lambda item: item[0].upper()):
+                if (
+                    not key
+                    or "=" in key
+                    or "\0" in key
+                    or "\0" in value
+                ):
+                    raise ValueError("invalid Windows recovery environment")
+                environment_values.append(f"{key}={value}")
+            environment = ctypes.create_unicode_buffer(
+                "\0".join(environment_values) + "\0\0"
+            )
+            creation_flags = (
+                0x00000004  # CREATE_SUSPENDED
+                | 0x00000400  # CREATE_UNICODE_ENVIRONMENT
+                | 0x00080000  # EXTENDED_STARTUPINFO_PRESENT
+                | 0x08000000  # CREATE_NO_WINDOW
+            )
+            application_name = str(PureWindowsPath(command[0]))
+            if not PureWindowsPath(application_name).is_absolute():
+                raise ValueError("Windows recovery executable must be absolute")
+            if not kernel32.CreateProcessW(
+                application_name,
+                command_line,
+                None,
+                None,
+                True,
+                creation_flags,
+                environment,
+                None,
+                ctypes.byref(startup.StartupInfo),
+                ctypes.byref(process_info),
+            ):
+                raise OSError(kernel32.GetLastError(), "CreateProcessW failed")
+            process = _WindowsAtomicRecoveryProcess(
+                ctypes,
+                wintypes,
+                kernel32,
+                process_info.hProcess,
+                process_info.hThread,
+                int(process_info.dwProcessId),
+                command,
+            )
+            created = True
+            return process
+        finally:
+            kernel32.DeleteProcThreadAttributeList(attribute_list)
+            if nul_handle not in (None, 0, invalid_handle):
+                kernel32.CloseHandle(nul_handle)
+            if not created:
+                if process_info.hThread:
+                    kernel32.CloseHandle(process_info.hThread)
+                if process_info.hProcess:
+                    kernel32.CloseHandle(process_info.hProcess)
+
+    def terminate(self) -> None:
+        if self.handle and not self._kernel32.TerminateJobObject(self.handle, 1):
+            raise OSError(self._kernel32.GetLastError(), "TerminateJobObject failed")
+
+    def close(self) -> None:
+        if getattr(self, "handle", None):
+            self._kernel32.CloseHandle(self.handle)
+            self.handle = None
+
+
+class _WindowsAtomicRecoveryProcess:
+    """管理原子绑定 Job 进程的最小 ``Popen`` 风格 owner。"""
+
+    def __init__(
+        self,
+        ctypes,
+        wintypes,
+        kernel32,
+        process_handle,
+        thread_handle,
+        pid: int,
+        command: list[str],
+    ):
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._kernel32 = kernel32
+        self._process_handle = process_handle
+        self._thread_handle = thread_handle
+        self.pid = pid
+        self.args = list(command)
+        kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+        kernel32.ResumeThread.restype = wintypes.DWORD
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+
+    def resume(self) -> None:
+        if not self._thread_handle:
+            raise OSError("recovery process has no resumable primary thread")
+        try:
+            if self._kernel32.ResumeThread(self._thread_handle) == 0xFFFFFFFF:
+                raise OSError(
+                    self._kernel32.GetLastError(),
+                    "ResumeThread failed",
+                )
+        finally:
+            self._kernel32.CloseHandle(self._thread_handle)
+            self._thread_handle = None
+
+    def poll(self) -> Optional[int]:
+        if not self._process_handle:
+            return 1
+        result = self._kernel32.WaitForSingleObject(self._process_handle, 0)
+        if result == 0x00000102:  # WAIT_TIMEOUT
+            return None
+        if result != 0:  # WAIT_OBJECT_0
+            raise OSError(self._kernel32.GetLastError(), "process wait failed")
+        exit_code = self._wintypes.DWORD()
+        if not self._kernel32.GetExitCodeProcess(
+            self._process_handle,
+            self._ctypes.byref(exit_code),
+        ):
+            raise OSError(
+                self._kernel32.GetLastError(),
+                "GetExitCodeProcess failed",
+            )
+        return int(exit_code.value)
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        milliseconds = (
+            0xFFFFFFFF
+            if timeout is None
+            else max(0, min(0xFFFFFFFE, int(float(timeout) * 1000)))
+        )
+        result = self._kernel32.WaitForSingleObject(
+            self._process_handle,
+            milliseconds,
+        )
+        if result == 0x00000102:
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        if result != 0:
+            raise OSError(self._kernel32.GetLastError(), "process wait failed")
+        value = self.poll()
+        if value is None:
+            raise OSError("process signaled without an exit code")
+        return value
+
+    def terminate(self) -> None:
+        if self.poll() is None and not self._kernel32.TerminateProcess(
+            self._process_handle,
+            1,
+        ):
+            raise OSError(self._kernel32.GetLastError(), "TerminateProcess failed")
+
+    kill = terminate
+
+    def close(self) -> None:
+        if self._thread_handle:
+            self._kernel32.CloseHandle(self._thread_handle)
+            self._thread_handle = None
+        if self._process_handle:
+            self._kernel32.CloseHandle(self._process_handle)
+            self._process_handle = None
+
+
+def _windows_job_api():
+    """通过一个可 mock 且受平台限制的接缝返回 Win32 Job API。"""
+
+    import ctypes
+    from ctypes import wintypes
+
+    return ctypes.windll.kernel32, wintypes
+
+
+def windows_recovery_job_is_active(operation_id: str) -> bool:
+    if not _is_windows_host():
+        return False
+
+    kernel32, wintypes = _windows_job_api()
+    kernel32.OpenJobObjectW.argtypes = [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    ]
+    kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.SetLastError(0)
+    handle = kernel32.OpenJobObjectW(
+        0x0004,
+        False,
+        _windows_recovery_job_name(operation_id),
+    )
+    if not handle:
+        error = int(kernel32.GetLastError())
+        if error == 2:  # ERROR_FILE_NOT_FOUND: the only proven-absent result.
+            return False
+        raise OSError(error, "OpenJobObjectW query failed")
+    if not kernel32.CloseHandle(handle):
+        raise OSError(kernel32.GetLastError(), "CloseHandle failed")
+    return True
+
+
+def terminate_windows_recovery_job(operation_id: str) -> bool:
+    if not _is_windows_host():
+        return False
+
+    kernel32, wintypes = _windows_job_api()
+    kernel32.OpenJobObjectW.argtypes = [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    ]
+    kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.SetLastError(0)
+    handle = kernel32.OpenJobObjectW(
+        0x0008,
+        False,
+        _windows_recovery_job_name(operation_id),
+    )
+    if not handle:
+        error = int(kernel32.GetLastError())
+        if error == 2:
+            return True
+        raise OSError(error, "OpenJobObjectW terminate failed")
+    try:
+        if not kernel32.TerminateJobObject(handle, 1):
+            raise OSError(
+                kernel32.GetLastError(),
+                "TerminateJobObject failed",
+            )
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _terminate_active_helper(
+    process,
+    *,
+    recovery_job: Optional[_WindowsRecoveryJob] = None,
+) -> None:
+    """停止精确 helper；Windows 私有流程会终止其完整 Job 树。"""
+
+    if process.poll() is not None:
+        return
+    if recovery_job is not None:
+        recovery_job.terminate()
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _abort_windows_recovery_process(
+    process: _WindowsAtomicRecoveryProcess,
+    recovery_job: _WindowsRecoveryJob,
+) -> None:
+    """创建、恢复或监控失败后关闭全部 owner 句柄。"""
+
+    try:
+        _terminate_active_helper(process, recovery_job=recovery_job)
+    finally:
+        # Closing a KILL_ON_JOB_CLOSE Job is the final fail-closed boundary even
+        # if explicit termination or wait failed.  Process/thread handles are
+        # independently owned by the wrapper and must also be closed.
+        recovery_job.close()
+        process.close()
+
+
+def _run_active(
+    script: Path,
+    args: List[str],
+    timeout: int,
+    *,
+    _recovery_notify: Optional[Callable[[], None]] = None,
+    _cancel_requested: Optional[Callable[[], bool]] = None,
+    _recovery_operation_id: Optional[str] = None,
+    _recovery_temp_notify: Optional[Callable[[dict], None]] = None,
+) -> str:
     """Run a debugger script and return its full console transcript text.
 
     Output always routes through ``Start-Transcript`` to a private random file:
@@ -422,7 +1038,21 @@ def _run_active(script: Path, args: List[str], timeout: int) -> str:
     if pinned_digest is None:
         logger.warning("active key script failed bundled integrity validation")
         return ""
-    private_dir = Path(tempfile.mkdtemp(prefix="chatlog_active_"))
+    private_dir = create_private_temp_dir("chatlog_active_")
+    if _recovery_temp_notify is not None:
+        try:
+            private_identity = private_dir.lstat()
+            _recovery_temp_notify(
+                {
+                    "path": str(private_dir),
+                    "device": private_identity.st_dev,
+                    "inode": private_identity.st_ino,
+                    "owner_pid": os.getpid(),
+                }
+            )
+        except Exception:
+            cleanup_private_temp_dir(private_dir)
+            raise
     out_path = private_dir / f"result-{secrets.token_hex(16)}.txt"
     bootstrap = _active_bootstrap(
         script=Path(script),
@@ -436,30 +1066,107 @@ def _run_active(script: Path, args: List[str], timeout: int) -> str:
     env = _windows_active_environment()
     try:
         cmd = [
-            "powershell.exe",
+            (
+                _trusted_windows_powershell_path()
+                if _is_windows_host()
+                else "powershell.exe"
+            ),
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
             "-EncodedCommand",
             encoded_bootstrap,
         ]
-        try:
-            subprocess.run(
-                cmd,
-                timeout=timeout,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
+        if _recovery_notify is None and _cancel_requested is None:
+            try:
+                subprocess.run(
+                    cmd,
+                    timeout=timeout,
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning("active key script timed out after %ss", timeout)
+            except FileNotFoundError:
+                logger.warning("powershell.exe not found; active extraction needs Windows")
+                return ""
+        else:
+            if os.name == "nt" and _recovery_operation_id is None:
+                raise ValueError("private Windows recovery requires an operation id")
+            recovery_job = (
+                _WindowsRecoveryJob(_recovery_operation_id)
+                if os.name == "nt" and _recovery_operation_id is not None
+                else None
             )
-        except subprocess.TimeoutExpired:
-            logger.warning("active key script timed out after %ss", timeout)
-        except FileNotFoundError:
-            logger.warning("powershell.exe not found; active extraction needs Windows")
-            return ""
+            try:
+                process = (
+                    recovery_job.create_suspended_process(cmd, env=env)
+                    if recovery_job is not None
+                    else subprocess.Popen(
+                        cmd,
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                )
+            except FileNotFoundError:
+                if recovery_job is not None:
+                    recovery_job.close()
+                logger.warning("powershell.exe not found; active extraction needs Windows")
+                return ""
+            except BaseException:
+                if recovery_job is not None:
+                    recovery_job.close()
+                raise
+            try:
+                if recovery_job is not None:
+                    process.resume()
+            except BaseException:
+                try:
+                    if recovery_job is not None:
+                        _abort_windows_recovery_process(process, recovery_job)
+                except Exception:
+                    # Preserve the primary start/resume failure.  The abort
+                    # helper always closes the kill-on-close Job and both raw
+                    # process handles in its finally block.
+                    pass
+                raise
+            notified = False
+            deadline = time.monotonic() + max(1, int(timeout))
+            try:
+                while process.poll() is None:
+                    if not notified and _recovery_notify is not None:
+                        transcript = _read_active_transcript(out_path)
+                        if _RECOVERY_CLIENT_OPEN_MARKER in transcript:
+                            _recovery_notify()
+                            notified = True
+                    if (
+                        (_cancel_requested is not None and _cancel_requested())
+                        or time.monotonic() >= deadline
+                    ):
+                        _terminate_active_helper(
+                            process,
+                            recovery_job=recovery_job,
+                        )
+                        break
+                    time.sleep(0.1)
+            except BaseException:
+                _terminate_active_helper(
+                    process,
+                    recovery_job=recovery_job,
+                )
+                raise
+            finally:
+                if recovery_job is not None:
+                    # KILL_ON_JOB_CLOSE proves no debugger-owned descendant can
+                    # outlive this private operation, including parent death.
+                    recovery_job.close()
+                    process.close()
         return _read_active_transcript(out_path)
     finally:
-        shutil.rmtree(private_dir, ignore_errors=True)
+        cleanup_private_temp_dir(private_dir)
 
 
 # ─── public API ───────────────────────────────────────────────────────────────
@@ -481,7 +1188,23 @@ def _is_macos_host() -> bool:
 def extract_qq_key_active(*, wrapper_node: Optional[str] = None,
                           db_path: Optional[str] = None,
                           analyze_only: bool = False,
-                          timeout: int = 600) -> Optional[bytes]:
+                          timeout: int = 600,
+                          _recovery_notify: Optional[Callable[[], None]] = None,
+                          _cancel_requested: Optional[Callable[[], bool]] = None,
+                          _require_closed_client: bool = False,
+                          _recovery_operation_id: Optional[str] = None,
+                          _recovery_process_notify: Optional[
+                              Callable[[dict], None]
+                          ] = None,
+                          _recovery_temp_notify: Optional[
+                              Callable[[dict], None]
+                          ] = None,
+                          _recovery_helper_notify: Optional[
+                              Callable[[dict], None]
+                          ] = None,
+                          _recovery_watchdog_notify: Optional[
+                              Callable[[dict], None]
+                          ] = None) -> Optional[bytes]:
     """Extract the QQ NT 16-char passphrase via the debugger script.
 
     Returns the passphrase as 16 ASCII bytes, or None. ``analyze_only`` runs
@@ -506,13 +1229,19 @@ def extract_qq_key_active(*, wrapper_node: Optional[str] = None,
             validate_debug_copy_process,
         )
         from chatlog_keeper.macos_key import extract_verified
+        from chatlog_keeper.macos_key import last_error as helper_error
         resolved = Path(db_path) if db_path else None
         if not resolved:
             root = qq_db.find_qq_data_root()
             resolved = qq_db.find_msg_database(root) if root else None
         if not resolved or not resolved.is_file():
             return None
-        debug_pid = launch_debug_copy("qq")
+        launch_options = {}
+        if _recovery_process_notify is not None:
+            launch_options["durable_launch_record"] = _recovery_process_notify
+        if _recovery_watchdog_notify is not None:
+            launch_options["durable_watchdog_record"] = _recovery_watchdog_notify
+        debug_pid = launch_debug_copy("qq", **launch_options)
         if not debug_pid:
             # The daily signed client does not carry get-task-allow. Falling
             # back to it would fail SIP/taskgated policy and must never trigger
@@ -520,25 +1249,47 @@ def extract_qq_key_active(*, wrapper_node: Optional[str] = None,
             return None
         result = None
         try:
+            if _recovery_notify is not None:
+                _recovery_notify()
             # A first login/checkpoint can replace page 1 while the helper scans.
             # Verify against a stable pre-scan oracle, then re-read and confirm on
             # the current DB family before returning a cacheable key. Retry once
             # on a real checkpoint race; never accept a stale-page-only match.
             for _attempt in range(2):
+                if _cancel_requested is not None and _cancel_requested():
+                    break
                 db_raw = qq_db._read_qq_verification_bytes(resolved)
                 identity = debug_copy_process_identity("qq", debug_pid)
                 if not db_raw or identity is None:
                     break
-                key = extract_verified(
-                    "qq", debug_pid,
-                    lambda candidate: qq_db._verify_key_qq(candidate, db_raw),
-                    primary_verify=lambda candidate: qq_db._verify_key_qq_with_algo(
-                        candidate, db_raw, "sha512", "sha1", 48
-                    ),
-                    elevate=False,
-                    timeout=timeout,
-                    expected_identity=identity,
-                )
+                key = None
+                scan_deadline = time.monotonic() + max(1, int(timeout))
+                while True:
+                    if _cancel_requested is not None and _cancel_requested():
+                        break
+                    remaining = scan_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    key = extract_verified(
+                        "qq", debug_pid,
+                        lambda candidate: qq_db._verify_key_qq(candidate, db_raw),
+                        primary_verify=lambda candidate: qq_db._verify_key_qq_with_algo(
+                            candidate, db_raw, "sha512", "sha1", 48
+                        ),
+                        elevate=False,
+                        timeout=(
+                            max(1, min(5, int(remaining)))
+                            if _cancel_requested is not None
+                            else max(1, int(remaining))
+                        ),
+                        expected_identity=identity,
+                        _recovery_helper_notify=_recovery_helper_notify,
+                    )
+                    if key or _cancel_requested is None:
+                        break
+                    if helper_error() != "helper_timeout":
+                        break
+                    clear_helper_error()
                 if not key or not validate_debug_copy_process("qq", debug_pid):
                     break
                 latest = qq_db._read_qq_verification_bytes(resolved)
@@ -563,9 +1314,19 @@ def extract_qq_key_active(*, wrapper_node: Optional[str] = None,
         args.append(wrapper_node)
     script_timeout = max(1, int(timeout) - 15) if int(timeout) > 15 else max(1, int(timeout))
     args += ["-TimeoutSeconds", str(script_timeout)]
+    if _require_closed_client:
+        args.append("-RequireClosedClient")
     if analyze_only:
         args.append("-NoDebugForKey")
-    text = _run_active(script, args, timeout)
+    text = _run_active(
+        script,
+        args,
+        timeout,
+        _recovery_notify=_recovery_notify,
+        _cancel_requested=_cancel_requested,
+        _recovery_operation_id=_recovery_operation_id,
+        _recovery_temp_notify=_recovery_temp_notify,
+    )
     if analyze_only:
         if "函数 RVA" in text or "FunctionRVA" in text:
             logger.info("QQ static analysis located the key-set function")
@@ -586,7 +1347,26 @@ def extract_qq_key_active(*, wrapper_node: Optional[str] = None,
 def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
                               db_path: Optional[str] = None,
                               analyze_only: bool = False,
-                              timeout: int = 600) -> Optional[bytes]:
+                              timeout: int = 600,
+                              _recovery_notify: Optional[Callable[[], None]] = None,
+                              _cancel_requested: Optional[Callable[[], bool]] = None,
+                              _require_closed_client: bool = False,
+                              _recovery_operation_id: Optional[str] = None,
+                              _recovery_process_notify: Optional[
+                                  Callable[[dict], None]
+                              ] = None,
+                              _recovery_temp_notify: Optional[
+                                  Callable[[dict], None]
+                              ] = None,
+                              _recovery_artifacts_notify: Optional[
+                                  Callable[[list[dict]], None]
+                              ] = None,
+                              _recovery_helper_notify: Optional[
+                                  Callable[[dict], None]
+                              ] = None,
+                              _recovery_watchdog_notify: Optional[
+                                  Callable[[dict], None]
+                              ] = None) -> Optional[bytes]:
     """Extract the WeChat 4.x 32-byte master key via the debugger script.
 
     Returns the 32-byte master key, or None. ``analyze_only`` runs static
@@ -630,9 +1410,38 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
         capture_library = ensure_capture_library()
         if capture_library is None:
             return None
+        def record_capture_channel(channel) -> None:
+            if _recovery_artifacts_notify is None:
+                return
+            artifacts = [
+                {
+                    "path": str(channel.path),
+                    "kind": "fifo",
+                    "mode": 0o600,
+                    "device": channel.device,
+                    "inode": channel.inode,
+                }
+            ]
+            if (
+                channel.library_path is not None
+                and channel.library_device is not None
+                and channel.library_inode is not None
+            ):
+                artifacts.append(
+                    {
+                        "path": str(channel.library_path),
+                        "kind": "file",
+                        "mode": 0o700,
+                        "device": channel.library_device,
+                        "inode": channel.library_inode,
+                    }
+                )
+            _recovery_artifacts_notify(artifacts)
+
         capture_channel = create_capture_channel(
             resolved,
             capture_library=capture_library,
+            _durable_record=record_capture_channel,
         )
         if (
             capture_channel is None
@@ -648,14 +1457,22 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
         process_clean = True
         channel_clean = False
         try:
-            debug_pid = launch_debug_copy(
-                "wechat",
-                capture_library=capture_channel.library_path,
-                capture_library_identity=capture_channel.library_identity,
-                capture_fifo=capture_channel.path,
-                capture_fifo_identity=capture_channel.identity,
-            )
+            launch_options = {
+                "capture_library": capture_channel.library_path,
+                "capture_library_identity": capture_channel.library_identity,
+                "capture_fifo": capture_channel.path,
+                "capture_fifo_identity": capture_channel.identity,
+            }
+            if _recovery_process_notify is not None:
+                launch_options["durable_launch_record"] = _recovery_process_notify
+            if _recovery_watchdog_notify is not None:
+                launch_options["durable_watchdog_record"] = (
+                    _recovery_watchdog_notify
+                )
+            debug_pid = launch_debug_copy("wechat", **launch_options)
             if debug_pid:
+                if _recovery_notify is not None:
+                    _recovery_notify()
                 # A candidate can reach the FIFO before LaunchServices returns
                 # the stable PID.  Keep candidates in bounded process memory
                 # until the matching DB page exists; login may create/replace
@@ -663,6 +1480,8 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
                 pending_candidates: List[bytes] = []
                 deadline = time.monotonic() + max(1, int(timeout))
                 while True:
+                    if _cancel_requested is not None and _cancel_requested():
+                        break
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
@@ -728,11 +1547,16 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
                             timeout=max(
                                 1,
                                 min(
-                                    _MACOS_WECHAT_SCAN_SLICE_SECONDS,
+                                    (
+                                        min(_MACOS_WECHAT_SCAN_SLICE_SECONDS, 5)
+                                        if _cancel_requested is not None
+                                        else _MACOS_WECHAT_SCAN_SLICE_SECONDS
+                                    ),
                                     int(remaining),
                                 ),
                             ),
                             expected_identity=identity,
+                            _recovery_helper_notify=_recovery_helper_notify,
                         )
                     if key:
                         if not validate_debug_copy_process("wechat", debug_pid):
@@ -790,9 +1614,19 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
         args += ["-DbPath", db_path]
     script_timeout = max(1, int(timeout) - 15) if int(timeout) > 15 else max(1, int(timeout))
     args += ["-TimeoutSeconds", str(script_timeout)]
+    if _require_closed_client:
+        args.append("-RequireClosedClient")
     if analyze_only:
         args.append("-NoDebugForKey")
-    text = _run_active(script, args, timeout)
+    text = _run_active(
+        script,
+        args,
+        timeout,
+        _recovery_notify=_recovery_notify,
+        _cancel_requested=_cancel_requested,
+        _recovery_operation_id=_recovery_operation_id,
+        _recovery_temp_notify=_recovery_temp_notify,
+    )
     if analyze_only:
         if "函数 RVA" in text or "funcRva" in text or "key-set" in text:
             logger.info("WeChat static analysis located the cipher-config function")

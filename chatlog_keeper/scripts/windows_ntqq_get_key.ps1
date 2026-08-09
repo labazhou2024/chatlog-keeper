@@ -57,6 +57,9 @@ param(
     [bool]$KillExisting = $true,
 
     [Parameter()]
+    [switch]$RequireClosedClient,
+
+    [Parameter()]
     [ValidateRange(1, 3600)]
     [int]$TimeoutSeconds = 600
 )
@@ -386,6 +389,7 @@ namespace DebugApi
                 throw new Exception("启动 QQ 进程并附加调试器失败。错误: " + Marshal.GetLastWin32Error());
             }
 
+            _log("CHATLOG_KEY_RECOVERY_CLIENT_OPEN_V1");
             _log("QQ 进程已启动。PID: " + _processId);
             _log("等待 wrapper.node 加载...");
             _log("请在 QQ 窗口中登录目标 QQ 账号。");
@@ -1272,8 +1276,11 @@ if (-not ([System.Management.Automation.PSTypeName]'DebugApi.KeyExtractor').Type
 # by the existing instance's singleton guard before the breakpoint fires. Kill,
 # then poll up to ~5s for it to actually exit. -ErrorAction SilentlyContinue keeps
 # Get-Process quiet (StrictMode + global $ErrorActionPreference='Stop') when none run.
-if ($KillExisting) {
-    $running = @(Get-Process -Name 'QQ', 'QQNT' -ErrorAction SilentlyContinue)
+$running = @(Get-Process -Name 'QQ', 'QQNT' -ErrorAction SilentlyContinue)
+if ($RequireClosedClient -and $running.Count -gt 0) {
+    throw '日常 QQ 客户端仍在运行；私有恢复协议禁止自动关闭正常客户端'
+}
+if ($KillExisting -and -not $RequireClosedClient) {
     if ($running.Count -gt 0) {
         Write-Host ("检测到 QQ 正在运行 (PID: " + ($running.Id -join ', ') + ") — 临时关闭以便附加调试器…") -ForegroundColor Yellow
         foreach ($p in $running) {

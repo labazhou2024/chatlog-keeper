@@ -33,6 +33,7 @@ from typing import Union, Any, Iterator
 
 from chatlog_keeper import (
     active_key,
+    key_recovery_protocol,
     participant_directory,
     participant_protocol,
     qq_db,
@@ -42,6 +43,10 @@ from chatlog_keeper import (
     wechat_key_identity,
 )
 from chatlog_keeper.core._secrets import private_binary_writer
+from chatlog_keeper.core._private_temp import (
+    PrivateTempLifecycleError,
+    scavenge_private_temp_dirs,
+)
 from chatlog_keeper.export import export_html, export_json
 
 
@@ -52,6 +57,17 @@ def _print_json(obj: dict) -> int:
         pass
     print(json.dumps(obj, ensure_ascii=False, indent=2))
     return 0 if obj.get("available", True) and not obj.get("error") else 1
+
+
+def _print_private_protocol_json(obj: dict, *, ok: bool) -> int:
+    """输出一个已经脱敏的私有协议结果。"""
+
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+    return 0 if ok else 1
 
 
 def _prepare_output_dir(path: Path) -> None:
@@ -699,6 +715,10 @@ def _probe_wechat() -> dict:
         running = bool(wechat_db._get_weixin_pids())
         root = wechat_db.find_weixin_data_root()
         wxid_dirs = wechat_db.find_wxid_dirs(root) if root else []
+        has_database = any(
+            bool(wechat_db.find_msg_databases(wxid_dir))
+            for wxid_dir in wxid_dirs
+        )
         readable_wxid_dir = None
         verified: tuple[bytes, wechat_key_identity.TargetSnapshot] | None = None
         if wxid_dirs:
@@ -731,7 +751,10 @@ def _probe_wechat() -> dict:
             "client_running": running,
             "wxid_dir": str(readable_wxid_dir or wxid_dirs[0]) if wxid_dirs else None,
             "enc_keys_present": has_key,
-            "needs_key": bool(running and wxid_dirs and not has_key),
+            # Archived/local databases still need a key after the daily client
+            # exits.  Recovery availability is a property of data + a verified
+            # cache, not of current process liveness.
+            "needs_key": bool(has_database and not has_key),
         }
         return wechat_key_identity.protocol_payload(result, key=key)
     except Exception:  # noqa: BLE001 - probe diagnostics must not expose paths
@@ -1200,7 +1223,13 @@ def _wechat_message_db_for_active(data_root: str | None = None) -> str | None:
     return None
 
 
-def _extract_key(source: str, method: str, data_root: str | None = None) -> dict:
+def _extract_key(
+    source: str,
+    method: str,
+    data_root: str | None = None,
+    *,
+    _recovery: key_recovery_protocol.KeyRecoverySession | None = None,
+) -> dict:
     """Acquire a decryption key and cache it for later cache-first exports.
 
     ``method="passive"`` (default) scans the live client's process memory — low
@@ -1215,6 +1244,11 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
     force_extract = os.environ.get("CHATLOG_FORCE_EXTRACT", "").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+    def recovery_failure(payload: dict, error_code: str) -> dict:
+        if _recovery is not None:
+            payload["_key_recovery_error_code"] = error_code
+        return payload
 
     def _active_failure(default: str) -> str:
         if sys.platform != "darwin":
@@ -1344,6 +1378,17 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
         return r
     if source == "qq":
         if method == "active":
+            if _recovery is not None:
+                if _recovery.cancel_requested():
+                    return recovery_failure(
+                        {"source": "qq", "method": "active", "ok": False},
+                        _recovery.cancel_reason or "cancelled",
+                    )
+                if qq_db._get_qq_pids():
+                    return recovery_failure(
+                        {"source": "qq", "method": "active", "ok": False},
+                        "client_running",
+                    )
             root = qq_db.find_qq_data_root()
             account = qq_db.detect_current_qq_account()
             account_databases = qq_db.find_qq_account_databases(root) if root else {}
@@ -1354,9 +1399,27 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
             )
             if verification_db is None and root is not None:
                 verification_db = qq_db.find_msg_database(root)
-            key = active_key.extract_qq_key_active(
-                db_path=str(verification_db) if verification_db else None
-            )
+            active_options = {
+                "db_path": str(verification_db) if verification_db else None,
+            }
+            if _recovery is not None:
+                active_options.update(
+                    timeout=_recovery.remaining_seconds(),
+                    _recovery_notify=_recovery.client_opened,
+                    _cancel_requested=_recovery.cancel_requested,
+                    _require_closed_client=True,
+                    _recovery_operation_id=_recovery.operation_id,
+                    _recovery_process_notify=_recovery.record_macos_process,
+                    _recovery_temp_notify=_recovery.record_private_temp,
+                    _recovery_helper_notify=_recovery.record_macos_helper,
+                    _recovery_watchdog_notify=_recovery.record_macos_watchdog,
+                )
+            key = active_key.extract_qq_key_active(**active_options)
+            if _recovery is not None and _recovery.cancel_requested():
+                return recovery_failure(
+                    {"source": "qq", "method": "active", "ok": False},
+                    _recovery.cancel_reason or "cancelled",
+                )
             saved = bool(key) and (
                 qq_db.save_cached_key_for_account(key, str(account))
                 if account not in (None, "")
@@ -1372,11 +1435,14 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
                         "key_len": len(key),
                         "saved_to": Path(saved_path).as_posix(),
                         "fresh_extraction": True}
-            return {"source": "qq", "method": "active", "ok": False,
-                    "error": _active_failure(
-                        "active extraction got no key (not logged into the popped-up QQ / "
-                        "local security policy blocked child debugging / unsupported build)"
-                    )}
+            return recovery_failure(
+                {"source": "qq", "method": "active", "ok": False,
+                 "error": _active_failure(
+                     "active extraction got no key (not logged into the popped-up QQ / "
+                     "local security policy blocked child debugging / unsupported build)"
+                 )},
+                "write_failed" if key else "helper_unavailable",
+            )
         reader = qq_db.QQDBReader()
         reader.initialize()  # cache → passive (timeout-bounded) → cache fallback
         key_source = getattr(reader, "key_source", None)
@@ -1404,31 +1470,70 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
                          "try `--method active` or `set-key`)"}
     if source == "wechat":
         if method == "active":
+            if _recovery is not None:
+                if _recovery.cancel_requested():
+                    return recovery_failure(
+                        {"source": "wechat", "method": "active", "ok": False},
+                        _recovery.cancel_reason or "cancelled",
+                    )
+                if wechat_db._get_weixin_pids():
+                    return recovery_failure(
+                        {"source": "wechat", "method": "active", "ok": False},
+                        "client_running",
+                    )
             db_path = _wechat_message_db_for_active(data_root)
             try:
                 snapshots = _wechat_key_target_snapshots(data_root)
             except wechat_key_identity.TargetError:
                 if not db_path:
-                    return {"source": "wechat", "method": "active", "ok": False,
-                            "error": "active extraction could not locate message_0.db for HMAC "
-                                     "verification (set --data-root to the xwechat_files folder)"}
-                return {"source": "wechat", "method": "active", "ok": False,
-                        "error": "active extraction could not freeze a stable WeChat "
-                                 "database target for HMAC verification",
-                        "db_path": db_path}
-            key = active_key.extract_wechat_key_active(db_path=db_path)
+                    return recovery_failure(
+                        {"source": "wechat", "method": "active", "ok": False,
+                         "error": "active extraction could not locate message_0.db for HMAC "
+                                  "verification (set --data-root to the xwechat_files folder)"},
+                        "source_unavailable",
+                    )
+                return recovery_failure(
+                    {"source": "wechat", "method": "active", "ok": False,
+                     "error": "active extraction could not freeze a stable WeChat "
+                              "database target for HMAC verification",
+                     "db_path": db_path},
+                    "source_unavailable",
+                )
+            active_options = {"db_path": db_path}
+            if _recovery is not None:
+                active_options.update(
+                    timeout=_recovery.remaining_seconds(),
+                    _recovery_notify=_recovery.client_opened,
+                    _cancel_requested=_recovery.cancel_requested,
+                    _require_closed_client=True,
+                    _recovery_operation_id=_recovery.operation_id,
+                    _recovery_process_notify=_recovery.record_macos_process,
+                    _recovery_temp_notify=_recovery.record_private_temp,
+                    _recovery_artifacts_notify=_recovery.record_artifacts,
+                    _recovery_helper_notify=_recovery.record_macos_helper,
+                    _recovery_watchdog_notify=_recovery.record_macos_watchdog,
+                )
+            key = active_key.extract_wechat_key_active(**active_options)
+            if _recovery is not None and _recovery.cancel_requested():
+                return recovery_failure(
+                    {"source": "wechat", "method": "active", "ok": False},
+                    _recovery.cancel_reason or "cancelled",
+                )
             if key:
                 try:
                     target = wechat_key_identity.matching_target(key, snapshots)
                 except wechat_key_identity.TargetError as exc:
-                    return {"source": "wechat", "method": "active", "ok": False,
-                            "error": (
-                                "active extraction key matched multiple local accounts"
-                                if exc.code == "ambiguous_account"
-                                else "active extraction got no key for the frozen WeChat "
-                                     "database target"
-                            ),
-                            "db_path": db_path}
+                    return recovery_failure(
+                        {"source": "wechat", "method": "active", "ok": False,
+                         "error": (
+                             "active extraction key matched multiple local accounts"
+                             if exc.code == "ambiguous_account"
+                             else "active extraction got no key for the frozen WeChat "
+                                  "database target"
+                         ),
+                         "db_path": db_path},
+                        "verification_failed",
+                    )
                 save_status, saved_path = wechat_key_identity.save_for_target(
                     key, target, snapshots
                 )
@@ -1442,26 +1547,41 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
                         key=key,
                     )
                 if save_status == "database_changed":
-                    return {"source": "wechat", "method": "active", "ok": False,
-                            "error": "WeChat database changed during active key extraction",
-                            "db_path": db_path}
+                    return recovery_failure(
+                        {"source": "wechat", "method": "active", "ok": False,
+                         "error": "WeChat database changed during active key extraction",
+                         "db_path": db_path},
+                        "verification_failed",
+                    )
                 if save_status == "selection_failed":
-                    return {"source": "wechat", "method": "active", "ok": False,
-                            "error": "verified WeChat key identity could not be stored",
-                            "db_path": db_path}
-                return {"source": "wechat", "method": "active", "ok": False,
-                        "error": "verified WeChat key could not be stored",
-                        "db_path": db_path}
+                    return recovery_failure(
+                        {"source": "wechat", "method": "active", "ok": False,
+                         "error": "verified WeChat key identity could not be stored",
+                         "db_path": db_path},
+                        "write_failed",
+                    )
+                return recovery_failure(
+                    {"source": "wechat", "method": "active", "ok": False,
+                     "error": "verified WeChat key could not be stored",
+                     "db_path": db_path},
+                    "write_failed",
+                )
             if not db_path:
-                return {"source": "wechat", "method": "active", "ok": False,
-                        "error": "active extraction could not locate message_0.db for HMAC "
-                                 "verification (set --data-root to the xwechat_files folder)"}
-            return {"source": "wechat", "method": "active", "ok": False,
-                    "error": _active_failure(
-                        "active extraction got no DB-verified key before the login window "
-                        "expired (no account switching is required)"
-                    ),
-                    "db_path": db_path}
+                return recovery_failure(
+                    {"source": "wechat", "method": "active", "ok": False,
+                     "error": "active extraction could not locate message_0.db for HMAC "
+                              "verification (set --data-root to the xwechat_files folder)"},
+                    "source_unavailable",
+                )
+            return recovery_failure(
+                {"source": "wechat", "method": "active", "ok": False,
+                 "error": _active_failure(
+                     "active extraction got no DB-verified key before the login window "
+                     "expired (no account switching is required)"
+                 ),
+                 "db_path": db_path},
+                "helper_unavailable",
+            )
         if force_extract:
             return {"source": "wechat", "method": "passive", "ok": False,
                     "error": "fresh WeChat extraction requires --method active"}
@@ -2061,6 +2181,149 @@ def _participant_directory_v1_command(args) -> int:
     return _print_json(payload)
 
 
+def _key_recovery_v1_command(args) -> int:
+    """运行私有主动取钥生命周期，且不暴露原生值。"""
+
+    try:
+        request = key_recovery_protocol.read_request(sys.stdin)
+    except key_recovery_protocol.KeyRecoveryProtocolError as exc:
+        return _print_private_protocol_json(
+            key_recovery_protocol.safe_error_result(exc.code),
+            ok=False,
+        )
+    if not getattr(args, "_key_recovery_transcript_cleanup_ok", True):
+        return _print_private_protocol_json(
+            key_recovery_protocol.safe_error_result(
+                "cleanup_failed",
+                operation_id=request.operation_id,
+            ),
+            ok=False,
+        )
+    try:
+        session = key_recovery_protocol.KeyRecoverySession(
+            request,
+            source=args.source,
+        )
+    except key_recovery_protocol.KeyRecoveryProtocolError as exc:
+        return _print_private_protocol_json(
+            key_recovery_protocol.safe_error_result(
+                exc.code,
+                operation_id=request.operation_id,
+            ),
+            ok=False,
+        )
+
+    if args.method != "active":
+        try:
+            session.terminal_error("invalid_request")
+            payload = session.result_payload(
+                ok=False,
+                error_code="invalid_request",
+            )
+        except key_recovery_protocol.KeyRecoveryProtocolError:
+            payload = session.result_payload(
+                ok=False,
+                error_code="status_unavailable",
+            )
+        session.release_active_lease()
+        return _print_private_protocol_json(payload, ok=False)
+    if not request.confirmed:
+        try:
+            session.terminal_error("confirmation_required")
+            payload = session.result_payload(
+                ok=False,
+                error_code="confirmation_required",
+            )
+        except key_recovery_protocol.KeyRecoveryProtocolError:
+            payload = session.result_payload(
+                ok=False,
+                error_code="status_unavailable",
+            )
+        session.release_active_lease()
+        return _print_private_protocol_json(payload, ok=False)
+
+    try:
+        session.emit("preparing")
+        with _message_stream_silent_logs():
+            with key_recovery_protocol.recovery_signal_handlers(session):
+                result = _extract_key(
+                    args.source,
+                    args.method,
+                    data_root=getattr(args, "data_root", None),
+                    _recovery=session,
+                )
+        if result.get("ok"):
+            session.emit("verified")
+            return _print_private_protocol_json(
+                session.result_payload(ok=True),
+                ok=True,
+            )
+        error_code = (
+            session.cancel_reason
+            or str(result.get("_key_recovery_error_code") or "verification_failed")
+        )
+        session.terminal_error(error_code)
+        return _print_private_protocol_json(
+            session.result_payload(ok=False, error_code=error_code),
+            ok=False,
+        )
+    except key_recovery_protocol.KeyRecoveryProtocolError as exc:
+        try:
+            session.terminal_error(exc.code)
+            error_code = exc.code
+        except key_recovery_protocol.KeyRecoveryProtocolError:
+            error_code = "status_unavailable"
+        return _print_private_protocol_json(
+            session.result_payload(ok=False, error_code=error_code),
+            ok=False,
+        )
+    except BaseException:  # noqa: BLE001 - private protocol must never traceback
+        try:
+            error_code = session.cancel_reason or "internal_error"
+            session.terminal_error(error_code)
+        except key_recovery_protocol.KeyRecoveryProtocolError:
+            error_code = "status_unavailable"
+        return _print_private_protocol_json(
+            session.result_payload(ok=False, error_code=error_code),
+            ok=False,
+        )
+    finally:
+        session.release_active_lease()
+
+
+def _key_recovery_control_command(args) -> int:
+    """对一个持久化 operation 执行无路径的 status/cancel/cleanup。"""
+
+    if args.capabilities:
+        return _print_private_protocol_json(
+            key_recovery_protocol.capabilities_payload(),
+            ok=True,
+        )
+    operation_id = None
+    try:
+        request = key_recovery_protocol.read_control_request(sys.stdin)
+        operation_id = request.operation_id
+        if args.action == "status":
+            payload = key_recovery_protocol.status_operation(request.operation_id)
+        elif args.action == "cancel":
+            payload = key_recovery_protocol.cancel_operation(request.operation_id)
+        elif args.action == "cleanup":
+            payload = key_recovery_protocol.cleanup_operation(request.operation_id)
+        else:
+            raise key_recovery_protocol.KeyRecoveryProtocolError("invalid_request")
+    except key_recovery_protocol.KeyRecoveryProtocolError as exc:
+        payload = key_recovery_protocol.control_result(
+            operation_id,
+            action=str(args.action or "unknown"),
+            ok=False,
+            terminal=False,
+            error_code=exc.code,
+            lease_state=None,
+        )
+        return _print_private_protocol_json(payload, ok=False)
+    return _print_private_protocol_json(payload, ok=True)
+
+
 # ─── CLI ───────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -2126,6 +2389,27 @@ def main(argv: list[str] | None = None) -> int:
         "--capabilities",
         action="store_true",
         help="emit the frozen key-identity-v1 capability contract",
+    )
+
+    p_key_recovery = sub.add_parser(
+        "key-recovery-v1",
+        help=argparse.SUPPRESS,
+    )
+    key_recovery_mode = p_key_recovery.add_mutually_exclusive_group(required=True)
+    key_recovery_mode.add_argument(
+        "--capabilities",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    key_recovery_mode.add_argument(
+        "--request-stdin",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p_key_recovery.add_argument(
+        "--action",
+        choices=["status", "cancel", "cleanup"],
+        help=argparse.SUPPRESS,
     )
 
     p_qq = sub.add_parser("qq", help="export your QQ history -> json + html")
@@ -2215,8 +2499,23 @@ def main(argv: list[str] | None = None) -> int:
                            "before launch and require a DB-verified manual key.")
     p_ek.add_argument("--data-root", type=str, default=None,
                       help="override the data folder (else auto-detected)")
+    p_ek.add_argument(
+        "--key-recovery-v1-stdin",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
     args = ap.parse_args(argv)
+
+    # A hard-killed Active Key helper may have left a private transcript in the
+    # system temp root.  Every CLI entry point attempts exact dead-owner
+    # scavenging; a new private Active run fails closed if cleanup is uncertain.
+    transcript_cleanup_ok = True
+    try:
+        scavenge_private_temp_dirs(("chatlog_active_",))
+    except PrivateTempLifecycleError:
+        transcript_cleanup_ok = False
+    setattr(args, "_key_recovery_transcript_cleanup_ok", transcript_cleanup_ok)
 
     # An explicit --data-root wins over auto-detection (machine-neutral override).
     if getattr(args, "data_root", None):
@@ -2310,7 +2609,35 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     if args.cmd == "extract-key":
+        if args.key_recovery_v1_stdin:
+            return _key_recovery_v1_command(args)
         return _print_json(_extract_key(args.source, args.method, data_root=getattr(args, "data_root", None)))
+    if args.cmd == "key-recovery-v1":
+        if args.request_stdin and args.action is None:
+            return _print_private_protocol_json(
+                key_recovery_protocol.control_result(
+                    None,
+                    action="unknown",
+                    ok=False,
+                    terminal=False,
+                    error_code="invalid_request",
+                    lease_state=None,
+                ),
+                ok=False,
+            )
+        if args.capabilities and args.action is not None:
+            return _print_private_protocol_json(
+                key_recovery_protocol.control_result(
+                    None,
+                    action=args.action,
+                    ok=False,
+                    terminal=False,
+                    error_code="invalid_request",
+                    lease_state=None,
+                ),
+                ok=False,
+            )
+        return _key_recovery_control_command(args)
     return 2
 
 

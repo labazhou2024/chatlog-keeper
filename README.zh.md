@@ -182,7 +182,9 @@ python -m chatlog_keeper.cli set-key --source qq --key <16位口令>
 macOS 上 secrets 目录权限为 `0700`，每个 key 文件为 `0600`。Windows 上使用
 受保护 ACL，只允许当前用户和 LocalSystem 访问；ACL 收紧或复核失败时拒绝读取。
 详细见
-[macOS 安全与排障说明](docs/macos.zh.md)。
+[macOS 安全与排障说明](docs/macos.zh.md)。桌面宿主需要展示主动取钥阶段、支持取消与
+有界等待时，使用不泄露 key、账号和路径的
+[Key Recovery v1 私有阶段合同](docs/key-recovery-v1-contract.zh.md)。
 
 ## 封号风险
 

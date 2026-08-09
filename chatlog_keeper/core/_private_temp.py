@@ -225,6 +225,56 @@ def cleanup_private_temp_dir(
     )
 
 
+def cleanup_recorded_private_temp_dir(
+    path: Path,
+    *,
+    expected_owner_pid: int,
+    expected_identity: tuple[int, int],
+    prefix: str,
+) -> None:
+    """完成精确身份验证后，删除一个崩溃 journal 对应目录。
+
+    与 :func:`cleanup_private_temp_dir` 不同，调用者可以是后续恢复进程。只有规范系统临时
+    根、有界生成名称、私有 owner marker 和目录 device/inode 全部仍匹配，才允许递归删除。
+    """
+
+    normalized_prefix = _validated_prefix(prefix)
+    candidate = Path(path)
+    root = Path(tempfile.gettempdir()).resolve()
+    try:
+        parent = candidate.parent.resolve(strict=True)
+        value = candidate.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise PrivateTempLifecycleError(
+            "private temporary plaintext cleanup failed"
+        ) from exc
+    suffix = candidate.name[len(normalized_prefix):]
+    if (
+        parent != root
+        or not candidate.name.startswith(normalized_prefix)
+        or _SUFFIX_RE.fullmatch(suffix) is None
+        or type(expected_owner_pid) is not int
+        or expected_owner_pid <= 0
+        or type(expected_identity) is not tuple
+        or len(expected_identity) != 2
+        or (value.st_dev, value.st_ino) != expected_identity
+        or not private_temp_dir_is_safe(candidate)
+        or _owner_pid(candidate) != expected_owner_pid
+    ):
+        raise PrivateTempLifecycleError(
+            "private temporary plaintext cleanup failed"
+        )
+    _remove_private_temp_dir(
+        candidate,
+        expected_owner_pid=expected_owner_pid,
+        allow_missing_owner=False,
+        retries=3,
+        retry_delay=0.05,
+    )
+
+
 def scavenge_private_temp_dirs(
     prefixes: Iterable[str],
     *,

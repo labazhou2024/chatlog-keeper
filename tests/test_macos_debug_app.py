@@ -1,12 +1,13 @@
 import os
 import plistlib
 import shutil
+import stat
 import sys
 from pathlib import Path
 
 import pytest
 
-from chatlog_keeper import macos_debug_app, macos_wechat_capture
+from chatlog_keeper import macos_debug_app, macos_key, macos_wechat_capture
 
 
 pytestmark = pytest.mark.skipif(
@@ -15,9 +16,59 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class _FakeWatchdog:
+    def __init__(self):
+        self.running = True
+
+    def poll(self):
+        return None if self.running else 0
+
+
+@pytest.fixture(autouse=True)
+def _stub_launch_watchdog(monkeypatch):
+    monkeypatch.setattr(
+        macos_key,
+        "launch_debug_copy_watchdog",
+        lambda *args, **kwargs: _FakeWatchdog(),
+    )
+
+    def cleanup(process, **_kwargs):
+        process.running = False
+        return True
+
+    monkeypatch.setattr(
+        macos_key,
+        "request_debug_copy_watchdog_cleanup",
+        cleanup,
+    )
+
+
 def test_prepare_debug_copy_is_macos_only(monkeypatch):
     monkeypatch.setattr(macos_debug_app.sys, "platform", "win32")
     assert macos_debug_app.prepare_debug_copy("wechat") is None
+
+
+def test_canonical_launch_path_resolves_parent_alias_and_rejects_final_link(
+    tmp_path,
+):
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    executable = real_parent / "WeChat"
+    executable.write_bytes(b"fixture")
+    executable.chmod(0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+
+    assert macos_debug_app._canonical_launch_path(
+        alias / "WeChat",
+        expected_type=stat.S_IFREG,
+    ) == executable.resolve(strict=True)
+    final_link = real_parent / "linked-WeChat"
+    final_link.symlink_to(executable)
+    assert macos_debug_app._canonical_launch_path(
+        final_link,
+        expected_type=stat.S_IFREG,
+    ) is None
 
 
 def test_launch_debug_copy_returns_exact_copy_pid(monkeypatch, tmp_path):
@@ -115,12 +166,15 @@ def test_wechat_capture_is_passed_to_private_launch_before_target(
         validate_fifo,
     )
 
-    def run(argv, **kwargs):
-        if argv[:2] == ["/usr/bin/open", "-n"]:
-            launches.append(argv)
-        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    def launch_watchdog(source, main, target, **kwargs):
+        launches.append((source, main, target, kwargs))
+        return _FakeWatchdog()
 
-    monkeypatch.setattr(macos_debug_app, "_run", run)
+    monkeypatch.setattr(
+        macos_key,
+        "launch_debug_copy_watchdog",
+        launch_watchdog,
+    )
 
     assert macos_debug_app.launch_debug_copy(
         "wechat",
@@ -129,15 +183,16 @@ def test_wechat_capture_is_passed_to_private_launch_before_target(
         capture_fifo=capture_fifo,
         capture_fifo_identity=fifo_identity,
     ) == 314
-    assert launches == [[
-        "/usr/bin/open",
-        "-n",
-        "--env",
-        f"DYLD_INSERT_LIBRARIES={capture_library}",
-        "--env",
-        f"CHATLOG_KEEPER_WECHAT_KEY_FIFO={capture_fifo}",
-        str(app),
-    ]]
+    assert launches == [(
+        "wechat",
+        executable,
+        app,
+        {
+            "capture_library": capture_library,
+            "capture_fifo": capture_fifo,
+            "durable_record": None,
+        },
+    )]
     assert fifo_validations == [
         (capture_fifo, fifo_identity),
         (capture_fifo, fifo_identity),

@@ -5,6 +5,7 @@ portable, while process names and sandbox container layouts are not.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -72,7 +73,10 @@ def _process_pids_for_executable_checked(
         return False, []
     if getattr(proc, "returncode", 0) != 0 or not isinstance(proc.stdout, str):
         return False, []
-    expected = str(executable)
+    try:
+        expected = os.path.realpath(os.fspath(executable))
+    except (OSError, TypeError, ValueError):
+        return False, []
     found: List[int] = []
     for line in proc.stdout.splitlines():
         parts = line.strip().split(None, 1)

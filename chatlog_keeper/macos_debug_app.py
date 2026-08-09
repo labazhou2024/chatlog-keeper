@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import BinaryIO, Optional
+from typing import Any, BinaryIO, Callable, Optional
 
 from chatlog_keeper.core._path_resolver import data_dir
 
@@ -62,6 +62,7 @@ class _DebugProcessToken:
     start_sec: int
     start_usec: int
     lock_file: Optional[BinaryIO] = None
+    watchdog: Optional[subprocess.Popen] = None
 
 
 _ACTIVE_DEBUG_PROCESSES: dict[tuple[str, int], _DebugProcessToken] = {}
@@ -271,12 +272,21 @@ def _canonical_debug_copy_identity(
     expected_identity: Optional[tuple[int, int]] = None,
 ) -> Optional[tuple[int, int]]:
     try:
-        actual = Path(os.path.abspath(os.fspath(target)))
-        root = Path(os.path.abspath(os.fspath(expected_root)))
+        requested = Path(os.path.abspath(os.fspath(target)))
+        requested_root = Path(os.path.abspath(os.fspath(expected_root)))
+        requested_info = requested.lstat()
+        actual = requested.resolve(strict=True)
+        root = requested_root.resolve(strict=True)
         info = actual.lstat()
     except OSError:
         return None
-    if actual.parent != root or not _private_directory(root):
+    if (
+        requested.is_symlink()
+        or (requested_info.st_dev, requested_info.st_ino)
+        != (info.st_dev, info.st_ino)
+        or actual.parent != root
+        or not _private_directory(root)
+    ):
         return None
     identity = (info.st_dev, info.st_ino)
     if (
@@ -569,8 +579,8 @@ def _validate_prepared_debug_copy(source: str, target: Path) -> bool:
     original, _executable_name = configured
     expected_root = data_dir() / "debug-apps"
     try:
-        actual_parent = Path(os.path.abspath(os.fspath(target.parent)))
-        canonical_root = Path(os.path.abspath(os.fspath(expected_root)))
+        actual_parent = target.parent.resolve(strict=True)
+        canonical_root = expected_root.resolve(strict=True)
     except OSError:
         return False
     # Keep the existing embedding/test hook for explicitly supplied non-cache
@@ -785,6 +795,34 @@ def _kernel_process_identity(pid: int) -> Optional[tuple[bytes, int, int]]:
     return process_identity(pid)
 
 
+def _canonical_launch_path(
+    path: Path,
+    *,
+    expected_type: int,
+) -> Optional[Path]:
+    """把非链接路径冻结到与内核进程路径一致的规范代际。"""
+
+    try:
+        requested = Path(os.path.abspath(os.fspath(path)))
+        requested_info = requested.lstat()
+        canonical = requested.resolve(strict=True)
+        current = canonical.lstat()
+    except OSError:
+        return None
+    if (
+        requested.is_symlink()
+        or stat.S_IFMT(requested_info.st_mode) != expected_type
+        or stat.S_IFMT(current.st_mode) != expected_type
+        or requested_info.st_uid != os.geteuid()
+        or current.st_uid != requested_info.st_uid
+        or (requested_info.st_dev, requested_info.st_ino)
+        != (current.st_dev, current.st_ino)
+        or current.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        return None
+    return canonical
+
+
 def _exact_process_pids(executable: Path) -> Optional[tuple[int, ...]]:
     """Return exact-path PIDs, or ``None`` when enumeration was not reliable."""
     from chatlog_keeper.core._macos import _process_pids_for_executable_checked
@@ -828,7 +866,10 @@ def _generation_for_pid(
     *,
     lock_file: Optional[BinaryIO] = None,
 ) -> Optional[_DebugProcessToken]:
-    pids = _exact_process_pids(executable)
+    canonical = _canonical_launch_path(executable, expected_type=stat.S_IFREG)
+    if canonical is None:
+        return None
+    pids = _exact_process_pids(canonical)
     if pids is None or pid not in pids or not _same_user_process(pid):
         return None
     identity = _kernel_process_identity(pid)
@@ -838,13 +879,13 @@ def _generation_for_pid(
     token = _DebugProcessToken(
         source,
         pid,
-        executable,
+        canonical,
         path_bytes,
         start_sec,
         start_usec,
         lock_file,
     )
-    if path_bytes != os.fsencode(executable) or not _process_matches(token):
+    if path_bytes != os.fsencode(canonical) or not _process_matches(token):
         return None
     return token
 
@@ -1004,7 +1045,11 @@ def _cleanup_observed_processes(
 def validate_debug_copy_process(source: str, pid: int) -> bool:
     """Validate that ``pid`` is the exact generation launched for ``source``."""
     token = _ACTIVE_DEBUG_PROCESSES.get((source, pid))
-    return bool(token and _process_matches(token))
+    return bool(
+        token
+        and _process_matches(token)
+        and (token.watchdog is None or token.watchdog.poll() is None)
+    )
 
 
 def debug_copy_process_identity(
@@ -1013,7 +1058,11 @@ def debug_copy_process_identity(
 ) -> Optional[tuple[bytes, int, int]]:
     """Return the immutable identity expected by the Mach helper."""
     token = _ACTIVE_DEBUG_PROCESSES.get((source, pid))
-    if token is None or not _process_matches(token):
+    if (
+        token is None
+        or not _process_matches(token)
+        or (token.watchdog is not None and token.watchdog.poll() is not None)
+    ):
         return None
     return token.path_bytes, token.start_sec, token.start_usec
 
@@ -1032,14 +1081,323 @@ def terminate_debug_copy(
         _LAST_ERROR = "debug_copy_cleanup_failed"
         return False
     try:
-        generation_cleaned = _terminate_generation(token, wait_s=wait_s)
+        watchdog_finished = True
+        if token.watchdog is not None:
+            from chatlog_keeper.macos_key import (
+                request_debug_copy_watchdog_cleanup,
+            )
+
+            request_debug_copy_watchdog_cleanup(token.watchdog)
+            watchdog_finished = token.watchdog.poll() is not None
+        generation_cleaned = _generation_state(token) in {"gone", "replaced"}
+        if not generation_cleaned:
+            generation_cleaned = _terminate_generation(token, wait_s=wait_s)
         remaining = _exact_process_pids(token.executable)
-        cleaned = generation_cleaned and remaining is not None and not remaining
+        cleaned = (
+            watchdog_finished
+            and generation_cleaned
+            and remaining is not None
+            and not remaining
+        )
         if not cleaned:
             _LAST_ERROR = "debug_copy_cleanup_failed"
         return cleaned
     finally:
         _release_launch_lock(token.lock_file)
+
+
+def _existing_verified_debug_executable(source: str) -> Optional[Path]:
+    """解析一个现有且已验证的私有可执行文件，不重新构建。"""
+
+    configured = _APPS.get(source)
+    if sys.platform != "darwin" or configured is None:
+        return None
+    original, executable_name = configured
+    try:
+        identity = _app_identity(original)
+    except OSError:
+        return None
+    target = data_dir() / "debug-apps" / f"{original.stem}-{identity}.app"
+    try:
+        if not target.is_dir() or not _validate_prepared_debug_copy(source, target):
+            return None
+    except OSError:
+        return None
+    canonical_target = _canonical_launch_path(target, expected_type=stat.S_IFDIR)
+    executable = target / "Contents" / "MacOS" / executable_name
+    canonical_executable = _canonical_launch_path(
+        executable,
+        expected_type=stat.S_IFREG,
+    )
+    if (
+        canonical_target is None
+        or canonical_executable is None
+        or canonical_executable
+        != canonical_target / "Contents" / "MacOS" / executable_name
+    ):
+        return None
+    return canonical_executable
+
+
+def verified_debug_copy_is_running(source: str) -> bool:
+    """证明已验证隔离副本当前是否存在精确进程。"""
+
+    executable = _existing_verified_debug_executable(source)
+    if executable is None:
+        return False
+    pids = _exact_process_pids(executable)
+    if pids is None:
+        raise RuntimeError("isolated process enumeration failed")
+    return bool(pids)
+
+
+def terminate_verified_debug_copy(source: str) -> bool:
+    """只终止该 source 已验证隔离副本的进程代际。
+
+    这是跨进程崩溃恢复路径，绝不解析腾讯签名的日常 App 可执行文件，也不向其发送信号。
+    """
+
+    executable = _existing_verified_debug_executable(source)
+    if executable is None:
+        return True
+    pids = _exact_process_pids(executable)
+    if pids is None:
+        return False
+    cleaned = True
+    for pid in pids:
+        token = _generation_for_pid(source, executable, pid)
+        if token is None:
+            cleaned = False
+            continue
+        cleaned = _terminate_generation(token, wait_s=5.0) and cleaned
+    remaining = _exact_process_pids(executable)
+    return cleaned and remaining is not None and not remaining
+
+
+def _recorded_debug_reference(record: dict[str, Any]) -> Optional[Path]:
+    """验证持久化身份字段，且不触碰旧 App artifact。"""
+
+    required = {
+        "schema",
+        "operation_id",
+        "state",
+        "source",
+        "path_hex",
+        "pid",
+        "start_sec",
+        "start_usec",
+    }
+    if type(record) is not dict or set(record) != required:
+        return None
+    source = record.get("source")
+    configured = _APPS.get(source)
+    state = record.get("state")
+    if (
+        sys.platform != "darwin"
+        or configured is None
+        or state not in {"launching", "running"}
+        or type(record.get("operation_id")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", record["operation_id"]) is None
+    ):
+        return None
+    if state == "launching":
+        if any(record.get(field) is not None for field in ("pid", "start_sec", "start_usec")):
+            return None
+    elif (
+        type(record.get("pid")) is not int
+        or record["pid"] <= 0
+        or type(record.get("start_sec")) is not int
+        or record["start_sec"] <= 0
+        or type(record.get("start_usec")) is not int
+        or not 0 <= record["start_usec"] < 1_000_000
+    ):
+        return None
+    try:
+        path_bytes = bytes.fromhex(record.get("path_hex", ""))
+        executable = Path(os.fsdecode(path_bytes))
+        canonical_bytes = os.fsencode(os.path.realpath(os.fspath(executable)))
+    except (OSError, TypeError, ValueError):
+        return None
+    if (
+        not path_bytes.startswith(b"/")
+        or b"\0" in path_bytes
+        or len(path_bytes) > 4095
+        or canonical_bytes != path_bytes
+    ):
+        return None
+    original, executable_name = configured
+    try:
+        target = executable.parents[2]
+    except IndexError:
+        return None
+    expected_name = re.compile(
+        rf"{re.escape(original.stem)}-[0-9a-f]{{12}}\.app"
+    )
+    if (
+        executable != target / "Contents" / "MacOS" / executable_name
+        or target.parent.name != "debug-apps"
+        or expected_name.fullmatch(target.name) is None
+    ):
+        return None
+    return executable
+
+
+def _recorded_pid_is_absent(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return False
+
+
+def _recorded_debug_executable(record: dict[str, Any]) -> Optional[Path]:
+    """不使用 data_dir()，重新验证一个 live 持久化恢复记录。
+
+    损坏记录绝不能让崩溃清理向任意进程发送信号。只接受精确生成的 bundle 名称、当前腾讯
+    source digest、本工具 marker/签名策略，以及私有 owner-only 缓存根目录。
+    """
+
+    executable = _recorded_debug_reference(record)
+    if executable is None:
+        return None
+    source = record.get("source")
+    configured = _APPS.get(source)
+    if configured is None:
+        return None
+    original, executable_name = configured
+    try:
+        target = executable.parents[2]
+    except IndexError:
+        return None
+    if (
+        executable != target / "Contents" / "MacOS" / executable_name
+        or target.parent.name != "debug-apps"
+    ):
+        return None
+    try:
+        root_info = target.parent.lstat()
+        identity = _app_identity(original)
+        original_entitlements = _entitlements(original)
+        source_digest = _bundle_source_digest(original)
+    except OSError:
+        return None
+    if (
+        target.parent.is_symlink()
+        or not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+        or target.name != f"{original.stem}-{identity}.app"
+        or original_entitlements is None
+        or source_digest is None
+    ):
+        return None
+    expected_entitlements = dict(original_entitlements)
+    expected_entitlements["com.apple.security.get-task-allow"] = True
+    marker = target / "Contents" / "Resources" / _DEBUG_COPY_MARKER
+    valid = _verified_cached_debug_copy(
+        target,
+        marker,
+        identity,
+        expected_entitlements,
+        source_digest,
+        hardened_runtime=_copy_uses_hardened_runtime(source),
+    )
+    return executable if valid is not None else None
+
+
+def recorded_debug_copy_is_running(record: dict[str, Any]) -> bool:
+    """只证明持久化记录中隔离可执行文件的存活状态。"""
+
+    reference = _recorded_debug_reference(record)
+    if reference is None:
+        raise RuntimeError("invalid durable debug-copy record")
+    pids = _exact_process_pids(reference)
+    if pids is None:
+        raise RuntimeError("isolated process enumeration failed")
+    if record["state"] == "launching" and not pids:
+        return False
+    if (
+        record["state"] == "running"
+        and _recorded_pid_is_absent(record["pid"])
+        and not pids
+    ):
+        return False
+    executable = _recorded_debug_executable(record)
+    if executable is None:
+        # The process may have exited while an old cache/client artifact was
+        # being checked.  Only a second kernel/path absence proof may release
+        # the lease; a live/reused PID plus artifact drift remains fail closed.
+        current_pids = _exact_process_pids(reference)
+        if (
+            current_pids == ()
+            and (
+                record["state"] == "launching"
+                or _recorded_pid_is_absent(record["pid"])
+            )
+        ):
+            return False
+        raise RuntimeError("invalid durable debug-copy artifact")
+    pids = _exact_process_pids(executable)
+    if pids is None:
+        raise RuntimeError("isolated process enumeration failed")
+    if record["state"] == "running":
+        token = _DebugProcessToken(
+            record["source"],
+            record["pid"],
+            executable,
+            os.fsencode(executable),
+            record["start_sec"],
+            record["start_usec"],
+        )
+        state = _generation_state(token)
+        if state == "unknown":
+            raise RuntimeError("isolated process identity unavailable")
+        if state == "same":
+            return True
+    return bool(pids)
+
+
+def terminate_recorded_debug_copy(record: dict[str, Any]) -> bool:
+    """只终止已记录的隔离可执行文件，并证明它已不存在。"""
+
+    reference = _recorded_debug_reference(record)
+    if reference is None:
+        return False
+    pids = _exact_process_pids(reference)
+    if pids is None:
+        return False
+    if record["state"] == "launching" and not pids:
+        return True
+    if (
+        record["state"] == "running"
+        and _recorded_pid_is_absent(record["pid"])
+        and not pids
+    ):
+        return True
+    executable = _recorded_debug_executable(record)
+    if executable is None:
+        current_pids = _exact_process_pids(reference)
+        return bool(
+            current_pids == ()
+            and (
+                record["state"] == "launching"
+                or _recorded_pid_is_absent(record["pid"])
+            )
+        )
+    pids = _exact_process_pids(executable)
+    if pids is None:
+        return False
+    cleaned = True
+    for pid in pids:
+        token = _generation_for_pid(record["source"], executable, pid)
+        if token is None:
+            cleaned = False
+            continue
+        cleaned = _terminate_generation(token, wait_s=5.0) and cleaned
+    remaining = _exact_process_pids(executable)
+    return cleaned and remaining is not None and not remaining
 
 
 def launch_debug_copy(
@@ -1051,6 +1409,8 @@ def launch_debug_copy(
     capture_library_identity: Optional[tuple[int, int]] = None,
     capture_fifo: Optional[Path] = None,
     capture_fifo_identity: Optional[tuple[int, int]] = None,
+    durable_launch_record: Optional[Callable[[dict[str, Any]], None]] = None,
+    durable_watchdog_record: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> Optional[int]:
     """Launch the isolated copy and return its verified, exact main PID.
 
@@ -1138,11 +1498,27 @@ def launch_debug_copy(
             else "debug_copy_library_validation_unverifiable"
         )
         return None
+    canonical_target = _canonical_launch_path(target, expected_type=stat.S_IFDIR)
+    canonical_executable = _canonical_launch_path(
+        executable,
+        expected_type=stat.S_IFREG,
+    )
+    if (
+        canonical_target is None
+        or canonical_executable is None
+        or canonical_executable
+        != canonical_target / "Contents" / "MacOS" / _APPS[source][1]
+    ):
+        _LAST_ERROR = "debug_copy_validation_failed"
+        return None
+    target = canonical_target
+    executable = canonical_executable
     launch_lock = _acquire_launch_lock(target.parent, source)
     if launch_lock is None:
         _LAST_ERROR = "debug_copy_busy"
         return None
 
+    watchdog = None
     try:
         existing_pids = _exact_process_pids(executable)
         if existing_pids is None:
@@ -1155,7 +1531,6 @@ def launch_debug_copy(
         if not _validate_prepared_debug_copy(source, target):
             _LAST_ERROR = "debug_copy_validation_failed"
             return None
-        launch_argv = ["/usr/bin/open", "-n"]
         if capture_requested:
             # Revalidate at the last possible moment.  Values are passed as argv
             # entries to LaunchServices, never through a shell or global process
@@ -1169,17 +1544,32 @@ def launch_debug_copy(
             ):
                 _LAST_ERROR = "capture_launch_configuration_invalid"
                 return None
-            launch_argv.extend(
-                [
-                    "--env",
-                    f"DYLD_INSERT_LIBRARIES={capture_library}",
-                    "--env",
-                    f"CHATLOG_KEEPER_WECHAT_KEY_FIFO={capture_fifo}",
-                ]
-            )
-        launch_argv.append(str(target))
-        launched = _run(launch_argv, timeout=30)
-        if launched.returncode != 0:
+        if durable_launch_record is not None:
+            try:
+                durable_launch_record(
+                    {
+                        "state": "launching",
+                        "source": source,
+                        "path_hex": os.fsencode(executable).hex(),
+                        "pid": None,
+                        "start_sec": None,
+                        "start_usec": None,
+                    }
+                )
+            except Exception:
+                _LAST_ERROR = "debug_copy_durable_record_failed"
+                return None
+        from chatlog_keeper.macos_key import launch_debug_copy_watchdog
+
+        watchdog = launch_debug_copy_watchdog(
+            source,
+            executable,
+            target,
+            capture_library=capture_library if capture_requested else None,
+            capture_fifo=capture_fifo if capture_requested else None,
+            durable_record=durable_watchdog_record,
+        )
+        if watchdog is None:
             _LAST_ERROR = "debug_copy_launch_failed"
             return None
         stable, saw_pid, observed = _wait_for_stable_pid(
@@ -1188,7 +1578,7 @@ def launch_debug_copy(
             wait_s=wait_s,
             settle_s=0.0 if source == "wechat" else settle_s,
         )
-        if stable is not None:
+        if stable is not None and watchdog.poll() is None:
             owned = _DebugProcessToken(
                 stable.source,
                 stable.pid,
@@ -1197,10 +1587,32 @@ def launch_debug_copy(
                 stable.start_sec,
                 stable.start_usec,
                 launch_lock,
+                watchdog,
             )
             if _process_matches(owned):
+                if durable_launch_record is not None:
+                    try:
+                        durable_launch_record(
+                            {
+                                "state": "running",
+                                "source": source,
+                                "path_hex": owned.path_bytes.hex(),
+                                "pid": owned.pid,
+                                "start_sec": owned.start_sec,
+                                "start_usec": owned.start_usec,
+                            }
+                        )
+                    except Exception:
+                        cleaned = _cleanup_observed_processes(observed, executable)
+                        _LAST_ERROR = (
+                            "debug_copy_durable_record_failed"
+                            if cleaned
+                            else "debug_copy_cleanup_failed"
+                        )
+                        return None
                 _ACTIVE_DEBUG_PROCESSES[(source, owned.pid)] = owned
                 launch_lock = None
+                watchdog = None
                 return owned.pid
             cleaned = _cleanup_observed_processes(observed, executable)
             _LAST_ERROR = (
@@ -1220,4 +1632,13 @@ def launch_debug_copy(
             )
         return None
     finally:
+        if watchdog is not None:
+            try:
+                from chatlog_keeper.macos_key import (
+                    request_debug_copy_watchdog_cleanup,
+                )
+
+                request_debug_copy_watchdog_cleanup(watchdog)
+            except Exception:
+                pass
         _release_launch_lock(launch_lock)

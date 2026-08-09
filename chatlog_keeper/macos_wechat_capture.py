@@ -19,7 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Optional
+from typing import Callable, Optional
 
 from chatlog_keeper.core._path_resolver import data_dir
 
@@ -654,6 +654,7 @@ def create_capture_channel(
     db_path: Path,
     *,
     capture_library: Optional[Path] = None,
+    _durable_record: Optional[Callable[[CaptureChannel], None]] = None,
 ) -> Optional[CaptureChannel]:
     """Create the FIFO and optional verified helper inside WeChat's sandbox."""
     global _LAST_ERROR
@@ -686,6 +687,12 @@ def create_capture_channel(
             ):
                 channel.close()
                 return None
+            if _durable_record is not None:
+                try:
+                    _durable_record(channel)
+                except BaseException:
+                    channel.close()
+                    raise
             return channel
         except FileExistsError:
             continue
