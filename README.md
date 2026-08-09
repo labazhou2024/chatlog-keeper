@@ -105,6 +105,7 @@ $expected = (Get-Content .\chatlog-keeper.exe.sha256).Split()[0]
 $actual = (Get-FileHash .\chatlog-keeper.exe -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "chatlog-keeper checksum mismatch" }
 .\chatlog-keeper.exe --help
+.\chatlog-keeper.exe key-identity-v1 --capabilities
 .\chatlog-keeper.exe message-stream-v1 --capabilities
 .\chatlog-keeper.exe participant-directory-v1 --capabilities
 ```
@@ -114,6 +115,7 @@ if ($actual -ne $expected) { throw "chatlog-keeper checksum mismatch" }
 shasum -a 256 -c chatlog-keeper-macos-arm64.sha256
 chmod 755 chatlog-keeper-macos-arm64
 ./chatlog-keeper-macos-arm64 --help
+./chatlog-keeper-macos-arm64 key-identity-v1 --capabilities
 ./chatlog-keeper-macos-arm64 message-stream-v1 --capabilities
 ./chatlog-keeper-macos-arm64 participant-directory-v1 --capabilities
 ```
@@ -121,8 +123,9 @@ chmod 755 chatlog-keeper-macos-arm64
 Each release also contains a deterministic `chatlog-keeper-v*-source.tar.gz`
 made from the tagged commit and one canonical approved artifact descriptor per
 platform. Their adjacent `.sha256` files are verified in the same way. The two
-descriptors identify the same source bundle and list both frozen local IPC
-protocols, so a host can bind the downloaded executable to its exact source.
+descriptors identify the same source bundle and list all three frozen local IPC
+protocol capabilities, so a host can bind the downloaded executable to its exact
+source.
 
 ## Usage
 

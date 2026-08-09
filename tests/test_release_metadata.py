@@ -24,16 +24,16 @@ SPEC.loader.exec_module(release_metadata)
 
 def test_version_contract_requires_tag_module_and_installed_metadata_agreement() -> None:
     assert release_metadata.validate_version_contract(
-        tag="v0.3.3",
-        module_version="0.3.3",
-        metadata_version="0.3.3",
-    ) == "0.3.3"
+        tag="v0.3.4",
+        module_version="0.3.4",
+        metadata_version="0.3.4",
+    ) == "0.3.4"
 
     with pytest.raises(release_metadata.ReleaseMetadataError, match="differ"):
         release_metadata.validate_version_contract(
-            tag="v0.3.3",
-            module_version="0.3.3",
-            metadata_version="0.3.2",
+            tag="v0.3.4",
+            module_version="0.3.4",
+            metadata_version="0.3.3",
         )
 
 
@@ -82,7 +82,28 @@ def _participant_capability() -> dict:
     }
 
 
-def test_frozen_capability_validator_executes_both_exact_no_input_contracts(
+def _key_identity_capability() -> dict:
+    return {
+        "capability": "key-identity-v1",
+        "schema": "chatlog-keeper.key-identity.v1",
+        "source": "wechat",
+        "authority": "database-master-key-proof",
+        "account_ref_format": "chatlog-account-ref-v1-sha256",
+    }
+
+
+def _probe_capability() -> dict:
+    return {
+        "qq": {"source": "qq", "available": False},
+        "wechat": {
+            "source": "wechat",
+            "available": False,
+            "protocol_capabilities": ["key-identity-v1"],
+        },
+    }
+
+
+def test_frozen_capability_validator_executes_all_exact_no_input_contracts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -93,8 +114,16 @@ def test_frozen_capability_validator_executes_both_exact_no_input_contracts(
     def fake_run(argv, **kwargs):
         calls.append(tuple(str(item) for item in argv))
         assert kwargs["stdin"] is subprocess.DEVNULL
-        protocol = argv[1]
-        payload = _message_capability() if protocol == "message-stream-v1" else _participant_capability()
+        command = tuple(argv[1:])
+        if command == ("message-stream-v1", "--capabilities"):
+            payload = _message_capability()
+        elif command == ("participant-directory-v1", "--capabilities"):
+            payload = _participant_capability()
+        elif command == ("key-identity-v1", "--capabilities"):
+            payload = _key_identity_capability()
+        else:
+            assert command == ("probe",)
+            payload = _probe_capability()
         return SimpleNamespace(
             returncode=0,
             stdout=json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n",
@@ -108,7 +137,40 @@ def test_frozen_capability_validator_executes_both_exact_no_input_contracts(
     assert calls == [
         (str(executable), "message-stream-v1", "--capabilities"),
         (str(executable), "participant-directory-v1", "--capabilities"),
+        (str(executable), "key-identity-v1", "--capabilities"),
+        (str(executable), "probe"),
     ]
+
+
+def test_frozen_capability_validator_rejects_key_identity_command_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "chatlog-keeper"
+    executable.write_bytes(b"frozen fixture")
+
+    def fake_run(argv, **_kwargs):
+        command = tuple(argv[1:])
+        if command == ("message-stream-v1", "--capabilities"):
+            payload = _message_capability()
+        elif command == ("participant-directory-v1", "--capabilities"):
+            payload = _participant_capability()
+        elif command == ("key-identity-v1", "--capabilities"):
+            payload = _key_identity_capability()
+            payload["account_ref_format"] = "native-id"
+        else:
+            assert command == ("probe",)
+            payload = _probe_capability()
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(release_metadata.subprocess, "run", fake_run)
+
+    with pytest.raises(release_metadata.ReleaseMetadataError, match="identity drifted"):
+        release_metadata.validate_frozen_capabilities(executable)
 
 
 @pytest.mark.parametrize(
@@ -157,6 +219,54 @@ def test_participant_capability_validator_fails_closed_on_any_drift(mutate) -> N
     mutate(payload)
     with pytest.raises(release_metadata.ReleaseMetadataError, match="identity"):
         release_metadata.validate_participant_directory_capability(payload)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda value: value.update(capability="key-identity-v2"), "identity"),
+        (lambda value: value.update(schema="chatlog-keeper.key-identity.v2"), "identity"),
+        (lambda value: value.update(source="qq"), "identity"),
+        (lambda value: value.update(authority="filesystem-name"), "identity"),
+        (lambda value: value.update(account_ref_format="native-id"), "identity"),
+        (lambda value: value.update(extra=True), "fields"),
+        (lambda value: value.pop("source"), "fields"),
+    ],
+)
+def test_key_identity_capability_validator_fails_closed_on_any_drift(
+    mutate,
+    message: str,
+) -> None:
+    payload = _key_identity_capability()
+    mutate(payload)
+
+    with pytest.raises(release_metadata.ReleaseMetadataError, match=message):
+        release_metadata.validate_key_identity_capability(payload)
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        None,
+        [],
+        ["key-identity-v1", "key-identity-v1"],
+        ["key-identity-v2"],
+        "key-identity-v1",
+    ],
+)
+def test_key_identity_probe_capability_fails_closed_on_any_drift(
+    capabilities,
+) -> None:
+    payload = _probe_capability()
+    payload["wechat"]["protocol_capabilities"] = capabilities
+
+    with pytest.raises(release_metadata.ReleaseMetadataError, match="identity"):
+        release_metadata.validate_key_identity_probe_capability(payload)
+
+
+def test_key_identity_probe_capability_requires_wechat_status() -> None:
+    with pytest.raises(release_metadata.ReleaseMetadataError, match="identity"):
+        release_metadata.validate_key_identity_probe_capability({"qq": {}})
 
 
 def _windows_executable() -> bytes:
@@ -240,6 +350,9 @@ def test_executable_header_gate_rejects_architecture_or_format_spoofing(
 def test_descriptor_is_canonical_and_binds_both_artifacts_to_one_source_bundle(
     tmp_path: Path,
 ) -> None:
+    assert release_metadata.PROTOCOL_CAPABILITIES == tuple(
+        sorted(release_metadata.PROTOCOL_CAPABILITIES)
+    )
     version = "0.3.1"
     commit = "1" * 40
     source_bundle = tmp_path / f"chatlog-keeper-v{version}-source.tar.gz"
@@ -282,6 +395,7 @@ def test_descriptor_is_canonical_and_binds_both_artifacts_to_one_source_bundle(
         "executable": "chatlog-keeper.exe",
         "kind": "chatlog_keeper",
         "protocol_capabilities": [
+            "key-identity-v1",
             "message-stream-v1",
             "participant-directory-v1",
         ],

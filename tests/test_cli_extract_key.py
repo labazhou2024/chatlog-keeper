@@ -1,6 +1,12 @@
 from pathlib import Path
 
-from chatlog_keeper import cli, macos_debug_app, macos_wechat_capture, wechat_db
+from chatlog_keeper import (
+    cli,
+    macos_debug_app,
+    macos_wechat_capture,
+    wechat_db,
+    wechat_key_identity,
+)
 from chatlog_keeper.core import _paths
 
 
@@ -53,6 +59,11 @@ def test_wechat_active_passes_db_path_to_debugger(monkeypatch, tmp_path):
         "_wechat_account_key_cache_path",
         lambda account_id: Path("wechat_accounts") / f"{account_id}.key",
         raising=False,
+    )
+    monkeypatch.setattr(
+        wechat_key_identity,
+        "write_selected_key",
+        lambda key: key == bytes(range(32)),
     )
 
     result = cli._extract_key("wechat", "active", data_root=str(tmp_path / "xwechat_files"))
@@ -107,6 +118,9 @@ def test_wechat_active_saves_key_for_matching_account_not_seed(
         cli.wechat_db,
         "_wechat_account_key_cache_path",
         lambda account_id: Path("wechat_accounts") / "matching.key",
+    )
+    monkeypatch.setattr(
+        wechat_key_identity, "write_selected_key", lambda candidate: candidate == key
     )
 
     result = cli._extract_key("wechat", "active", data_root=str(root))

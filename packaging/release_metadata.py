@@ -28,7 +28,11 @@ from typing import Any, Mapping, Sequence
 
 DESCRIPTOR_SCHEMA = "memexa.approved_artifact_descriptor.v2"
 DESCRIPTOR_KIND = "chatlog_keeper"
-PROTOCOL_CAPABILITIES = ("message-stream-v1", "participant-directory-v1")
+PROTOCOL_CAPABILITIES = (
+    "key-identity-v1",
+    "message-stream-v1",
+    "participant-directory-v1",
+)
 SOURCE_BUNDLE_TEMPLATE = "chatlog-keeper-v{version}-source.tar.gz"
 DESCRIPTOR_TEMPLATE = "chatlog-keeper-v{version}-{platform}-{arch}.artifact.json"
 
@@ -75,6 +79,14 @@ _PARTICIPANT_DIRECTORY_CAPABILITY = {
         "max_participants": 50_000,
     },
 }
+_KEY_IDENTITY_CAPABILITY = {
+    "capability": "key-identity-v1",
+    "schema": "chatlog-keeper.key-identity.v1",
+    "source": "wechat",
+    "authority": "database-master-key-proof",
+    "account_ref_format": "chatlog-account-ref-v1-sha256",
+}
+_KEY_IDENTITY_PROTOCOL = _KEY_IDENTITY_CAPABILITY["capability"]
 _SUPPORTED_TARGETS = {
     ("macos", "arm64"): "chatlog-keeper-macos-arm64",
     ("windows", "x86_64"): "chatlog-keeper.exe",
@@ -254,6 +266,26 @@ def validate_participant_directory_capability(value: Mapping[str, Any]) -> None:
         raise ReleaseMetadataError("participant-directory capability identity drifted")
 
 
+def validate_key_identity_capability(value: Mapping[str, Any]) -> None:
+    """Require the executable's exact frozen key identity capability payload."""
+
+    if set(value) != set(_KEY_IDENTITY_CAPABILITY):
+        raise ReleaseMetadataError("key-identity capability fields drifted")
+    if _canonical_json(dict(value)) != _canonical_json(_KEY_IDENTITY_CAPABILITY):
+        raise ReleaseMetadataError("key-identity capability identity drifted")
+
+
+def validate_key_identity_probe_capability(value: Mapping[str, Any]) -> None:
+    """Require the frozen probe to advertise the exact WeChat identity protocol."""
+
+    wechat = value.get("wechat")
+    if (
+        type(wechat) is not dict
+        or wechat.get("protocol_capabilities") != [_KEY_IDENTITY_PROTOCOL]
+    ):
+        raise ReleaseMetadataError("key-identity capability identity drifted")
+
+
 def validate_executable_header(
     executable: Path,
     *,
@@ -298,10 +330,10 @@ def validate_executable_header(
         raise ReleaseMetadataError("release executable header could not be read") from None
 
 
-def _run_capability(executable: Path, protocol: str) -> dict[str, Any]:
+def _run_json_command(executable: Path, *arguments: str) -> dict[str, Any]:
     try:
         completed = subprocess.run(
-            [str(executable), protocol, "--capabilities"],
+            [str(executable), *arguments],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -315,14 +347,22 @@ def _run_capability(executable: Path, protocol: str) -> dict[str, Any]:
     return _decode_one_json_object(completed.stdout)
 
 
+def _run_capability(executable: Path, protocol: str) -> dict[str, Any]:
+    return _run_json_command(executable, protocol, "--capabilities")
+
+
 def validate_frozen_capabilities(executable: Path) -> None:
-    """Execute and strictly validate both no-input frozen IPC capabilities."""
+    """Execute and strictly validate every frozen no-input release capability."""
 
     _regular_file_size_and_sha256(executable)
     message_stream = _run_capability(executable, "message-stream-v1")
     participant_directory = _run_capability(executable, "participant-directory-v1")
+    key_identity = _run_capability(executable, "key-identity-v1")
+    probe = _run_json_command(executable, "probe")
     validate_message_stream_capability(message_stream)
     validate_participant_directory_capability(participant_directory)
+    validate_key_identity_capability(key_identity)
+    validate_key_identity_probe_capability(probe)
 
 
 def build_source_bundle(

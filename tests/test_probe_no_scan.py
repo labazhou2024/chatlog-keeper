@@ -44,15 +44,17 @@ def test_probe_wechat_never_scans(monkeypatch):
     assert r["needs_key"] is True         # running + data + no key → guide to 取密钥
 
 
-def test_probe_wechat_available_with_cached_key(monkeypatch):
-    from chatlog_keeper import cli, wechat_db
+def test_probe_wechat_available_with_cached_key(monkeypatch, tmp_path):
+    from chatlog_keeper import cli, wechat_db, wechat_key_identity
 
     monkeypatch.setattr(wechat_db.WeChatDBReader, "initialize",
                         lambda self: (_ for _ in ()).throw(AssertionError("no scan in probe")))
     monkeypatch.setattr(wechat_db, "_get_weixin_pids", lambda: [1])
-    monkeypatch.setattr(wechat_db, "find_weixin_data_root", lambda: Path("X:/fake"))
-    account_dir = Path("X:/fake/wxid_demo")
+    monkeypatch.setattr(wechat_db, "find_weixin_data_root", lambda: tmp_path)
+    account_dir = tmp_path / "wxid_demo"
     database = account_dir / "db_storage" / "message" / "message_0.db"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"page")
     monkeypatch.setattr(wechat_db, "find_wxid_dirs", lambda root: [account_dir])
     monkeypatch.setattr(wechat_db, "find_msg_databases", lambda _root: [database])
     monkeypatch.setattr(
@@ -70,15 +72,21 @@ def test_probe_wechat_available_with_cached_key(monkeypatch):
     r = cli._probe_wechat()
     assert r["available"] is True         # 32-byte cached key → ready now
     assert r["needs_key"] is False
+    assert r["protocol_capabilities"] == ["key-identity-v1"]
+    assert r["key_identity"] == wechat_key_identity.envelope(b"\x11" * 32)
 
 
-def test_probe_wechat_rejects_a_cached_key_for_the_wrong_account(monkeypatch):
+def test_probe_wechat_rejects_a_cached_key_for_the_wrong_account(
+    monkeypatch, tmp_path
+):
     from chatlog_keeper import cli, wechat_db
 
-    account_dir = Path("X:/fake/wxid_current")
+    account_dir = tmp_path / "wxid_current"
     database = account_dir / "db_storage" / "message" / "message_0.db"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"page")
     monkeypatch.setattr(wechat_db, "_get_weixin_pids", lambda: [1])
-    monkeypatch.setattr(wechat_db, "find_weixin_data_root", lambda: Path("X:/fake"))
+    monkeypatch.setattr(wechat_db, "find_weixin_data_root", lambda: tmp_path)
     monkeypatch.setattr(wechat_db, "find_wxid_dirs", lambda _root: [account_dir])
     monkeypatch.setattr(wechat_db, "find_msg_databases", lambda _root: [database])
     monkeypatch.setattr(
@@ -94,6 +102,8 @@ def test_probe_wechat_rejects_a_cached_key_for_the_wrong_account(monkeypatch):
     assert result["available"] is False
     assert result["enc_keys_present"] is False
     assert result["needs_key"] is True
+    assert result["protocol_capabilities"] == ["key-identity-v1"]
+    assert "key_identity" not in result
 
 
 def test_wechat_directory_reader_never_scans_without_cached_key(monkeypatch, tmp_path):

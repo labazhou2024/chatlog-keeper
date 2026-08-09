@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import signal
+import stat
 import sys
 import time
 from contextlib import contextmanager
@@ -38,6 +39,7 @@ from chatlog_keeper import (
     stream_protocol,
     wechat_db,
     wechat_image,
+    wechat_key_identity,
 )
 from chatlog_keeper.core._secrets import private_binary_writer
 from chatlog_keeper.export import export_html, export_json
@@ -66,6 +68,9 @@ class _SelectionError(Exception):
 
 _MAX_SELECTION_STDIN_CHARS = 1_048_576
 _MAX_KEY_STDIN_CHARS = 256
+_MAX_KEY_IDENTITY_STDIN_CHARS = 1024
+_KEY_IDENTITY_SET_KEY_SCHEMA = "chatlog-keeper.set-key-identity.v1"
+_EXPECTED_ACCOUNT_REF_UNSET = object()
 _CONVERSATION_SCOPE_VERSION = 2
 _CONVERSATION_TYPES = frozenset({"direct", "group"})
 
@@ -695,20 +700,32 @@ def _probe_wechat() -> dict:
         root = wechat_db.find_weixin_data_root()
         wxid_dirs = wechat_db.find_wxid_dirs(root) if root else []
         readable_wxid_dir = None
-        for wxid_dir in wxid_dirs:
-            account_id = wxid_dir.name
-            cached = wechat_db.load_cached_wechat_key_for_account(account_id)
-            if not cached or len(cached) != 32:
-                continue
-            for database in wechat_db.find_msg_databases(wxid_dir):
-                page1 = wechat_db._read_stable_page1(database)
-                if page1 and wechat_db._verify_key_v4(cached, page1):
-                    readable_wxid_dir = wxid_dir
-                    break
-            if readable_wxid_dir is not None:
-                break
-        has_key = readable_wxid_dir is not None
-        return {
+        verified: tuple[bytes, wechat_key_identity.TargetSnapshot] | None = None
+        if wxid_dirs:
+            try:
+                snapshots = _wechat_key_target_snapshots(
+                    str(root) if root is not None else None
+                )
+                verified = wechat_key_identity.verified_cached_target(snapshots)
+            except wechat_key_identity.TargetError:
+                # A missing, unstable, changed, or multi-account target is not
+                # identity evidence.  Preserve the actionable needs-key state
+                # without exposing a path or a native account value.
+                verified = None
+        if verified is not None:
+            key, target = verified
+            readable_wxid_dir = next(
+                (
+                    wxid_dir
+                    for wxid_dir in wxid_dirs
+                    if target.account_id and wxid_dir.name == target.account_id
+                ),
+                target.path.parents[2],
+            )
+        else:
+            key = None
+        has_key = key is not None
+        result = {
             "source": "wechat",
             "available": has_key,
             "client_running": running,
@@ -716,8 +733,11 @@ def _probe_wechat() -> dict:
             "enc_keys_present": has_key,
             "needs_key": bool(running and wxid_dirs and not has_key),
         }
-    except Exception as e:  # noqa: BLE001
-        return {"source": "wechat", "available": False, "error": f"{type(e).__name__}:{e}"}
+        return wechat_key_identity.protocol_payload(result, key=key)
+    except Exception:  # noqa: BLE001 - probe diagnostics must not expose paths
+        return wechat_key_identity.protocol_payload(
+            {"source": "wechat", "available": False, "error": "probe_failed"}
+        )
 
 
 def _export_wechat(
@@ -916,24 +936,52 @@ def _wechat_verification_databases(data_root: str | None = None) -> list[Path]:
         if root is None:
             return []
         direct_account = root / "db_storage" / "message"
-        account_roots = (
-            [root]
-            if direct_account.is_dir()
-            else sorted(wechat_db.find_wxid_dirs(root), key=lambda item: item.name)
-        )
-    except (OSError, RuntimeError):
+        if direct_account.is_dir():
+            account_roots = [root]
+        else:
+            # ``find_wxid_dirs`` is intentionally tolerant for normal export
+            # discovery and can return a partial result after an ``OSError``.
+            # Identity proof cannot use a partial account set: compare it with
+            # one strict enumeration and reject any discrepancy or race.
+            discovered = tuple(Path(item) for item in wechat_db.find_wxid_dirs(root))
+            strict_accounts = []
+            for item in root.iterdir():
+                item_stat = os.lstat(item)
+                if not stat.S_ISDIR(item_stat.st_mode):
+                    continue
+                if item.name.startswith("wxid_") or len(item.name) > 10:
+                    strict_accounts.append(item)
+            discovered_keys = {
+                os.path.normcase(os.fspath(item)) for item in discovered
+            }
+            strict_keys = {
+                os.path.normcase(os.fspath(item)) for item in strict_accounts
+            }
+            if discovered_keys != strict_keys:
+                raise wechat_key_identity.TargetError("database_unstable")
+            account_roots = sorted(
+                strict_accounts,
+                key=lambda item: (item.name.lower(), os.fspath(item)),
+            )
+    except FileNotFoundError:
         return []
+    except wechat_key_identity.TargetError:
+        raise
+    except (OSError, RuntimeError):
+        raise wechat_key_identity.TargetError("database_unstable") from None
 
     databases: list[Path] = []
     for account_root in account_roots:
         try:
+            # Do not use ``Path.is_file`` here: it converts some permission
+            # failures into ``False`` and could silently remove an account's
+            # oracle.  ``target_snapshots`` performs the strict file check.
             candidates = [
                 Path(candidate)
                 for candidate in wechat_db.find_msg_databases(account_root)
-                if Path(candidate).is_file()
             ]
-        except OSError:
-            continue
+        except (OSError, RuntimeError):
+            raise wechat_key_identity.TargetError("database_unstable") from None
         if not candidates:
             continue
         candidates.sort(
@@ -946,7 +994,23 @@ def _wechat_verification_databases(data_root: str | None = None) -> list[Path]:
     return databases
 
 
-def _set_key(source: str, key: str, data_root: str | None = None) -> dict:
+def _wechat_key_target_snapshots(
+    data_root: str | None = None,
+) -> tuple[wechat_key_identity.TargetSnapshot, ...]:
+    """Freeze the bounded canonical DB set used by one identity action."""
+
+    return wechat_key_identity.target_snapshots(
+        _wechat_verification_databases(data_root)
+    )
+
+
+def _set_key(
+    source: str,
+    key: str,
+    data_root: str | None = None,
+    *,
+    expected_account_ref: str | None | object = _EXPECTED_ACCOUNT_REF_UNSET,
+) -> dict:
     """Save a manually-supplied decryption key to the cache so a later export
     uses it cache-first (no memory scan needed).
 
@@ -964,64 +1028,79 @@ def _set_key(source: str, key: str, data_root: str | None = None) -> dict:
         if len(key) != 64 or any(char not in "0123456789abcdefABCDEF" for char in key):
             return {"source": "wechat", "ok": False, "error": "invalid WeChat key (expect 64 hex chars)"}
         kb = bytes.fromhex(key)
-        databases = _wechat_verification_databases(data_root)
-        if not databases:
+        try:
+            snapshots = _wechat_key_target_snapshots(data_root)
+        except wechat_key_identity.TargetError as exc:
+            error = (
+                "could not locate a WeChat message database for key verification"
+                if exc.code == "database_unavailable"
+                else "could not read a stable WeChat database page for key verification"
+            )
             return {
                 "source": "wechat",
                 "ok": False,
                 "saved_to": None,
-                "error": "could not locate a WeChat message database for key verification",
+                "error": error,
             }
-
-        stable_page_found = False
-        verified_databases = []
-        for database in databases:
-            page1 = wechat_db._read_stable_page1(database)
-            if not page1:
-                continue
-            stable_page_found = True
-            if wechat_db._verify_key_v4(kb, page1):
-                verified_databases.append(database)
-
-        if not stable_page_found:
+        try:
+            target = wechat_key_identity.matching_target(kb, snapshots)
+        except wechat_key_identity.TargetError as exc:
             return {
                 "source": "wechat",
                 "ok": False,
                 "saved_to": None,
-                "error": "could not read a stable WeChat database page for key verification",
+                "error": (
+                    "WeChat key matched multiple local accounts"
+                    if exc.code == "ambiguous_account"
+                    else "WeChat key did not pass local database verification"
+                ),
             }
-        if not verified_databases:
+        save_kwargs: dict[str, Any] = {}
+        if expected_account_ref is not _EXPECTED_ACCOUNT_REF_UNSET:
+            save_kwargs["expected_account_ref"] = expected_account_ref
+        save_status, saved_path = wechat_key_identity.save_for_target(
+            kb,
+            target,
+            snapshots,
+            **save_kwargs,
+        )
+        if save_status == "account_ref_mismatch":
             return {
                 "source": "wechat",
                 "ok": False,
                 "saved_to": None,
-                "error": "WeChat key did not pass local database verification",
+                "error": "WeChat key did not match expected account identity",
             }
-
-        saved_paths = []
-        account_databases = {}
-        for database in verified_databases:
-            account_id = wechat_db.wechat_account_id_for_database(database)
-            if account_id:
-                account_databases.setdefault(account_id, database)
-        if account_databases:
-            for account_id, database in account_databases.items():
-                if wechat_db.save_cached_wechat_key_for_account(
-                    kb, account_id, database
-                ):
-                    saved_paths.append(
-                        wechat_db._wechat_account_key_cache_path(account_id)
-                    )
-            ok = len(saved_paths) == len(account_databases)
-        else:
-            # Compatibility for callers supplying a legacy/non-canonical oracle.
-            # Never touch this global cache when a matching account is known.
-            ok = wechat_db.save_cached_wechat_key(kb)
-            if ok:
-                saved_paths.append(wechat_db._wechat_key_cache_path())
-        return {"source": "wechat", "ok": bool(ok),
-                "saved_to": Path(saved_paths[0]).as_posix() if ok else None,
-                "error": None if ok else "verified WeChat key could not be stored"}
+        if save_status == "save_failed":
+            return {
+                "source": "wechat",
+                "ok": False,
+                "saved_to": None,
+                "error": "verified WeChat key could not be stored",
+            }
+        if save_status == "selection_failed":
+            return {
+                "source": "wechat",
+                "ok": False,
+                "saved_to": None,
+                "error": "verified WeChat key identity could not be stored",
+            }
+        if save_status != "ok" or saved_path is None:
+            return {
+                "source": "wechat",
+                "ok": False,
+                "saved_to": None,
+                "error": "WeChat database changed during key configuration",
+            }
+        return wechat_key_identity.protocol_payload(
+            {
+                "source": "wechat",
+                "ok": True,
+                "saved_to": Path(saved_path).as_posix(),
+                "error": None,
+            },
+            key=kb,
+        )
     return {"ok": False, "error": "unknown source: " + str(source)}
 
 
@@ -1037,6 +1116,49 @@ def _read_key_stdin() -> str | None:
     if len(non_empty_lines) != 1:
         return None
     return supplied
+
+
+def _read_key_identity_stdin(source: str) -> tuple[str, str | None] | None:
+    """Read the strict private v1 set-key request without echoing its values."""
+
+    if source != "wechat":
+        return None
+    try:
+        supplied = sys.stdin.read(_MAX_KEY_IDENTITY_STDIN_CHARS + 1)
+    except (OSError, UnicodeError):
+        return None
+    if len(supplied) > _MAX_KEY_IDENTITY_STDIN_CHARS:
+        return None
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate field")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(supplied, object_pairs_hook=reject_duplicates)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if (
+        type(payload) is not dict
+        or set(payload) != {"schema", "source", "key", "expected_account_ref"}
+        or payload.get("schema") != _KEY_IDENTITY_SET_KEY_SCHEMA
+        or payload.get("source") != source
+        or type(payload.get("key")) is not str
+        or not payload["key"]
+        or len(payload["key"]) > _MAX_KEY_STDIN_CHARS
+    ):
+        return None
+    expected = payload.get("expected_account_ref")
+    if expected is not None and (
+        type(expected) is not str
+        or wechat_key_identity._ACCOUNT_REF_RE.fullmatch(expected) is None
+    ):
+        return None
+    return payload["key"], expected
 
 
 # ─── automatic key extraction (passive memory scan / active debugger) ─────────
@@ -1283,43 +1405,53 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
     if source == "wechat":
         if method == "active":
             db_path = _wechat_message_db_for_active(data_root)
+            try:
+                snapshots = _wechat_key_target_snapshots(data_root)
+            except wechat_key_identity.TargetError:
+                if not db_path:
+                    return {"source": "wechat", "method": "active", "ok": False,
+                            "error": "active extraction could not locate message_0.db for HMAC "
+                                     "verification (set --data-root to the xwechat_files folder)"}
+                return {"source": "wechat", "method": "active", "ok": False,
+                        "error": "active extraction could not freeze a stable WeChat "
+                                 "database target for HMAC verification",
+                        "db_path": db_path}
             key = active_key.extract_wechat_key_active(db_path=db_path)
-            saved = False
-            saved_path = wechat_db._wechat_key_cache_path()
-            verified_db = Path(db_path) if db_path else None
-            account_databases = {}
             if key:
-                for database in _wechat_verification_databases(data_root):
-                    page1 = wechat_db._read_stable_page1(database)
-                    if not page1 or not wechat_db._verify_key_v4(key, page1):
-                        continue
-                    account_id = wechat_db.wechat_account_id_for_database(database)
-                    if account_id:
-                        account_databases.setdefault(account_id, database)
-            if account_databases:
-                saved_paths = []
-                for account_id, database in account_databases.items():
-                    if wechat_db.save_cached_wechat_key_for_account(
-                        key, account_id, database
-                    ):
-                        saved_paths.append(
-                            wechat_db._wechat_account_key_cache_path(account_id)
-                        )
-                saved = len(saved_paths) == len(account_databases)
-                if saved_paths:
-                    saved_path = saved_paths[0]
-                    verified_db = next(iter(account_databases.values()))
-            elif key and db_path:
-                # Preserve support for a direct legacy/non-canonical DB oracle.
-                page1 = wechat_db._read_stable_page1(Path(db_path))
-                if page1 and wechat_db._verify_key_v4(key, page1):
-                    saved = wechat_db.save_cached_wechat_key(key)
-            if key and saved:
-                return {"source": "wechat", "method": "active", "ok": True,
-                        "key_len": len(key),
-                        "saved_to": Path(saved_path).as_posix(),
-                        "db_path": str(verified_db) if verified_db else db_path,
-                        "fresh_extraction": True}
+                try:
+                    target = wechat_key_identity.matching_target(key, snapshots)
+                except wechat_key_identity.TargetError as exc:
+                    return {"source": "wechat", "method": "active", "ok": False,
+                            "error": (
+                                "active extraction key matched multiple local accounts"
+                                if exc.code == "ambiguous_account"
+                                else "active extraction got no key for the frozen WeChat "
+                                     "database target"
+                            ),
+                            "db_path": db_path}
+                save_status, saved_path = wechat_key_identity.save_for_target(
+                    key, target, snapshots
+                )
+                if save_status == "ok" and saved_path is not None:
+                    return wechat_key_identity.protocol_payload(
+                        {"source": "wechat", "method": "active", "ok": True,
+                         "key_len": len(key),
+                         "saved_to": saved_path.as_posix(),
+                         "db_path": str(target.path),
+                         "fresh_extraction": True},
+                        key=key,
+                    )
+                if save_status == "database_changed":
+                    return {"source": "wechat", "method": "active", "ok": False,
+                            "error": "WeChat database changed during active key extraction",
+                            "db_path": db_path}
+                if save_status == "selection_failed":
+                    return {"source": "wechat", "method": "active", "ok": False,
+                            "error": "verified WeChat key identity could not be stored",
+                            "db_path": db_path}
+                return {"source": "wechat", "method": "active", "ok": False,
+                        "error": "verified WeChat key could not be stored",
+                        "db_path": db_path}
             if not db_path:
                 return {"source": "wechat", "method": "active", "ok": False,
                         "error": "active extraction could not locate message_0.db for HMAC "
@@ -1333,25 +1465,46 @@ def _extract_key(source: str, method: str, data_root: str | None = None) -> dict
         if force_extract:
             return {"source": "wechat", "method": "passive", "ok": False,
                     "error": "fresh WeChat extraction requires --method active"}
+        try:
+            snapshots = _wechat_key_target_snapshots(data_root)
+        except wechat_key_identity.TargetError:
+            return {"source": "wechat", "method": "passive", "ok": False,
+                    "error": "passive extraction could not freeze a stable WeChat "
+                             "database target for HMAC verification"}
         reader = wechat_db.WeChatDBReader()
         reader.initialize()
         enc = getattr(reader, "enc_keys", None)
         if enc:
             # 4.x derives every per-DB page key from one 32-byte master key.
-            verification_db, master = next(iter(enc.items()))
-            account_id = getattr(reader, "account_id", None)
-            if account_id:
-                saved = wechat_db.save_cached_wechat_key_for_account(
-                    master, str(account_id), verification_db
+            _verification_db, master = next(iter(enc.items()))
+            try:
+                target = wechat_key_identity.matching_target(master, snapshots)
+            except wechat_key_identity.TargetError as exc:
+                return {"source": "wechat", "method": "passive", "ok": False,
+                        "error": (
+                            "passive extraction key matched multiple local accounts"
+                            if exc.code == "ambiguous_account"
+                            else "passive extraction key did not authenticate the frozen "
+                                 "WeChat database target"
+                        )}
+            save_status, saved_path = wechat_key_identity.save_for_target(
+                master, target, snapshots
+            )
+            if save_status == "ok" and saved_path is not None:
+                return wechat_key_identity.protocol_payload(
+                    {"source": "wechat", "method": "passive", "ok": True,
+                     "key_len": len(master),
+                     "saved_to": saved_path.as_posix()},
+                    key=master,
                 )
-                saved_path = wechat_db._wechat_account_key_cache_path(str(account_id))
-            else:
-                saved = wechat_db.save_cached_wechat_key(master)
-                saved_path = wechat_db._wechat_key_cache_path()
-            if saved:
-                return {"source": "wechat", "method": "passive", "ok": True,
-                        "key_len": len(master),
-                        "saved_to": Path(saved_path).as_posix()}
+            if save_status == "database_changed":
+                return {"source": "wechat", "method": "passive", "ok": False,
+                        "error": "WeChat database changed during passive key extraction"}
+            if save_status == "selection_failed":
+                return {"source": "wechat", "method": "passive", "ok": False,
+                        "error": "verified WeChat key identity could not be stored"}
+            return {"source": "wechat", "method": "passive", "ok": False,
+                    "error": "verified WeChat key could not be stored"}
         return {"source": "wechat", "method": "passive", "ok": False,
                 "error": "passive scan found no key (WeChat not running, or 4.1.10.31+ where the "
                          "key is no longer in plaintext memory — try `--method active` or `set-key`)"}
@@ -1964,6 +2117,17 @@ def main(argv: list[str] | None = None) -> int:
         help="override the selected source's local data root",
     )
 
+    p_key_identity = sub.add_parser(
+        "key-identity-v1",
+        help="publish the frozen WeChat key identity capability contract",
+    )
+    key_identity_mode = p_key_identity.add_mutually_exclusive_group(required=True)
+    key_identity_mode.add_argument(
+        "--capabilities",
+        action="store_true",
+        help="emit the frozen key-identity-v1 capability contract",
+    )
+
     p_qq = sub.add_parser("qq", help="export your QQ history -> json + html")
     p_qq.add_argument("--days", type=int, default=7, help="lookback window in days (default 7)")
     p_qq.add_argument("--out", type=str, required=True, help="output directory")
@@ -2034,6 +2198,11 @@ def main(argv: list[str] | None = None) -> int:
         help="read one bounded non-empty key line from standard input so it is "
         "not exposed in the process list",
     )
+    key_input.add_argument(
+        "--key-identity-stdin",
+        action="store_true",
+        help="read one strict private key-identity-v1 set-key request from standard input",
+    )
 
     p_ek = sub.add_parser("extract-key",
                           help="acquire + cache a decryption key automatically")
@@ -2063,6 +2232,8 @@ def main(argv: list[str] | None = None) -> int:
         return _message_stream_v1_command(args)
     if args.cmd == "participant-directory-v1":
         return _participant_directory_v1_command(args)
+    if args.cmd == "key-identity-v1":
+        return _print_json(wechat_key_identity.capabilities_payload())
     if args.cmd == "qq":
         try:
             selection = _selection_from_args(args)
@@ -2110,7 +2281,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "images":
         return _print_json(_decrypt_images(args.src, args.out))
     if args.cmd == "set-key":
-        supplied = _read_key_stdin() if args.key_stdin else args.key
+        if args.key_identity_stdin:
+            identity_request = _read_key_identity_stdin(args.source)
+            if identity_request is None:
+                supplied = None
+                expected_account_ref = _EXPECTED_ACCOUNT_REF_UNSET
+            else:
+                supplied, expected_account_ref = identity_request
+        else:
+            supplied = _read_key_stdin() if args.key_stdin else args.key
+            expected_account_ref = _EXPECTED_ACCOUNT_REF_UNSET
         if supplied is None:
             return _print_json({
                 "source": args.source,
@@ -2118,7 +2298,17 @@ def main(argv: list[str] | None = None) -> int:
                 "saved_to": None,
                 "error": "invalid key input",
             })
-        return _print_json(_set_key(args.source, supplied, data_root=args.data_root))
+        set_key_kwargs: dict[str, Any] = {}
+        if expected_account_ref is not _EXPECTED_ACCOUNT_REF_UNSET:
+            set_key_kwargs["expected_account_ref"] = expected_account_ref
+        return _print_json(
+            _set_key(
+                args.source,
+                supplied,
+                data_root=args.data_root,
+                **set_key_kwargs,
+            )
+        )
     if args.cmd == "extract-key":
         return _print_json(_extract_key(args.source, args.method, data_root=getattr(args, "data_root", None)))
     return 2

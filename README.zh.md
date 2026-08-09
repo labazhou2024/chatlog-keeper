@@ -97,6 +97,7 @@ $expected = (Get-Content .\chatlog-keeper.exe.sha256).Split()[0]
 $actual = (Get-FileHash .\chatlog-keeper.exe -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "chatlog-keeper checksum mismatch" }
 .\chatlog-keeper.exe --help
+.\chatlog-keeper.exe key-identity-v1 --capabilities
 .\chatlog-keeper.exe message-stream-v1 --capabilities
 .\chatlog-keeper.exe participant-directory-v1 --capabilities
 ```
@@ -106,6 +107,7 @@ if ($actual -ne $expected) { throw "chatlog-keeper checksum mismatch" }
 shasum -a 256 -c chatlog-keeper-macos-arm64.sha256
 chmod 755 chatlog-keeper-macos-arm64
 ./chatlog-keeper-macos-arm64 --help
+./chatlog-keeper-macos-arm64 key-identity-v1 --capabilities
 ./chatlog-keeper-macos-arm64 message-stream-v1 --capabilities
 ./chatlog-keeper-macos-arm64 participant-directory-v1 --capabilities
 ```
@@ -113,8 +115,8 @@ chmod 755 chatlog-keeper-macos-arm64
 每个 Release 还包含从对应 tag commit 确定性生成的
 `chatlog-keeper-v*-source.tar.gz`，以及 Windows、macOS 各自的 canonical approved
 artifact descriptor；它们旁边都有独立 `.sha256`，校验方式相同。两个 descriptor
-引用同一个 source bundle，并同时声明两个冻结的本机 IPC 协议，使宿主能够把下载的
-可执行文件与精确源码绑定。
+引用同一个 source bundle，并同时声明三项冻结的本机 IPC 协议能力，使宿主能够把
+下载的可执行文件与精确源码绑定。
 
 ## 使用
 

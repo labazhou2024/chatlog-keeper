@@ -1,9 +1,10 @@
 import io
+import json
 from pathlib import Path
 
 import pytest
 
-from chatlog_keeper import cli
+from chatlog_keeper import cli, wechat_key_identity
 
 
 def test_set_key_can_be_read_from_stdin_without_argv_secret(monkeypatch):
@@ -22,6 +23,86 @@ def test_set_key_can_be_read_from_stdin_without_argv_secret(monkeypatch):
         "key": "0123456789abcdef\n",
         "data_root": None,
     }
+
+
+def test_key_identity_set_key_request_passes_expected_ref_only_through_stdin(
+    monkeypatch,
+):
+    seen = {}
+    expected = "chatlog-account-ref-v1:" + ("a" * 64)
+
+    def fake_set_key(
+        source,
+        key,
+        data_root=None,
+        *,
+        expected_account_ref,
+    ):
+        seen.update(
+            source=source,
+            key=key,
+            data_root=data_root,
+            expected_account_ref=expected_account_ref,
+        )
+        return {"source": source, "ok": True}
+
+    request = json.dumps(
+        {
+            "schema": "chatlog-keeper.set-key-identity.v1",
+            "source": "wechat",
+            "key": "ab" * 32,
+            "expected_account_ref": expected,
+        },
+        separators=(",", ":"),
+    )
+    monkeypatch.setattr(cli, "_set_key", fake_set_key)
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(request))
+
+    argv = ["set-key", "--source", "wechat", "--key-identity-stdin"]
+    assert expected not in repr(argv)
+    assert "ab" * 32 not in repr(argv)
+    assert cli.main(argv) == 0
+    assert seen == {
+        "source": "wechat",
+        "key": "ab" * 32,
+        "data_root": None,
+        "expected_account_ref": expected,
+    }
+
+
+@pytest.mark.parametrize(
+    "payload_text",
+    [
+        "{}",
+        '{"schema":"chatlog-keeper.set-key-identity.v1",'
+        '"source":"wechat","key":"aa","key":"bb",'
+        '"expected_account_ref":null}',
+        json.dumps(
+            {
+                "schema": "chatlog-keeper.set-key-identity.v1",
+                "source": "wechat",
+                "key": "ab" * 32,
+                "expected_account_ref": "chatlog-account-ref-v1:" + ("A" * 64),
+            }
+        ),
+    ],
+)
+def test_key_identity_set_key_request_rejects_schema_or_type_drift(
+    monkeypatch,
+    capsys,
+    payload_text,
+):
+    monkeypatch.setattr(
+        cli,
+        "_set_key",
+        lambda *_args, **_kwargs: pytest.fail("invalid request reached set-key"),
+    )
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(payload_text))
+
+    assert cli.main(
+        ["set-key", "--source", "wechat", "--key-identity-stdin"]
+    ) == 1
+    assert "invalid key input" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -205,6 +286,7 @@ def test_wechat_set_key_fails_closed_when_all_database_pages_are_unstable(
 
 def test_wechat_set_key_fails_closed_on_hmac_mismatch(monkeypatch, tmp_path):
     db = tmp_path / "message_0.db"
+    db.write_bytes(b"fixture")
     monkeypatch.setattr(
         cli, "_wechat_verification_databases", lambda data_root=None: [db], raising=False
     )
@@ -229,6 +311,8 @@ def test_wechat_set_key_reads_verifies_then_saves_after_any_account_matches(
 ):
     first = tmp_path / "first.db"
     second = tmp_path / "second.db"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
     candidate = bytes.fromhex("04" * 32)
     events = []
 
@@ -255,28 +339,47 @@ def test_wechat_set_key_reads_verifies_then_saves_after_any_account_matches(
     monkeypatch.setattr(cli.wechat_db, "_verify_key_v4", fake_verify)
     monkeypatch.setattr(cli.wechat_db, "save_cached_wechat_key", fake_save)
     monkeypatch.setattr(
+        wechat_key_identity, "write_selected_key", lambda key: key == candidate
+    )
+    monkeypatch.setattr(
         cli.wechat_db, "_wechat_key_cache_path", lambda: Path("wechat_db.key")
     )
 
     result = cli._set_key("wechat", "04" * 32 + "\n", data_root="configured-root")
 
-    assert result == {
-        "source": "wechat",
-        "ok": True,
-        "saved_to": "wechat_db.key",
-        "error": None,
-    }
+    assert result == wechat_key_identity.protocol_payload(
+        {
+            "source": "wechat",
+            "ok": True,
+            "saved_to": "wechat_db.key",
+            "error": None,
+        },
+        key=candidate,
+    )
     assert events == [
+        ("read", "first.db"),
+        ("read", "second.db"),
+        ("verify", "first.db"),
+        ("verify", "second.db"),
         ("read", "first.db"),
         ("verify", "first.db"),
         ("read", "second.db"),
         ("verify", "second.db"),
         ("save", True),
+        ("read", "first.db"),
+        ("verify", "first.db"),
+        ("read", "second.db"),
+        ("verify", "second.db"),
+        ("read", "first.db"),
+        ("verify", "first.db"),
+        ("read", "second.db"),
+        ("verify", "second.db"),
     ]
 
 
 def test_wechat_set_key_reports_verified_cache_write_failure(monkeypatch, tmp_path):
     db = tmp_path / "message_0.db"
+    db.write_bytes(b"fixture")
     monkeypatch.setattr(
         cli, "_wechat_verification_databases", lambda data_root=None: [db], raising=False
     )
@@ -330,15 +433,21 @@ def test_wechat_set_key_writes_only_the_hmac_matching_account(monkeypatch, tmp_p
         "save_cached_wechat_key",
         lambda _key: pytest.fail("a discovered account key must not overwrite global cache"),
     )
+    monkeypatch.setattr(
+        wechat_key_identity, "write_selected_key", lambda key: key == candidate
+    )
 
     result = cli._set_key("wechat", "06" * 32, data_root=str(root))
 
-    assert result == {
-        "source": "wechat",
-        "ok": True,
-        "saved_to": "wechat_accounts/wxid_second.key",
-        "error": None,
-    }
+    assert result == wechat_key_identity.protocol_payload(
+        {
+            "source": "wechat",
+            "ok": True,
+            "saved_to": "wechat_accounts/wxid_second.key",
+            "error": None,
+        },
+        key=candidate,
+    )
     assert saves == [(candidate, "wxid_second", second)]
     assert first != second
 
