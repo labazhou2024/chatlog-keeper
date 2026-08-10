@@ -119,7 +119,9 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert workflow.count("release_metadata.py verify-version") == 2
     assert workflow.count("release_metadata.py validate-capabilities") == 2
     assert "build-source-bundle" in workflow
-    assert '--commit "${GITHUB_SHA}"' in workflow
+    assert '--commit "${RELEASE_COMMIT}"' in workflow
+    assert workflow.count('--commit "$env:RELEASE_COMMIT"') == 2
+    assert workflow.count("ref: ${{ github.sha }}") == 1
     assert workflow.count("release_metadata.py build-descriptor") == 2
     assert "--platform windows" in workflow
     assert "--arch x86_64" in workflow
@@ -150,11 +152,50 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
         "actions/checkout@"
     )
     assert "release-ref-gate:" in workflow
+    assert (
+        "  workflow_dispatch:\n"
+        "    inputs:\n"
+        "      release_tag:\n"
+        "        description: Existing annotated release tag to build\n"
+        "        required: true\n"
+        "        type: string\n"
+        in workflow
+    )
+    dispatch_or_push_tag = (
+        "${{ github.event_name == 'workflow_dispatch' "
+        "&& inputs.release_tag || github.ref_name }}"
+    )
+    assert workflow.count(dispatch_or_push_tag) == 2
+    assert f"group: chatlog-keeper-release-{dispatch_or_push_tag}" in workflow
+    assert "cancel-in-progress: false" in workflow
+    assert workflow.count(
+        "ref: ${{ needs.release-ref-gate.outputs.release_commit }}"
+    ) == 2
+    assert "release_commit: ${{ steps.freeze.outputs.release_commit }}" in workflow
+    assert "release_tag: ${{ steps.freeze.outputs.release_tag }}" in workflow
+    assert "release_tag_object: ${{ steps.freeze.outputs.release_tag_object }}" in workflow
     assert 'test "$GITHUB_REF_TYPE" = "tag"' in workflow
-    assert '[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+[A-Za-z0-9.+-]*$ ]]' in workflow
-    assert 'git cat-file -t "$GITHUB_REF_NAME"' in workflow
-    assert 'git rev-parse --verify "${GITHUB_REF_NAME}^{commit}"' in workflow
-    assert 'test "$tag_commit" = "$GITHUB_SHA"' in workflow
+    assert '[[ "$RELEASE_TAG" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+[A-Za-z0-9.+-]*$ ]]' in workflow
+    assert 'release_ref="refs/memexa-release-tags/$RELEASE_TAG"' in workflow
+    assert (
+        'git fetch --force --no-tags origin '
+        '"refs/tags/${RELEASE_TAG}:${release_ref}"'
+        in workflow
+    )
+    assert 'git cat-file -t "$release_ref"' in workflow
+    assert 'git rev-parse --verify "${release_ref}^{tag}"' in workflow
+    assert 'git rev-parse --verify "${release_ref}^{commit}"' in workflow
+    assert 'git cat-file tag "$tag_object"' in workflow
+    assert 'test "$direct_target_type" = "commit"' in workflow
+    assert 'test "$direct_target" = "$tag_commit"' in workflow
+    assert 'test "$embedded_tag" = "$RELEASE_TAG"' in workflow
+    assert 'git ls-remote --refs origin "refs/tags/$RELEASE_TAG"' in workflow
+    assert 'test "$remote_tag_object" = "$tag_object"' in workflow
+    assert 'git fetch --force --no-tags origin "refs/heads/main:${main_ref}"' in workflow
+    assert 'git merge-base --is-ancestor "$tag_commit" "$main_ref"' in workflow
+    assert 'test "$GITHUB_SHA" = "$tag_commit"' in workflow
+    assert 'test "$GITHUB_REF" = "refs/heads/main"' in workflow
+    assert 'git merge-base --is-ancestor "$tag_commit" "$GITHUB_SHA"' in workflow
     assert "build-windows:" in workflow
     assert "publish-release:" in workflow
     publisher = workflow.split("  publish-release:\n", maxsplit=1)[1]
@@ -166,11 +207,26 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert 'test "$(find release_inputs -type f | wc -l | tr -d \' \')" = "10"' in publisher
     assert publisher.count("sha256sum -c") == 5
     assert publisher.count("GH_TOKEN: ${{ github.token }}") == 1
+    assert 'git/ref/tags/$RELEASE_TAG" --jq .object.sha' in publisher
+    assert 'test "$current_tag_object" = "$RELEASE_TAG_OBJECT"' in publisher
+    assert 'git/tags/$RELEASE_TAG_OBJECT" --jq .object.sha' in publisher
+    assert 'test "$current_tag_commit" = "$RELEASE_COMMIT"' in publisher
+    assert 'git/tags/$RELEASE_TAG_OBJECT" --jq .tag' in publisher
+    assert 'test "$current_tag_name" = "$RELEASE_TAG"' in publisher
     assert "Publish immutable GitHub Release" not in workflow
-    assert workflow.count("RELEASE_TAG: ${{ github.ref_name }}") == 4
+    assert workflow.count(
+        "RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}"
+    ) == 7
+    assert workflow.count(
+        "RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}"
+    ) == 5
+    assert workflow.count("Verify the frozen source commit") == 2
     for line in workflow.splitlines():
         if "${{ github.ref_name }}" in line:
-            assert line.strip() == "RELEASE_TAG: ${{ github.ref_name }}"
+            assert line.strip() in {
+                f"group: chatlog-keeper-release-{dispatch_or_push_tag}",
+                f"RELEASE_TAG: {dispatch_or_push_tag}",
+            }
     assert '--tag "$RELEASE_TAG"' in workflow
     assert '--tag "$env:RELEASE_TAG"' in workflow
     assert '$releaseTag = [string]$env:RELEASE_TAG' in workflow

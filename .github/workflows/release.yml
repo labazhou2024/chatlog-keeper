@@ -5,28 +5,77 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing annotated release tag to build
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: chatlog-keeper-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   release-ref-gate:
     runs-on: ubuntu-24.04
+    outputs:
+      release_commit: ${{ steps.freeze.outputs.release_commit }}
+      release_tag: ${{ steps.freeze.outputs.release_tag }}
+      release_tag_object: ${{ steps.freeze.outputs.release_tag_object }}
     steps:
       - name: Check out the release tag
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify the tag resolves to the exact workflow commit
+          ref: ${{ github.sha }}
+      - name: Freeze the annotated tag and exact release commit
+        id: freeze
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REF_TYPE" = "tag"
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$ ]]
-          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
-          tag_commit="$(git rev-parse --verify "${GITHUB_REF_NAME}^{commit}")"
-          test "$tag_commit" = "$GITHUB_SHA"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$ ]]
+          release_ref="refs/memexa-release-tags/$RELEASE_TAG"
+          git fetch --force --no-tags origin "refs/tags/${RELEASE_TAG}:${release_ref}"
+          test "$(git cat-file -t "$release_ref")" = "tag"
+          tag_object="$(git rev-parse --verify "${release_ref}^{tag}")"
+          tag_commit="$(git rev-parse --verify "${release_ref}^{commit}")"
+          tag_headers="$(git cat-file tag "$tag_object" | sed -n '/^$/q;p')"
+          direct_target="$(printf '%s\n' "$tag_headers" | sed -n 's/^object //p')"
+          direct_target_type="$(printf '%s\n' "$tag_headers" | sed -n 's/^type //p')"
+          embedded_tag="$(printf '%s\n' "$tag_headers" | sed -n 's/^tag //p')"
+          [[ "$direct_target" =~ ^[0-9a-f]{40}$ ]]
+          test "$direct_target_type" = "commit"
+          test "$direct_target" = "$tag_commit"
+          test "$embedded_tag" = "$RELEASE_TAG"
+          read -r remote_tag_object remote_tag_ref extra <<< "$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG")"
+          test -z "${extra:-}"
+          test "$remote_tag_object" = "$tag_object"
+          test "$remote_tag_ref" = "refs/tags/$RELEASE_TAG"
+          main_ref="refs/memexa-release-main"
+          git fetch --force --no-tags origin "refs/heads/main:${main_ref}"
+          test "$(git cat-file -t "$main_ref")" = "commit"
+          git merge-base --is-ancestor "$tag_commit" "$main_ref"
+          if test "$GITHUB_EVENT_NAME" = "push"; then
+            test "$GITHUB_REF_TYPE" = "tag"
+            test "$GITHUB_REF_NAME" = "$RELEASE_TAG"
+            test "$GITHUB_SHA" = "$tag_commit"
+          else
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+            test "$GITHUB_REF_TYPE" = "branch"
+            test "$GITHUB_REF_NAME" = "main"
+            test "$GITHUB_REF" = "refs/heads/main"
+            test "$(git rev-parse --verify HEAD)" = "$GITHUB_SHA"
+            git merge-base --is-ancestor "$tag_commit" "$GITHUB_SHA"
+          fi
+          echo "release_commit=$tag_commit" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_tag_object=$tag_object" >> "$GITHUB_OUTPUT"
 
   build-macos:
     needs: release-ref-gate
@@ -40,6 +89,11 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
+          ref: ${{ needs.release-ref-gate.outputs.release_commit }}
+      - name: Verify the frozen source commit
+        env:
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+        run: test "$(git rev-parse --verify HEAD)" = "$RELEASE_COMMIT"
       - name: Set up exact release Python and SQLite
         uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
@@ -59,7 +113,7 @@ jobs:
           python -m pip check
       - name: Verify tag, module, and installed metadata versions
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
         run: python packaging/release_metadata.py verify-version --tag "$RELEASE_TAG"
       - name: Test
         run: python -m pytest -q
@@ -79,12 +133,15 @@ jobs:
           python packaging/release_metadata.py checksum \
             --file dist_exe/chatlog-keeper-macos-arm64
       - name: Build deterministic source bundle from frozen commit
+        env:
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           python packaging/release_metadata.py build-source-bundle \
             --repository . \
-            --commit "${GITHUB_SHA}" \
+            --commit "${RELEASE_COMMIT}" \
             --version "${version}" \
             --output "dist_source/chatlog-keeper-v${version}-source.tar.gz"
       - name: Upload macOS release inputs
@@ -113,6 +170,15 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
+          ref: ${{ needs.release-ref-gate.outputs.release_commit }}
+      - name: Verify the frozen source commit
+        shell: pwsh
+        env:
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+        run: |
+          if ((git rev-parse --verify HEAD).Trim() -ne $env:RELEASE_COMMIT) {
+            throw "release checkout commit mismatch"
+          }
       - name: Set up exact release Python and SQLite
         uses: conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f # v3.2.0
         with:
@@ -141,7 +207,7 @@ jobs:
       - name: Verify tag, module, and installed metadata versions
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
         run: python packaging/release_metadata.py verify-version --tag "$env:RELEASE_TAG"
       - name: Test
         run: python -m pytest -q
@@ -196,7 +262,7 @@ jobs:
       - name: Verify transferred release inputs
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
         run: |
           $releaseTag = [string]$env:RELEASE_TAG
           $version = $releaseTag.Substring(1)
@@ -211,13 +277,14 @@ jobs:
       - name: Build canonical approved artifact descriptors
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
         run: |
           $releaseTag = [string]$env:RELEASE_TAG
           $version = $releaseTag.Substring(1)
           New-Item -ItemType Directory -Path .\dist_metadata -ErrorAction Stop | Out-Null
           python packaging/release_metadata.py build-descriptor `
-            --commit "${{ github.sha }}" `
+            --commit "$env:RELEASE_COMMIT" `
             --version $version `
             --platform windows `
             --arch x86_64 `
@@ -226,7 +293,7 @@ jobs:
             --output ".\dist_metadata\chatlog-keeper-v${version}-windows-x86_64.artifact.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python packaging/release_metadata.py build-descriptor `
-            --commit "${{ github.sha }}" `
+            --commit "$env:RELEASE_COMMIT" `
             --version $version `
             --platform macos `
             --arch arm64 `
@@ -265,9 +332,11 @@ jobs:
           path: release_inputs
       - name: Verify the exact release file set and every sidecar
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           test "$(find release_inputs -type f | wc -l | tr -d ' ')" = "10"
           test -f release_inputs/dist_exe/chatlog-keeper.exe
           test -f release_inputs/dist_macos/chatlog-keeper-macos-arm64
@@ -283,10 +352,23 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}
+          RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}
+          RELEASE_TAG_OBJECT: ${{ needs.release-ref-gate.outputs.release_tag_object }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" \
+          current_tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq .object.sha)"
+          test "$current_tag_object" = "$RELEASE_TAG_OBJECT"
+          current_tag_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq .object.type)"
+          test "$current_tag_type" = "tag"
+          current_tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$RELEASE_TAG_OBJECT" --jq .object.sha)"
+          current_target_type="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$RELEASE_TAG_OBJECT" --jq .object.type)"
+          current_tag_name="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$RELEASE_TAG_OBJECT" --jq .tag)"
+          test "$current_target_type" = "commit"
+          test "$current_tag_commit" = "$RELEASE_COMMIT"
+          test "$current_tag_name" = "$RELEASE_TAG"
+          version="${RELEASE_TAG#v}"
+          gh release create "$RELEASE_TAG" \
             release_inputs/dist_exe/chatlog-keeper.exe \
             release_inputs/dist_exe/chatlog-keeper.exe.sha256 \
             release_inputs/dist_macos/chatlog-keeper-macos-arm64 \
@@ -299,5 +381,5 @@ jobs:
             "release_inputs/dist_metadata/chatlog-keeper-v${version}-macos-arm64.artifact.json.sha256" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "chatlog-keeper $GITHUB_REF_NAME" \
+            --title "chatlog-keeper $RELEASE_TAG" \
             --generate-notes
