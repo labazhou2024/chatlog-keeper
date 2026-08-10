@@ -867,7 +867,11 @@ def _launch_path_arguments(
 ) -> list[str]:
     """把已冻结路径编码为不经 shell 解析的 watchdog 参数。"""
 
-    canonical = Path(os.path.realpath(os.fspath(path), strict=True))
+    # ``Path.resolve(strict=True)`` preserves the fail-closed canonicalization
+    # contract on every supported Python.  ``os.path.realpath(..., strict=)``
+    # only gained that keyword after Python 3.9, which is still in our CI and
+    # declared support range.
+    canonical = path.resolve(strict=True)
     current = canonical.lstat()
     current_identity = (
         current.st_uid,
