@@ -154,11 +154,14 @@ def test_wechat_active_reports_running_daily_client_without_new_fields(
         data_root=str(tmp_path / "xwechat_files"),
     )
 
-    assert set(result) == {"source", "method", "ok", "error", "db_path"}
+    assert set(result) == {
+        "source", "method", "ok", "error", "db_path", "key_recovery_flow",
+    }
     assert result["ok"] is False
     assert result["db_path"] == str(db)
     assert "quit WeChat normally" in result["error"]
     assert "do not force-quit" in result["error"]
+    assert result["key_recovery_flow"]["sequence"] == ["passive", "active", "manual"]
 
 
 def test_wechat_active_reports_library_validation_block_without_new_fields(
@@ -183,7 +186,9 @@ def test_wechat_active_reports_library_validation_block_without_new_fields(
         data_root=str(tmp_path / "xwechat_files"),
     )
 
-    assert set(result) == {"source", "method", "ok", "error", "db_path"}
+    assert set(result) == {
+        "source", "method", "ok", "error", "db_path", "key_recovery_flow",
+    }
     assert result["ok"] is False
     assert result["db_path"] == str(db)
     assert "required embedded libraries" in result["error"]
@@ -212,7 +217,9 @@ def test_wechat_active_reports_unverifiable_library_validation_without_new_field
         data_root=str(tmp_path / "xwechat_files"),
     )
 
-    assert set(result) == {"source", "method", "ok", "error", "db_path"}
+    assert set(result) == {
+        "source", "method", "ok", "error", "db_path", "key_recovery_flow",
+    }
     assert result["ok"] is False
     assert result["db_path"] == str(db)
     assert "could not safely verify" in result["error"]
@@ -242,7 +249,9 @@ def test_wechat_active_reports_capture_preflight_without_contract_drift(
         data_root=str(tmp_path / "xwechat_files"),
     )
 
-    assert set(result) == {"source", "method", "ok", "error", "db_path"}
+    assert set(result) == {
+        "source", "method", "ok", "error", "db_path", "key_recovery_flow",
+    }
     assert result["ok"] is False
     assert result["db_path"] == str(db)
     assert "startup capture helper" in result["error"]

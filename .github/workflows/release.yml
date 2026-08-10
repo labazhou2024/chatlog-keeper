@@ -234,6 +234,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "standalone participant-directory capability failed" }
             & $executable key-identity-v1 --capabilities
             if ($LASTEXITCODE -ne 0) { throw "standalone key-identity capability failed" }
+            & $executable native-account-binding-v1 --capabilities
+            if ($LASTEXITCODE -ne 0) { throw "standalone native-account-binding capability failed" }
             & $executable probe
             if ($LASTEXITCODE -ne 0) { throw "standalone connector probe failed" }
           } finally {

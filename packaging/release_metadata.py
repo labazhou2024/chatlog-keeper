@@ -31,6 +31,7 @@ DESCRIPTOR_KIND = "chatlog_keeper"
 PROTOCOL_CAPABILITIES = (
     "key-identity-v1",
     "message-stream-v1",
+    "native-account-binding-v1",
     "participant-directory-v1",
 )
 SOURCE_BUNDLE_TEMPLATE = "chatlog-keeper-v{version}-source.tar.gz"
@@ -87,6 +88,25 @@ _KEY_IDENTITY_CAPABILITY = {
     "account_ref_format": "chatlog-account-ref-v1-sha256",
 }
 _KEY_IDENTITY_PROTOCOL = _KEY_IDENTITY_CAPABILITY["capability"]
+_NATIVE_ACCOUNT_BINDING_CAPABILITY = {
+    "capability": "native-account-binding-v1",
+    "schema": "chatlog-keeper.native-account-binding.v1",
+    "authority": "device-local-canonical-account-binding",
+    "account_ref_formats": [
+        "chatlog-account-ref-v1-sha256",
+        "chatlog-native-account-ref-v1-hmac-sha256",
+    ],
+    "sources": ["qq", "wechat"],
+    "states": [
+        "verified",
+        "verified_unpersisted",
+        "restored",
+        "single_account",
+        "current_account",
+        "selection_required",
+        "unavailable",
+    ],
+}
 _SUPPORTED_TARGETS = {
     ("macos", "arm64"): "chatlog-keeper-macos-arm64",
     ("windows", "x86_64"): "chatlog-keeper.exe",
@@ -275,6 +295,17 @@ def validate_key_identity_capability(value: Mapping[str, Any]) -> None:
         raise ReleaseMetadataError("key-identity capability identity drifted")
 
 
+def validate_native_account_binding_capability(value: Mapping[str, Any]) -> None:
+    """Require the exact frozen opaque native-account binding capability."""
+
+    if set(value) != set(_NATIVE_ACCOUNT_BINDING_CAPABILITY):
+        raise ReleaseMetadataError("native-account-binding capability fields drifted")
+    if _canonical_json(dict(value)) != _canonical_json(
+        _NATIVE_ACCOUNT_BINDING_CAPABILITY
+    ):
+        raise ReleaseMetadataError("native-account-binding capability identity drifted")
+
+
 def validate_key_identity_probe_capability(value: Mapping[str, Any]) -> None:
     """Require the frozen probe to advertise the exact WeChat identity protocol."""
 
@@ -358,10 +389,15 @@ def validate_frozen_capabilities(executable: Path) -> None:
     message_stream = _run_capability(executable, "message-stream-v1")
     participant_directory = _run_capability(executable, "participant-directory-v1")
     key_identity = _run_capability(executable, "key-identity-v1")
+    native_account_binding = _run_capability(
+        executable,
+        "native-account-binding-v1",
+    )
     probe = _run_json_command(executable, "probe")
     validate_message_stream_capability(message_stream)
     validate_participant_directory_capability(participant_directory)
     validate_key_identity_capability(key_identity)
+    validate_native_account_binding_capability(native_account_binding)
     validate_key_identity_probe_capability(probe)
 
 

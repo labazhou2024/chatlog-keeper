@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from chatlog_keeper import wechat_db
+from chatlog_keeper import native_account_binding, wechat_db
 from chatlog_keeper.core._secrets import read_secret_text, write_secret_text
 
 
@@ -395,4 +395,14 @@ def save_for_target(
         return "database_changed", None
     if _target_group(published) != _target_group(target):
         return "database_changed", None
+    if target.account_id and (
+        native_account_binding.select_account(
+            "wechat",
+            target.account_id,
+            proof="database-key-proof",
+            account_ref_value=candidate_ref,
+        )
+        is None
+    ):
+        return "binding_failed", None
     return "ok", Path(saved_path)

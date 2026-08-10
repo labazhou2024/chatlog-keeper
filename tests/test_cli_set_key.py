@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from chatlog_keeper import cli, wechat_key_identity
+from chatlog_keeper import cli, native_account_binding, wechat_key_identity
 
 
 def test_set_key_can_be_read_from_stdin_without_argv_secret(monkeypatch):
@@ -347,7 +347,7 @@ def test_wechat_set_key_reads_verifies_then_saves_after_any_account_matches(
 
     result = cli._set_key("wechat", "04" * 32 + "\n", data_root="configured-root")
 
-    assert result == wechat_key_identity.protocol_payload(
+    expected = wechat_key_identity.protocol_payload(
         {
             "source": "wechat",
             "ok": True,
@@ -356,6 +356,11 @@ def test_wechat_set_key_reads_verifies_then_saves_after_any_account_matches(
         },
         key=candidate,
     )
+    expected["native_account_binding"] = native_account_binding.envelope(
+        "wechat",
+        state="unavailable",
+    )
+    assert result == expected
     assert events == [
         ("read", "first.db"),
         ("read", "second.db"),
@@ -439,7 +444,7 @@ def test_wechat_set_key_writes_only_the_hmac_matching_account(monkeypatch, tmp_p
 
     result = cli._set_key("wechat", "06" * 32, data_root=str(root))
 
-    assert result == wechat_key_identity.protocol_payload(
+    expected = wechat_key_identity.protocol_payload(
         {
             "source": "wechat",
             "ok": True,
@@ -448,6 +453,16 @@ def test_wechat_set_key_writes_only_the_hmac_matching_account(monkeypatch, tmp_p
         },
         key=candidate,
     )
+    assert {
+        key: result[key]
+        for key in expected
+    } == expected
+    binding = result["native_account_binding"]
+    assert binding["state"] == "verified"
+    assert binding["account_ref"] == wechat_key_identity.envelope(candidate)[
+        "account_ref"
+    ]
+    assert "wxid_second" not in json.dumps(binding)
     assert saves == [(candidate, "wxid_second", second)]
     assert first != second
 
@@ -458,9 +473,16 @@ def test_qq_set_key_behavior_is_unchanged_when_data_root_is_supplied(monkeypatch
 
     result = cli._set_key("qq", "q" * 16, data_root="ignored-for-qq")
 
-    assert result == {
+    assert {
+        key: result[key]
+        for key in ("source", "ok", "saved_to", "error")
+    } == {
         "source": "qq",
         "ok": True,
         "saved_to": "qq_db.key",
         "error": None,
     }
+    assert result["native_account_binding"] == native_account_binding.envelope(
+        "qq",
+        state="unavailable",
+    )

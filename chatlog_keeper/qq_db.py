@@ -16,6 +16,7 @@ Storage layout (QQ NT):
 """
 import ctypes
 import ctypes.wintypes as wt
+from contextvars import ContextVar
 import hashlib
 import hmac as hmac_mod
 import logging
@@ -37,9 +38,30 @@ from chatlog_keeper.core._private_temp import (
     create_private_temp_dir,
     scavenge_private_temp_dirs,
 )
+from chatlog_keeper.core._windows_process_memory import (
+    PROCESS_ACCESS_DENIED,
+    ProcessMemoryAccessDenied,
+    kernel32 as _windows_kernel32,
+    last_error as _windows_last_error,
+    raise_if_access_denied as _raise_if_windows_access_denied,
+)
 from chatlog_keeper.stream_protocol import QQ_UNREADABLE_DECODE_ERROR_CODES
 
 logger = logging.getLogger(__name__)
+
+
+_PASSIVE_KEY_ERROR_CODE: ContextVar[Optional[str]] = ContextVar(
+    "chatlog_keeper_qq_passive_key_error_code",
+    default=None,
+)
+
+
+def _clear_passive_key_error() -> None:
+    _PASSIVE_KEY_ERROR_CODE.set(None)
+
+
+def _passive_key_error() -> Optional[str]:
+    return _PASSIVE_KEY_ERROR_CODE.get()
 
 
 # ─── Data model ───────────────────────────────────────────────────────────────
@@ -685,12 +707,13 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
             timeout=max(1, int(timeout_s or 120)),
         )
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _windows_kernel32()
     PROCESS_VM_READ = 0x0010
     PROCESS_QUERY_INFORMATION = 0x0400
 
     handle = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
     if not handle:
+        _raise_if_windows_access_denied(_windows_last_error(kernel32))
         logger.warning(f"Cannot open PID {pid} — try running as Administrator")
         return None
 
@@ -731,9 +754,10 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
                                "giving up (try `extract-key --method active` or `set-key`)")
                 break
             ret = kernel32.VirtualQueryEx(
-                handle, ctypes.c_uint64(address), ctypes.byref(mbi), ctypes.sizeof(mbi)
+                handle, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)
             )
             if not ret:
+                _raise_if_windows_access_denied(_windows_last_error(kernel32))
                 break
 
             if (mbi.State == MEM_COMMIT and
@@ -741,10 +765,12 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
                     0 < mbi.RegionSize < 200 * 1024 * 1024):
                 buf = ctypes.create_string_buffer(mbi.RegionSize)
                 read_n = ctypes.c_size_t(0)
-                kernel32.ReadProcessMemory(
-                    handle, ctypes.c_uint64(mbi.BaseAddress),
+                read_ok = kernel32.ReadProcessMemory(
+                    handle, ctypes.c_void_p(mbi.BaseAddress),
                     buf, mbi.RegionSize, ctypes.byref(read_n)
                 )
+                if not read_ok:
+                    _raise_if_windows_access_denied(_windows_last_error(kernel32))
                 chunk = bytes(buf[:read_n.value])
 
                 # Sliding window: find runs of printable ASCII terminated by 0x00.
@@ -781,6 +807,8 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
             address = nxt
 
         return found
+    except ProcessMemoryAccessDenied:
+        raise
     except Exception as e:
         logger.error(f"Memory scan error for PID {pid}: {e}")
         return None
@@ -796,8 +824,14 @@ def extract_key_from_qq(pid: int, db_path: Path = None,
     Note: passphrase semantics; not a raw binary key.
     ``timeout_s`` bounds the passive scan (see _scan_memory_for_key).
     """
+    _clear_passive_key_error()
     logger.info(f"Attempting passphrase extraction from QQ PID {pid}")
-    key = _scan_memory_for_key(pid, db_path=db_path, timeout_s=timeout_s)
+    try:
+        key = _scan_memory_for_key(pid, db_path=db_path, timeout_s=timeout_s)
+    except ProcessMemoryAccessDenied:
+        _PASSIVE_KEY_ERROR_CODE.set(PROCESS_ACCESS_DENIED)
+        logger.warning("QQ process-memory access was denied")
+        return None
     if key:
         logger.info(f"Passphrase extracted: len={len(key)}")
     else:
@@ -3257,6 +3291,7 @@ class QQDBReader:
         self.account_label = ""
         self.key = None
         self.key_source = None  # "live" | "cache"; never contains key material
+        self._passive_key_error_code = None
         self._initialized = False
     
     def initialize(self) -> bool:
@@ -3267,6 +3302,8 @@ class QQDBReader:
           2. Cached key file ``data/secrets/qq_db.key`` (extracted previously).
           3. None — caller sees ``key=None`` and downstream skips gracefully.
         """
+        self._passive_key_error_code = None
+        _clear_passive_key_error()
         self.data_root = self._configured_data_root or find_qq_data_root()
         if not self.data_root:
             logger.warning("QQ data root not found")
@@ -3338,7 +3375,11 @@ class QQDBReader:
                         break
                     self.key = extract_key_from_qq(pid, db_path=self.db_path,
                                                    timeout_s=min(per_process_budget, remaining))
+                    scan_error = _passive_key_error()
+                    if scan_error == PROCESS_ACCESS_DENIED:
+                        self._passive_key_error_code = scan_error
                     if self.key:
+                        self._passive_key_error_code = None
                         self.key_source = "live"
                         saved = (
                             save_cached_key_for_account(self.key, self.account_id)
@@ -3366,6 +3407,7 @@ class QQDBReader:
                 logger.info("Using cached key from data/secrets/qq_db.key (fallback)")
                 self.key = cached
                 self.key_source = "cache"
+                self._passive_key_error_code = None
             elif not self._allow_live_key_extract:
                 logger.warning("No verified cached key is available for the requested account")
             else:

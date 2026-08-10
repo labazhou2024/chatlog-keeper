@@ -394,7 +394,11 @@ def test_qq_directory_returns_exact_public_shape_for_all_accounts(monkeypatch, t
     ]
     assert result["accounts"][0]["label"] != result["accounts"][0]["account_id"]
     assert all(
-        set(item) == {"account_id", "label", "conversation_count"}
+        set(item) == {"account_id", "account_ref", "label", "conversation_count"}
+        for item in result["accounts"]
+    )
+    assert all(
+        str(item["account_ref"]).startswith("chatlog-native-account-ref-v1:")
         for item in result["accounts"]
     )
     assert all(

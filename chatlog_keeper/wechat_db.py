@@ -13,6 +13,7 @@ Storage layout (Weixin 4.x):
 """
 import ctypes
 import ctypes.wintypes as wt
+from contextvars import ContextVar
 import hashlib
 import hmac as hmac_mod
 import json
@@ -33,7 +34,29 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Tuple
 
+from chatlog_keeper.core._windows_process_memory import (
+    PROCESS_ACCESS_DENIED,
+    ProcessMemoryAccessDenied,
+    kernel32 as _windows_kernel32,
+    last_error as _windows_last_error,
+    raise_if_access_denied as _raise_if_windows_access_denied,
+)
+
 logger = logging.getLogger(__name__)
+
+
+_PASSIVE_KEY_ERROR_CODE: ContextVar[Optional[str]] = ContextVar(
+    "chatlog_keeper_wechat_passive_key_error_code",
+    default=None,
+)
+
+
+def _clear_passive_key_error() -> None:
+    _PASSIVE_KEY_ERROR_CODE.set(None)
+
+
+def _passive_key_error() -> Optional[str]:
+    return _PASSIVE_KEY_ERROR_CODE.get()
 
 
 # ─── Data model ───────────────────────────────────────────────────────────────
@@ -603,11 +626,12 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
             timeout=max(1, int(timeout_s or 120)),
         )
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = _windows_kernel32()
     PROCESS_VM_READ = 0x0010
     PROCESS_QUERY_INFORMATION = 0x0400
     handle = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
     if not handle:
+        _raise_if_windows_access_denied(_windows_last_error(kernel32))
         logger.warning(f"Cannot open PID {pid} — try running as Administrator")
         return None
 
@@ -654,9 +678,10 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
                                "giving up (try `extract-key --method active` or `set-key`)")
                 break
             ret = kernel32.VirtualQueryEx(
-                handle, ctypes.c_uint64(address), ctypes.byref(mbi), ctypes.sizeof(mbi)
+                handle, ctypes.c_void_p(address), ctypes.byref(mbi), ctypes.sizeof(mbi)
             )
             if not ret:
+                _raise_if_windows_access_denied(_windows_last_error(kernel32))
                 break
 
             if (mbi.State == MEM_COMMIT and
@@ -664,10 +689,12 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
                     0 < mbi.RegionSize < 200 * 1024 * 1024):
                 buf = ctypes.create_string_buffer(mbi.RegionSize)
                 read_n = ctypes.c_size_t(0)
-                kernel32.ReadProcessMemory(
-                    handle, ctypes.c_uint64(mbi.BaseAddress),
+                read_ok = kernel32.ReadProcessMemory(
+                    handle, ctypes.c_void_p(mbi.BaseAddress),
                     buf, mbi.RegionSize, ctypes.byref(read_n)
                 )
+                if not read_ok:
+                    _raise_if_windows_access_denied(_windows_last_error(kernel32))
                 chunk = bytes(buf[:read_n.value])
 
                 for m in hex_key_re.finditer(chunk):
@@ -696,6 +723,8 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
             address = nxt
 
         return found_key
+    except ProcessMemoryAccessDenied:
+        raise
     except Exception as e:
         logger.error(f"Memory scan error for PID {pid}: {e}")
         return None
@@ -718,6 +747,7 @@ def extract_key_from_weixin(pid: int, db_path: Path = None,
          persisted to the cache so future runs skip the scan.
     No key bytes are ever logged (privacy).
     """
+    _clear_passive_key_error()
     db_page1 = None
     if db_path and Path(db_path).exists():
         db_page1 = _read_stable_page1(Path(db_path))
@@ -735,7 +765,12 @@ def extract_key_from_weixin(pid: int, db_path: Path = None,
 
     # 2. Live process-memory scan (fails on 4.1.10.31 — plaintext key not in heap).
     logger.info(f"Attempting key extraction from Weixin PID {pid}")
-    key = _scan_memory_for_key(pid, db_path=db_path, timeout_s=timeout_s)
+    try:
+        key = _scan_memory_for_key(pid, db_path=db_path, timeout_s=timeout_s)
+    except ProcessMemoryAccessDenied:
+        _PASSIVE_KEY_ERROR_CODE.set(PROCESS_ACCESS_DENIED)
+        logger.warning("WeChat process-memory access was denied")
+        return None
     if key and len(key) == 32:
         # _scan_memory_for_key already HMAC-validates; persist for future runs.
         if db_page1 and _verify_key_v4(key, db_page1):
@@ -2793,6 +2828,7 @@ class WeChatDBReader:
         self.account_label = ""
         self.enc_key = None  # backward-compat: first DB's key (deprecated; prefer enc_keys)
         self.enc_keys: dict = {}  # NEW (2026-04-30): {Path: bytes} per-DB key map
+        self._passive_key_error_code = None
         self._initialized = False
         # contact resolver lazy-loaded after initialize() succeeds
         self.contacts = None
@@ -2805,6 +2841,8 @@ class WeChatDBReader:
         message_1.db etc silently fail with "file is not a database", so the
         nested loop below builds a per-DB key dict.
         """
+        self._passive_key_error_code = None
+        _clear_passive_key_error()
         self.data_root = self._configured_data_root or find_weixin_data_root()
         if not self.data_root:
             logger.warning("Weixin data root not found")
@@ -2917,9 +2955,13 @@ class WeChatDBReader:
                     timeout_s=eff_timeout,
                     account_id=self.account_id,
                 )
+                scan_error = _passive_key_error()
+                if scan_error == PROCESS_ACCESS_DENIED:
+                    self._passive_key_error_code = scan_error
                 # A truthiness check is insufficient for crypto bytes: also
                 # validate the length is 32 (AES-256).
                 if key and isinstance(key, (bytes, bytearray)) and len(key) == 32:
+                    self._passive_key_error_code = None
                     self.enc_keys[db] = bytes(key)
                     if working_pid is None:
                         logger.info(f"Weixin enc_key extraction working_pid={pid}")

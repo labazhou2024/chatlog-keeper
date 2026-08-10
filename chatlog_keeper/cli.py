@@ -34,6 +34,7 @@ from typing import Union, Any, Iterator
 from chatlog_keeper import (
     active_key,
     key_recovery_protocol,
+    native_account_binding,
     participant_directory,
     participant_protocol,
     qq_db,
@@ -89,6 +90,7 @@ _KEY_IDENTITY_SET_KEY_SCHEMA = "chatlog-keeper.set-key-identity.v1"
 _EXPECTED_ACCOUNT_REF_UNSET = object()
 _CONVERSATION_SCOPE_VERSION = 2
 _CONVERSATION_TYPES = frozenset({"direct", "group"})
+_WECHAT_RECOVERY_FLOW_SCHEMA = "chatlog-keeper.key-recovery-flow.v1"
 
 _ConversationScope = Union[tuple[str, str], tuple[str, str, str]]
 
@@ -110,6 +112,178 @@ class _ExportSelection:
     scopes_explicit: bool = False
     explicit: bool = False
     all_accounts: bool = False
+
+
+def _wechat_recovery_flow() -> dict[str, Any]:
+    """Return the additive first-configuration recovery order.
+
+    QR authentication is part of the official client opened by ``active``;
+    ``manual`` remains the final DB-verified fallback.  The descriptor never
+    implies that users must switch their daily account.
+    """
+
+    return {
+        "schema": _WECHAT_RECOVERY_FLOW_SCHEMA,
+        "source": "wechat",
+        "sequence": ["passive", "active", "manual"],
+        "active_authentication": ["saved_session", "qr"],
+        "account_switch_required": False,
+    }
+
+
+def _with_wechat_recovery_flow(payload: dict[str, Any]) -> dict[str, Any]:
+    result = dict(payload)
+    result["key_recovery_flow"] = _wechat_recovery_flow()
+    return result
+
+
+def _native_binding_for_accounts(
+    source: str,
+    account_ids: Iterator[str] | tuple[str, ...] | list[str],
+    *,
+    verified_account_id: str | None = None,
+    verified_account_ref: str | None = None,
+    preferred_account_id: str | None = None,
+    fallback_account_ref: str | None = None,
+) -> dict[str, Any]:
+    """Build one opaque binding envelope from a canonical account set.
+
+    A verified database target always wins.  Otherwise a previously persisted
+    binding is restored, followed by a single-account or QQ current-account
+    routing decision.  First-run multi-account WeChat deliberately returns
+    only opaque candidates and ``account_selection_required``; it never picks
+    a raw wxid by directory order.
+    """
+
+    candidates = tuple(
+        sorted(
+            {
+                str(item).strip()
+                for item in account_ids
+                if str(item).strip()
+            }
+        )
+    )
+    verified = str(verified_account_id or "").strip()
+    preferred = str(preferred_account_id or "").strip()
+    if verified:
+        if verified not in candidates:
+            candidates = tuple(sorted((*candidates, verified)))
+        selected = native_account_binding.select_account(
+            source,
+            verified,
+            proof="database-key-proof",
+            account_ref_value=verified_account_ref,
+        )
+        if selected is not None:
+            return native_account_binding.envelope(
+                source,
+                state="verified",
+                account_ref_value=selected,
+            )
+        ref = verified_account_ref or native_account_binding.account_ref(
+            source,
+            verified,
+        )
+        try:
+            return native_account_binding.envelope(
+                source,
+                state="verified_unpersisted",
+                account_ref_value=ref,
+                account_refs=(ref,) if ref is not None else (),
+            )
+        except ValueError:
+            fallback_ref = native_account_binding.account_ref(source, verified)
+            return native_account_binding.envelope(
+                source,
+                state="verified_unpersisted",
+                account_ref_value=fallback_ref,
+                account_refs=(fallback_ref,) if fallback_ref is not None else (),
+            )
+
+    restored = native_account_binding.resolve_selected(source, candidates)
+    if restored is not None:
+        return native_account_binding.envelope(
+            source,
+            state="restored",
+            account_ref_value=restored.account_ref,
+        )
+
+    # ``key-identity-v1`` existed before native-account-binding-v1.  Its
+    # owner-private marker is already a database-key-proven OS credential
+    # lookup ref, so upgrades must surface it before inventing a new native
+    # candidate.  It intentionally remains unresolved until the recovered key
+    # proves one member of the current complete database set.
+    if source == "wechat" and fallback_account_ref is not None:
+        try:
+            return native_account_binding.envelope(
+                source,
+                state="restored",
+                account_ref_value=fallback_account_ref,
+            )
+        except ValueError:
+            pass
+
+    if len(candidates) == 1:
+        selected = native_account_binding.select_account(
+            source,
+            candidates[0],
+            proof="single-account-enumeration",
+        )
+        if selected is not None:
+            return native_account_binding.envelope(
+                source,
+                state="single_account",
+                account_ref_value=selected,
+            )
+
+    if source == "qq" and preferred and preferred in candidates:
+        selected = native_account_binding.select_account(
+            source,
+            preferred,
+            proof="current-account-routing",
+        )
+        if selected is not None:
+            return native_account_binding.envelope(
+                source,
+                state="current_account",
+                account_ref_value=selected,
+            )
+
+    refs = native_account_binding.candidate_refs(source, candidates)
+    if len(candidates) > 1 and len(refs) == len(candidates):
+        return native_account_binding.envelope(
+            source,
+            state="selection_required",
+            account_refs=refs,
+        )
+    return native_account_binding.envelope(
+        source,
+        state="unavailable",
+        account_refs=refs,
+    )
+
+
+def _with_native_binding(
+    payload: dict[str, Any],
+    source: str,
+    account_ids: Iterator[str] | tuple[str, ...] | list[str],
+    *,
+    verified_account_id: str | None = None,
+    verified_account_ref: str | None = None,
+    preferred_account_id: str | None = None,
+    fallback_account_ref: str | None = None,
+) -> dict[str, Any]:
+    result = dict(payload)
+    result["native_account_binding"] = _native_binding_for_accounts(
+        source,
+        account_ids,
+        verified_account_id=verified_account_id,
+        verified_account_ref=verified_account_ref,
+        preferred_account_id=preferred_account_id,
+        fallback_account_ref=fallback_account_ref,
+    )
+    return result
 
 
 def _validated_ids(value) -> tuple[str, ...]:
@@ -362,6 +536,7 @@ def _directory_qq(data_root: str | None = None, account_ids: tuple[str, ...] | N
             label = f"QQ account {display_index}" if len(selected_ids) > 1 else "QQ account"
         accounts.append({
             "account_id": account_id,
+            "account_ref": native_account_binding.account_ref("qq", account_id),
             "label": label,
             "conversation_count": len(directory),
         })
@@ -408,6 +583,7 @@ def _directory_wechat(data_root: str | None = None, account_ids: tuple[str, ...]
             label = f"微信号：{normalized_account_id}" if normalized_account_id else "微信账号"
         accounts.append({
             "account_id": account_id,
+            "account_ref": native_account_binding.account_ref("wechat", account_id),
             "label": label,
             "conversation_count": len(directory),
         })
@@ -442,7 +618,14 @@ def _probe_qq() -> dict:
         db = qq_db.find_msg_database(root) if root else None
         account = qq_db.detect_current_qq_account()
         account_databases = qq_db.find_qq_account_databases(root) if root else {}
-        preferred_account = str(account) if account not in (None, "") else ""
+        current_account = str(account) if account not in (None, "") else ""
+        restored = native_account_binding.resolve_selected(
+            "qq",
+            account_databases,
+        )
+        preferred_account = (
+            restored.account_id if restored is not None else current_account
+        )
         ordered_accounts = sorted(
             account_databases,
             key=lambda account_id: (account_id != preferred_account, account_id),
@@ -482,7 +665,7 @@ def _probe_qq() -> dict:
                 readable_db = db
 
         has_key = readable_db is not None
-        return {
+        result = {
             "source": "qq",
             "available": has_key,
             "client_running": running,
@@ -491,6 +674,18 @@ def _probe_qq() -> dict:
             "key_present": has_key,
             "needs_key": bool((account_databases or db) and not has_key),
         }
+        candidates = list(account_databases)
+        if not candidates and current_account:
+            candidates = [current_account]
+        return _with_native_binding(
+            result,
+            "qq",
+            candidates,
+            verified_account_id=(
+                str(readable_account) if readable_account not in (None, "") else None
+            ),
+            preferred_account_id=current_account or None,
+        )
     except Exception as e:  # noqa: BLE001
         return {"source": "qq", "available": False, "error": f"{type(e).__name__}:{e}"}
 
@@ -721,10 +916,18 @@ def _probe_wechat() -> dict:
         )
         readable_wxid_dir = None
         verified: tuple[bytes, wechat_key_identity.TargetSnapshot] | None = None
+        binding_accounts: list[str] = []
         if wxid_dirs:
             try:
                 snapshots = _wechat_key_target_snapshots(
                     str(root) if root is not None else None
+                )
+                binding_accounts = sorted(
+                    {
+                        str(target.account_id).strip()
+                        for target in snapshots
+                        if target.account_id and str(target.account_id).strip()
+                    }
                 )
                 verified = wechat_key_identity.verified_cached_target(snapshots)
             except wechat_key_identity.TargetError:
@@ -756,7 +959,31 @@ def _probe_wechat() -> dict:
             # cache, not of current process liveness.
             "needs_key": bool(has_database and not has_key),
         }
-        return wechat_key_identity.protocol_payload(result, key=key)
+        result = wechat_key_identity.protocol_payload(result, key=key)
+        target_account = (
+            str(verified[1].account_id).strip()
+            if verified is not None and verified[1].account_id
+            else None
+        )
+        result = _with_native_binding(
+            result,
+            "wechat",
+            binding_accounts,
+            verified_account_id=target_account,
+            verified_account_ref=(
+                wechat_key_identity.envelope(key)["account_ref"]
+                if key is not None
+                else None
+            ),
+            fallback_account_ref=(
+                wechat_key_identity.selected_ref()
+                if key is None
+                else None
+            ),
+        )
+        if result.get("needs_key"):
+            result = _with_wechat_recovery_flow(result)
+        return result
     except Exception:  # noqa: BLE001 - probe diagnostics must not expose paths
         return wechat_key_identity.protocol_payload(
             {"source": "wechat", "available": False, "error": "probe_failed"}
@@ -1044,9 +1271,25 @@ def _set_key(
     key = (key or "").strip()
     if source == "qq":
         ok = qq_db.save_cached_key(key)
-        return {"source": "qq", "ok": bool(ok),
-                "saved_to": Path(qq_db._key_cache_path()).as_posix() if ok else None,
-                "error": None if ok else "invalid QQ key (expect a 16- or 32-char passphrase)"}
+        result = {"source": "qq", "ok": bool(ok),
+                  "saved_to": Path(qq_db._key_cache_path()).as_posix() if ok else None,
+                  "error": None if ok else "invalid QQ key (expect a 16- or 32-char passphrase)"}
+        if not ok:
+            return result
+        root = (
+            Path(data_root).expanduser()
+            if data_root
+            else qq_db.find_qq_data_root()
+        )
+        accounts = qq_db.find_qq_account_databases(root) if root else {}
+        current = qq_db.detect_current_qq_account()
+        preferred = str(current) if current not in (None, "") else None
+        return _with_native_binding(
+            result,
+            "qq",
+            list(accounts),
+            preferred_account_id=preferred,
+        )
     if source == "wechat":
         if len(key) != 64 or any(char not in "0123456789abcdefABCDEF" for char in key):
             return {"source": "wechat", "ok": False, "error": "invalid WeChat key (expect 64 hex chars)"}
@@ -1108,6 +1351,13 @@ def _set_key(
                 "saved_to": None,
                 "error": "verified WeChat key identity could not be stored",
             }
+        if save_status == "binding_failed":
+            return {
+                "source": "wechat",
+                "ok": False,
+                "saved_to": None,
+                "error": "verified WeChat account binding could not be stored",
+            }
         if save_status != "ok" or saved_path is None:
             return {
                 "source": "wechat",
@@ -1115,7 +1365,7 @@ def _set_key(
                 "saved_to": None,
                 "error": "WeChat database changed during key configuration",
             }
-        return wechat_key_identity.protocol_payload(
+        result = wechat_key_identity.protocol_payload(
             {
                 "source": "wechat",
                 "ok": True,
@@ -1123,6 +1373,18 @@ def _set_key(
                 "error": None,
             },
             key=kb,
+        )
+        return _with_native_binding(
+            result,
+            "wechat",
+            [
+                str(account_id).strip()
+                for item in snapshots
+                if (account_id := getattr(item, "account_id", None))
+                and str(account_id).strip()
+            ],
+            verified_account_id=target.account_id,
+            verified_account_ref=wechat_key_identity.envelope(kb)["account_ref"],
         )
     return {"ok": False, "error": "unknown source: " + str(source)}
 
@@ -1246,6 +1508,8 @@ def _extract_key(
     )
 
     def recovery_failure(payload: dict, error_code: str) -> dict:
+        if source == "wechat":
+            payload = _with_wechat_recovery_flow(payload)
         if _recovery is not None:
             payload["_key_recovery_error_code"] = error_code
         return payload
@@ -1375,6 +1639,8 @@ def _extract_key(
         r = _extract_key(source, "active", data_root=data_root)
         if isinstance(r, dict):
             r["fell_back_from_passive"] = True
+            if source == "wechat" and not r.get("ok"):
+                r = _with_wechat_recovery_flow(r)
         return r
     if source == "qq":
         if method == "active":
@@ -1431,10 +1697,17 @@ def _extract_key(
                     if account not in (None, "")
                     else qq_db._key_cache_path()
                 )
-                return {"source": "qq", "method": "active", "ok": True,
-                        "key_len": len(key),
-                        "saved_to": Path(saved_path).as_posix(),
-                        "fresh_extraction": True}
+                return _with_native_binding(
+                    {"source": "qq", "method": "active", "ok": True,
+                     "key_len": len(key),
+                     "saved_to": Path(saved_path).as_posix(),
+                     "fresh_extraction": True},
+                    "qq",
+                    list(account_databases) or ([str(account)] if account not in (None, "") else []),
+                    verified_account_id=(
+                        str(account) if account not in (None, "") else None
+                    ),
+                )
             return recovery_failure(
                 {"source": "qq", "method": "active", "ok": False,
                  "error": _active_failure(
@@ -1461,10 +1734,20 @@ def _extract_key(
                 if account not in (None, "")
                 else qq_db._key_cache_path()
             )
-            return {"source": "qq", "method": "passive", "ok": True,
-                    "key_len": len(reader.key),
-                    "saved_to": Path(saved_path).as_posix(),
-                    "fresh_extraction": key_source == "live"}
+            return _with_native_binding(
+                {"source": "qq", "method": "passive", "ok": True,
+                 "key_len": len(reader.key),
+                 "saved_to": Path(saved_path).as_posix(),
+                 "fresh_extraction": key_source == "live"},
+                "qq",
+                [str(account)] if account not in (None, "") else [],
+                verified_account_id=(
+                    str(account) if account not in (None, "") else None
+                ),
+            )
+        if getattr(reader, "_passive_key_error_code", None) == "process_access_denied":
+            return {"source": "qq", "method": "passive", "ok": False,
+                    "error": "process_access_denied"}
         return {"source": "qq", "method": "passive", "ok": False,
                 "error": "passive scan found no key (QQ not running, or a newer build — "
                          "try `--method active` or `set-key`)"}
@@ -1538,13 +1821,27 @@ def _extract_key(
                     key, target, snapshots
                 )
                 if save_status == "ok" and saved_path is not None:
-                    return wechat_key_identity.protocol_payload(
+                    result = wechat_key_identity.protocol_payload(
                         {"source": "wechat", "method": "active", "ok": True,
                          "key_len": len(key),
                          "saved_to": saved_path.as_posix(),
                          "db_path": str(target.path),
                          "fresh_extraction": True},
                         key=key,
+                    )
+                    return _with_native_binding(
+                        result,
+                        "wechat",
+                        [
+                            str(account_id).strip()
+                            for item in snapshots
+                            if (account_id := getattr(item, "account_id", None))
+                            and str(account_id).strip()
+                        ],
+                        verified_account_id=target.account_id,
+                        verified_account_ref=wechat_key_identity.envelope(key)[
+                            "account_ref"
+                        ],
                     )
                 if save_status == "database_changed":
                     return recovery_failure(
@@ -1557,6 +1854,13 @@ def _extract_key(
                     return recovery_failure(
                         {"source": "wechat", "method": "active", "ok": False,
                          "error": "verified WeChat key identity could not be stored",
+                         "db_path": db_path},
+                        "write_failed",
+                    )
+                if save_status == "binding_failed":
+                    return recovery_failure(
+                        {"source": "wechat", "method": "active", "ok": False,
+                         "error": "verified WeChat account binding could not be stored",
                          "db_path": db_path},
                         "write_failed",
                     )
@@ -1611,11 +1915,25 @@ def _extract_key(
                 master, target, snapshots
             )
             if save_status == "ok" and saved_path is not None:
-                return wechat_key_identity.protocol_payload(
+                result = wechat_key_identity.protocol_payload(
                     {"source": "wechat", "method": "passive", "ok": True,
                      "key_len": len(master),
                      "saved_to": saved_path.as_posix()},
                     key=master,
+                )
+                return _with_native_binding(
+                    result,
+                    "wechat",
+                    [
+                        str(account_id).strip()
+                        for item in snapshots
+                        if (account_id := getattr(item, "account_id", None))
+                        and str(account_id).strip()
+                    ],
+                    verified_account_id=target.account_id,
+                    verified_account_ref=wechat_key_identity.envelope(master)[
+                        "account_ref"
+                    ],
                 )
             if save_status == "database_changed":
                 return {"source": "wechat", "method": "passive", "ok": False,
@@ -1623,8 +1941,14 @@ def _extract_key(
             if save_status == "selection_failed":
                 return {"source": "wechat", "method": "passive", "ok": False,
                         "error": "verified WeChat key identity could not be stored"}
+            if save_status == "binding_failed":
+                return {"source": "wechat", "method": "passive", "ok": False,
+                        "error": "verified WeChat account binding could not be stored"}
             return {"source": "wechat", "method": "passive", "ok": False,
                     "error": "verified WeChat key could not be stored"}
+        if getattr(reader, "_passive_key_error_code", None) == "process_access_denied":
+            return {"source": "wechat", "method": "passive", "ok": False,
+                    "error": "process_access_denied"}
         return {"source": "wechat", "method": "passive", "ok": False,
                 "error": "passive scan found no key (WeChat not running, or 4.1.10.31+ where the "
                          "key is no longer in plaintext memory — try `--method active` or `set-key`)"}
@@ -2391,6 +2715,17 @@ def main(argv: list[str] | None = None) -> int:
         help="emit the frozen key-identity-v1 capability contract",
     )
 
+    p_native_binding = sub.add_parser(
+        "native-account-binding-v1",
+        help="publish the frozen opaque native-account binding contract",
+    )
+    native_binding_mode = p_native_binding.add_mutually_exclusive_group(required=True)
+    native_binding_mode.add_argument(
+        "--capabilities",
+        action="store_true",
+        help="emit the frozen native-account-binding-v1 capability contract",
+    )
+
     p_key_recovery = sub.add_parser(
         "key-recovery-v1",
         help=argparse.SUPPRESS,
@@ -2539,6 +2874,8 @@ def main(argv: list[str] | None = None) -> int:
         return _participant_directory_v1_command(args)
     if args.cmd == "key-identity-v1":
         return _print_json(wechat_key_identity.capabilities_payload())
+    if args.cmd == "native-account-binding-v1":
+        return _print_json(native_account_binding.capabilities_payload())
     if args.cmd == "qq":
         try:
             selection = _selection_from_args(args)

@@ -92,6 +92,28 @@ def _key_identity_capability() -> dict:
     }
 
 
+def _native_account_binding_capability() -> dict:
+    return {
+        "capability": "native-account-binding-v1",
+        "schema": "chatlog-keeper.native-account-binding.v1",
+        "authority": "device-local-canonical-account-binding",
+        "account_ref_formats": [
+            "chatlog-account-ref-v1-sha256",
+            "chatlog-native-account-ref-v1-hmac-sha256",
+        ],
+        "sources": ["qq", "wechat"],
+        "states": [
+            "verified",
+            "verified_unpersisted",
+            "restored",
+            "single_account",
+            "current_account",
+            "selection_required",
+            "unavailable",
+        ],
+    }
+
+
 def _probe_capability() -> dict:
     return {
         "qq": {"source": "qq", "available": False},
@@ -121,6 +143,8 @@ def test_frozen_capability_validator_executes_all_exact_no_input_contracts(
             payload = _participant_capability()
         elif command == ("key-identity-v1", "--capabilities"):
             payload = _key_identity_capability()
+        elif command == ("native-account-binding-v1", "--capabilities"):
+            payload = _native_account_binding_capability()
         else:
             assert command == ("probe",)
             payload = _probe_capability()
@@ -138,6 +162,7 @@ def test_frozen_capability_validator_executes_all_exact_no_input_contracts(
         (str(executable), "message-stream-v1", "--capabilities"),
         (str(executable), "participant-directory-v1", "--capabilities"),
         (str(executable), "key-identity-v1", "--capabilities"),
+        (str(executable), "native-account-binding-v1", "--capabilities"),
         (str(executable), "probe"),
     ]
 
@@ -158,6 +183,8 @@ def test_frozen_capability_validator_rejects_key_identity_command_drift(
         elif command == ("key-identity-v1", "--capabilities"):
             payload = _key_identity_capability()
             payload["account_ref_format"] = "native-id"
+        elif command == ("native-account-binding-v1", "--capabilities"):
+            payload = _native_account_binding_capability()
         else:
             assert command == ("probe",)
             payload = _probe_capability()
@@ -242,6 +269,26 @@ def test_key_identity_capability_validator_fails_closed_on_any_drift(
 
     with pytest.raises(release_metadata.ReleaseMetadataError, match=message):
         release_metadata.validate_key_identity_capability(payload)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda value: value.update(capability="native-account-binding-v2"), "identity"),
+        (lambda value: value["account_ref_formats"].reverse(), "identity"),
+        (lambda value: value["states"].pop(), "identity"),
+        (lambda value: value.update(extra=True), "fields"),
+    ],
+)
+def test_native_account_binding_capability_fails_closed_on_any_drift(
+    mutate,
+    message: str,
+) -> None:
+    payload = _native_account_binding_capability()
+    mutate(payload)
+
+    with pytest.raises(release_metadata.ReleaseMetadataError, match=message):
+        release_metadata.validate_native_account_binding_capability(payload)
 
 
 @pytest.mark.parametrize(
@@ -397,6 +444,7 @@ def test_descriptor_is_canonical_and_binds_both_artifacts_to_one_source_bundle(
         "protocol_capabilities": [
             "key-identity-v1",
             "message-stream-v1",
+            "native-account-binding-v1",
             "participant-directory-v1",
         ],
         "schema": "memexa.approved_artifact_descriptor.v2",

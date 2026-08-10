@@ -279,6 +279,7 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert "& $executable message-stream-v1 --capabilities" in workflow
     assert "& $executable participant-directory-v1 --capabilities" in workflow
     assert "& $executable key-identity-v1 --capabilities" in workflow
+    assert "& $executable native-account-binding-v1 --capabilities" in workflow
     assert "& $executable probe" in workflow
 
 
@@ -355,6 +356,7 @@ def test_ci_covers_release_python_and_runs_the_runtime_probe_on_windows():
     assert "& $executable message-stream-v1 --capabilities" in workflow
     assert "& $executable participant-directory-v1 --capabilities" in workflow
     assert "& $executable key-identity-v1 --capabilities" in workflow
+    assert "& $executable native-account-binding-v1 --capabilities" in workflow
     assert "& $executable probe" in workflow
     assert "release_metadata.py validate-capabilities" in workflow
 
@@ -435,5 +437,6 @@ def test_readmes_document_standalone_verification_and_both_protocol_probes():
         assert "chmod 755 chatlog-keeper-macos-arm64" in readme
         assert "message-stream-v1 --capabilities" in readme
         assert "participant-directory-v1 --capabilities" in readme
+        assert "native-account-binding-v1 --capabilities" in readme
         assert "chatlog-keeper-v*-source.tar.gz" in readme
         assert "artifact descriptor" in readme
