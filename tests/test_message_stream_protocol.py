@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -962,4 +964,32 @@ def test_legacy_probe_output_and_dispatch_are_unchanged(monkeypatch, capsys) -> 
         "wechat": {"source": "wechat", "available": False},
     }
     assert "message-stream-v1" not in captured.out
+    assert captured.err == ""
+
+
+def test_legacy_probe_suppresses_expected_discovery_warnings(
+    monkeypatch, capsys
+) -> None:
+    logger = logging.getLogger("chatlog_keeper.tests.probe")
+    handler = logging.StreamHandler(sys.stderr)
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+
+    def _warning_probe(source):
+        logger.warning("expected missing data root")
+        return {"source": source, "available": False}
+
+    monkeypatch.setattr(cli, "_probe_qq", lambda: _warning_probe("qq"))
+    monkeypatch.setattr(cli, "_probe_wechat", lambda: _warning_probe("wechat"))
+    try:
+        assert cli.main(["probe"]) == 0
+    finally:
+        logger.removeHandler(handler)
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "qq": {"source": "qq", "available": False},
+        "wechat": {"source": "wechat", "available": False},
+    }
     assert captured.err == ""

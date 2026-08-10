@@ -71,6 +71,20 @@ def test_canonical_launch_path_resolves_parent_alias_and_rejects_final_link(
     ) is None
 
 
+def test_non_cache_debug_copy_validation_does_not_require_cache_root(
+    monkeypatch, tmp_path
+):
+    """Clean CI may exercise an explicit bundle before the product cache exists."""
+
+    target = tmp_path / "explicit" / "WeChat.app"
+    target.mkdir(parents=True)
+    missing_data_root = tmp_path / "not-created"
+    monkeypatch.setattr(macos_debug_app, "data_dir", lambda: missing_data_root)
+
+    assert not (missing_data_root / "debug-apps").exists()
+    assert macos_debug_app._validate_prepared_debug_copy("wechat", target) is True
+
+
 def test_launch_debug_copy_returns_exact_copy_pid(monkeypatch, tmp_path):
     app = tmp_path / "WeChat.app"
     executable = app / "Contents" / "MacOS" / "WeChat"

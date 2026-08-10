@@ -580,8 +580,14 @@ def _validate_prepared_debug_copy(source: str, target: Path) -> bool:
     expected_root = data_dir() / "debug-apps"
     try:
         actual_parent = target.parent.resolve(strict=True)
-        canonical_root = expected_root.resolve(strict=True)
-    except OSError:
+        # ``prepare_debug_copy`` always creates the production cache root before
+        # returning.  An explicitly supplied non-cache bundle is also used by
+        # the embedding/test hook, and a clean machine may not have created the
+        # cache root yet.  Resolve existing ancestors without requiring that
+        # unrelated leaf to exist, then keep the full product validation below
+        # whenever the target is actually inside the cache root.
+        canonical_root = expected_root.resolve(strict=False)
+    except (OSError, RuntimeError):
         return False
     # Keep the existing embedding/test hook for explicitly supplied non-cache
     # bundles. Product preparation always returns a child of ``debug-apps``.

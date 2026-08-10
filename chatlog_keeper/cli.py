@@ -1683,8 +1683,8 @@ def _message_stream_signal_handlers(
 
 
 @contextmanager
-def _message_stream_silent_logs() -> Iterator[None]:
-    """Keep native IDs and database paths out of the protocol's stderr channel."""
+def _structured_output_silent_logs() -> Iterator[None]:
+    """Keep native IDs and database paths out of structured-output stderr."""
 
     previous = logging.root.manager.disable
     logging.disable(logging.CRITICAL)
@@ -2134,7 +2134,7 @@ def _message_stream_v1_command(args) -> int:
 
     cancellation = stream_protocol.MessageStreamCancellation()
     try:
-        with _message_stream_silent_logs(), _message_stream_signal_handlers(cancellation):
+        with _structured_output_silent_logs(), _message_stream_signal_handlers(cancellation):
             _run_message_stream_v1(
                 request,
                 data_root=args.data_root,
@@ -2168,7 +2168,7 @@ def _participant_directory_v1_command(args) -> int:
     if getattr(args, "capabilities", False):
         return _print_json(participant_protocol.capabilities_payload())
     try:
-        with _message_stream_silent_logs():
+        with _structured_output_silent_logs():
             request = participant_protocol.read_request(sys.stdin)
             payload = participant_directory.read_page(
                 request,
@@ -2244,7 +2244,7 @@ def _key_recovery_v1_command(args) -> int:
 
     try:
         session.emit("preparing")
-        with _message_stream_silent_logs():
+        with _structured_output_silent_logs():
             with key_recovery_protocol.recovery_signal_handlers(session):
                 result = _extract_key(
                     args.source,
@@ -2526,7 +2526,13 @@ def main(argv: list[str] | None = None) -> int:
             os.environ["CHATLOG_WECHAT_DATA_ROOT"] = args.data_root
 
     if args.cmd == "probe":
-        return _print_json({"qq": _probe_qq(), "wechat": _probe_wechat()})
+        # ``probe`` is a machine-readable, no-input release capability.  A
+        # fresh host legitimately has no QQ/WeChat data roots; the discovery
+        # helpers log that expected absence as a warning for interactive
+        # callers, but it must not contaminate this JSON command's stderr.
+        with _structured_output_silent_logs():
+            payload = {"qq": _probe_qq(), "wechat": _probe_wechat()}
+        return _print_json(payload)
     if args.cmd == "message-stream-v1":
         return _message_stream_v1_command(args)
     if args.cmd == "participant-directory-v1":
