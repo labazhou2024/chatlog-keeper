@@ -257,7 +257,37 @@ class _WeChatConversationPageRow:
 
 # ─── WeChat process helpers ────────────────────────────────────────────────────
 
-def _get_weixin_pids() -> list:
+def _windows_process_executable(pid: int) -> Optional[Path]:
+    """Return the executable image for one Windows process without scanning disks."""
+
+    if sys.platform != "win32":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    kernel32.OpenProcess.restype = wt.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wt.HANDLE,
+        wt.DWORD,
+        wt.LPWSTR,
+        ctypes.POINTER(wt.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    kernel32.CloseHandle.restype = wt.BOOL
+    handle = kernel32.OpenProcess(0x1000, False, int(pid))
+    if not handle:
+        return None
+    try:
+        size = wt.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return None
+        return Path(buffer.value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _get_weixin_pids(client_executable: Optional[Path] = None) -> list:
     """Return list of Weixin.exe PIDs.
 
     Sorted ASCENDING — smallest PID = oldest = likely parent process that holds
@@ -288,6 +318,20 @@ def _get_weixin_pids() -> list:
                         pids.append(int(parts[1]))
                     except ValueError:
                         pass
+            if client_executable is not None:
+                try:
+                    expected = Path(client_executable).resolve(strict=True)
+                except (OSError, RuntimeError):
+                    return []
+                pids = [
+                    pid
+                    for pid in pids
+                    if (
+                        (actual := _windows_process_executable(pid)) is not None
+                        and os.path.normcase(os.fspath(actual.resolve(strict=False)))
+                        == os.path.normcase(os.fspath(expected))
+                    )
+                ]
             return sorted(pids)  # ASCENDING — parent (smallest PID) first
         except subprocess.TimeoutExpired as e:
             last_err = e
@@ -2811,6 +2855,7 @@ class WeChatDBReader:
         account_id: Optional[str] = None,
         *,
         allow_live_key_extract: bool = True,
+        client_executable: Optional[Path] = None,
     ):
         """Create a reader, optionally scoped to one discovered wxid directory.
 
@@ -2822,6 +2867,9 @@ class WeChatDBReader:
         self._configured_data_root = Path(data_root) if data_root is not None else None
         self._configured_account_id = str(account_id) if account_id is not None else None
         self._allow_live_key_extract = bool(allow_live_key_extract)
+        self._client_executable = (
+            Path(client_executable) if client_executable is not None else None
+        )
         self.data_root = None
         self.wxid_dir = None
         self.account_id = None
@@ -2907,7 +2955,11 @@ class WeChatDBReader:
             self._initialized = True
             return True
 
-        pids = _get_weixin_pids()
+        pids = (
+            _get_weixin_pids(self._client_executable)
+            if self._client_executable is not None
+            else _get_weixin_pids()
+        )
         if not pids:
             logger.warning("Weixin.exe not running; %d DB(s) without a key — run "
                            "`chatlog-keeper wechat extract-key` or `chatlog-keeper wechat set-key`.",

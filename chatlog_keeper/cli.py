@@ -896,7 +896,71 @@ def _wx_msg_to_dict(m, self_wxid: str = "", account_id: str = "") -> dict:
     }
 
 
-def _probe_wechat() -> dict:
+def _explicit_wechat_data_root(data_root: str) -> Path:
+    """Validate one user-selected xwechat_files directory without broad discovery."""
+
+    candidate = Path(data_root).expanduser()
+    if not candidate.is_absolute() or candidate.name.casefold() != "xwechat_files":
+        raise ValueError("wechat data root must be the selected xwechat_files folder")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("wechat data root is unavailable") from None
+    if not resolved.is_dir() or resolved.is_symlink():
+        raise ValueError("wechat data root is unavailable")
+    accounts = wechat_db.find_wxid_dirs(resolved)
+    if not any(wechat_db.find_msg_databases(account) for account in accounts):
+        raise ValueError("wechat data root does not contain a supported message database")
+    return resolved
+
+
+def _explicit_weixin_executable(client_executable: str) -> Path:
+    """Validate the exact user-selected Weixin.exe before process matching."""
+
+    candidate = Path(client_executable).expanduser()
+    if not candidate.is_absolute() or candidate.name.casefold() != "weixin.exe":
+        raise ValueError("wechat client executable must be Weixin.exe")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("wechat client executable is unavailable") from None
+    if not resolved.is_file() or resolved.is_symlink():
+        raise ValueError("wechat client executable is unavailable")
+    return resolved
+
+
+def _weixin_dll_for_executable(client_executable: Path) -> Path:
+    """Resolve Weixin.dll only inside the explicitly selected client directory."""
+
+    install_root = client_executable.parent
+    candidates = [install_root / "Weixin.dll"]
+    try:
+        for child in install_root.iterdir():
+            if child.is_dir() and all(part.isdigit() for part in child.name.split(".")):
+                candidates.append(child / "Weixin.dll")
+    except OSError:
+        pass
+    existing = [
+        candidate
+        for candidate in candidates
+        if candidate.is_file() and not candidate.is_symlink()
+    ]
+    if not existing:
+        raise ValueError("wechat client installation does not contain Weixin.dll")
+    return max(
+        existing,
+        key=lambda item: (
+            tuple(int(part) for part in item.parent.name.split("."))
+            if item.parent != install_root
+            else (0,)
+        ),
+    )
+
+
+def _probe_wechat(
+    data_root: str | None = None,
+    client_executable: str | None = None,
+) -> dict:
     """Lightweight status probe — NEVER scans process memory.
 
     Mirror of :func:`_probe_qq`. WeChat 4.1.10.31+ keeps no plaintext key in the
@@ -907,8 +971,21 @@ def _probe_wechat() -> dict:
     the user to 「自动获取密钥」 (which runs the scan/debugger explicitly).
     """
     try:
-        running = bool(wechat_db._get_weixin_pids())
-        root = wechat_db.find_weixin_data_root()
+        selected_client = (
+            _explicit_weixin_executable(client_executable)
+            if client_executable
+            else None
+        )
+        running = bool(
+            wechat_db._get_weixin_pids(selected_client)
+            if selected_client is not None
+            else wechat_db._get_weixin_pids()
+        )
+        root = (
+            _explicit_wechat_data_root(data_root)
+            if data_root
+            else wechat_db.find_weixin_data_root()
+        )
         wxid_dirs = wechat_db.find_wxid_dirs(root) if root else []
         has_database = any(
             bool(wechat_db.find_msg_databases(wxid_dir))
@@ -1489,6 +1566,7 @@ def _extract_key(
     source: str,
     method: str,
     data_root: str | None = None,
+    client_executable: str | None = None,
     *,
     _recovery: key_recovery_protocol.KeyRecoverySession | None = None,
 ) -> dict:
@@ -1633,10 +1711,20 @@ def _extract_key(
         # ONLY if passive finds nothing. Export stays cache-first and never
         # triggers active on its own — active only runs inside this command,
         # which the user invoked deliberately.
-        r = _extract_key(source, "passive", data_root=data_root)
+        r = _extract_key(
+            source,
+            "passive",
+            data_root=data_root,
+            client_executable=client_executable,
+        )
         if r.get("ok"):
             return r
-        r = _extract_key(source, "active", data_root=data_root)
+        r = _extract_key(
+            source,
+            "active",
+            data_root=data_root,
+            client_executable=client_executable,
+        )
         if isinstance(r, dict):
             r["fell_back_from_passive"] = True
             if source == "wechat" and not r.get("ok"):
@@ -1752,6 +1840,12 @@ def _extract_key(
                 "error": "passive scan found no key (QQ not running, or a newer build — "
                          "try `--method active` or `set-key`)"}
     if source == "wechat":
+        selected_root = _explicit_wechat_data_root(data_root) if data_root else None
+        selected_client = (
+            _explicit_weixin_executable(client_executable)
+            if client_executable
+            else None
+        )
         if method == "active":
             if _recovery is not None:
                 if _recovery.cancel_requested():
@@ -1764,9 +1858,13 @@ def _extract_key(
                         {"source": "wechat", "method": "active", "ok": False},
                         "client_running",
                     )
-            db_path = _wechat_message_db_for_active(data_root)
+            db_path = _wechat_message_db_for_active(
+                str(selected_root) if selected_root is not None else data_root
+            )
             try:
-                snapshots = _wechat_key_target_snapshots(data_root)
+                snapshots = _wechat_key_target_snapshots(
+                    str(selected_root) if selected_root is not None else data_root
+                )
             except wechat_key_identity.TargetError:
                 if not db_path:
                     return recovery_failure(
@@ -1783,6 +1881,10 @@ def _extract_key(
                     "source_unavailable",
                 )
             active_options = {"db_path": db_path}
+            if selected_client is not None:
+                active_options["weixin_dll"] = str(
+                    _weixin_dll_for_executable(selected_client)
+                )
             if _recovery is not None:
                 active_options.update(
                     timeout=_recovery.remaining_seconds(),
@@ -1890,12 +1992,17 @@ def _extract_key(
             return {"source": "wechat", "method": "passive", "ok": False,
                     "error": "fresh WeChat extraction requires --method active"}
         try:
-            snapshots = _wechat_key_target_snapshots(data_root)
+            snapshots = _wechat_key_target_snapshots(
+                str(selected_root) if selected_root is not None else data_root
+            )
         except wechat_key_identity.TargetError:
             return {"source": "wechat", "method": "passive", "ok": False,
                     "error": "passive extraction could not freeze a stable WeChat "
                              "database target for HMAC verification"}
-        reader = wechat_db.WeChatDBReader()
+        reader = wechat_db.WeChatDBReader(
+            data_root=selected_root,
+            client_executable=selected_client,
+        )
         reader.initialize()
         enc = getattr(reader, "enc_keys", None)
         if enc:
@@ -2658,7 +2765,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("probe", help="report what's available on this machine + key status")
+    p_probe = sub.add_parser(
+        "probe",
+        help="report what's available on this machine + key status",
+    )
+    p_probe.add_argument("--source", choices=["qq", "wechat"], default=None)
+    p_probe.add_argument("--data-root", type=str, default=None)
+    p_probe.add_argument("--client-executable", type=str, default=None)
 
     p_stream = sub.add_parser(
         "message-stream-v1",
@@ -2834,6 +2947,8 @@ def main(argv: list[str] | None = None) -> int:
                            "before launch and require a DB-verified manual key.")
     p_ek.add_argument("--data-root", type=str, default=None,
                       help="override the data folder (else auto-detected)")
+    p_ek.add_argument("--client-executable", type=str, default=None,
+                      help="exact Weixin.exe selected by the user")
     p_ek.add_argument(
         "--key-recovery-v1-stdin",
         action="store_true",
@@ -2866,7 +2981,17 @@ def main(argv: list[str] | None = None) -> int:
         # helpers log that expected absence as a warning for interactive
         # callers, but it must not contaminate this JSON command's stderr.
         with _structured_output_silent_logs():
-            payload = {"qq": _probe_qq(), "wechat": _probe_wechat()}
+            if args.source == "wechat":
+                payload = {
+                    "wechat": _probe_wechat(
+                        data_root=args.data_root,
+                        client_executable=args.client_executable,
+                    )
+                }
+            elif args.source == "qq":
+                payload = {"qq": _probe_qq()}
+            else:
+                payload = {"qq": _probe_qq(), "wechat": _probe_wechat()}
         return _print_json(payload)
     if args.cmd == "message-stream-v1":
         return _message_stream_v1_command(args)
@@ -2954,7 +3079,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "extract-key":
         if args.key_recovery_v1_stdin:
             return _key_recovery_v1_command(args)
-        return _print_json(_extract_key(args.source, args.method, data_root=getattr(args, "data_root", None)))
+        return _print_json(_extract_key(
+            args.source,
+            args.method,
+            data_root=getattr(args, "data_root", None),
+            client_executable=getattr(args, "client_executable", None),
+        ))
     if args.cmd == "key-recovery-v1":
         if args.request_stdin and args.action is None:
             return _print_private_protocol_json(

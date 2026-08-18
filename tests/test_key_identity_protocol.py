@@ -311,7 +311,9 @@ def test_passive_extract_bootstraps_identity_and_ready_probe_repeats_same_ref(
     )
 
     class Reader:
-        def __init__(self) -> None:
+        def __init__(self, *, data_root=None, client_executable=None) -> None:
+            assert data_root == root.resolve()
+            assert client_executable is None
             self.enc_keys: dict[Path, bytes] = {}
 
         def initialize(self) -> bool:

@@ -17,6 +17,50 @@ def _mk_message_db(root: Path) -> Path:
     return db
 
 
+def test_explicit_wechat_data_root_requires_exact_xwechat_files(tmp_path):
+    selected = tmp_path / "xwechat_files"
+    _mk_message_db(selected)
+
+    assert cli._explicit_wechat_data_root(str(selected)) == selected.resolve()
+
+    try:
+        cli._explicit_wechat_data_root(str(tmp_path))
+    except ValueError as exc:
+        assert "xwechat_files" in str(exc)
+    else:
+        raise AssertionError("the parent folder must not be accepted implicitly")
+
+
+def test_explicit_wechat_data_root_requires_message_database(tmp_path):
+    selected = tmp_path / "xwechat_files"
+    selected.mkdir()
+
+    try:
+        cli._explicit_wechat_data_root(str(selected))
+    except ValueError as exc:
+        assert "message database" in str(exc)
+    else:
+        raise AssertionError("an unrelated folder must not be accepted")
+
+
+def test_explicit_weixin_executable_scopes_dll_resolution(tmp_path):
+    install_root = tmp_path / "Weixin"
+    executable = install_root / "Weixin.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"exe")
+    older_dll = install_root / "4.1.9.1" / "Weixin.dll"
+    newer_dll = install_root / "4.1.10.31" / "Weixin.dll"
+    older_dll.parent.mkdir()
+    newer_dll.parent.mkdir()
+    older_dll.write_bytes(b"old")
+    newer_dll.write_bytes(b"new")
+
+    selected = cli._explicit_weixin_executable(str(executable))
+
+    assert selected == executable.resolve()
+    assert cli._weixin_dll_for_executable(selected) == newer_dll
+
+
 def test_wechat_active_db_path_resolves_parent_data_root(tmp_path):
     db = _mk_message_db(tmp_path / "xwechat_files")
 
