@@ -2681,6 +2681,7 @@ def _key_recovery_v1_command(args) -> int:
                     args.source,
                     args.method,
                     data_root=getattr(args, "data_root", None),
+                    client_executable=getattr(args, "client_executable", None),
                     _recovery=session,
                 )
         if result.get("ok"):
