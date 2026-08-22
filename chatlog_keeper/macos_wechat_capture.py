@@ -24,7 +24,7 @@ from typing import Callable, Optional
 from chatlog_keeper.core._path_resolver import data_dir
 
 _LAST_ERROR = ""
-_CAPTURE_FORMAT = b"wechat-pbkdf2-startup-interpose-v1"
+_CAPTURE_FORMAT = b"wechat-pbkdf2-startup-interpose-v4-image-forward"
 _RECORD_MAGIC = b"WXK1"
 _RECORD_SIZE = len(_RECORD_MAGIC) + 32
 _MAX_BUFFER_BYTES = _RECORD_SIZE * 1024

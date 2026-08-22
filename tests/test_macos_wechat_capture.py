@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -209,6 +210,90 @@ def test_ensure_capture_library_targets_macos_11_arm64_and_stable_install_name(
     assert channel.close() is True
     assert not fifo.exists()
     assert not staged.exists()
+
+
+def test_real_interposer_forwards_once_without_recursing(monkeypatch, tmp_path):
+    """Exercise dyld interposition against the real CommonCrypto image."""
+    output_root = tmp_path / "data"
+    monkeypatch.setattr(macos_wechat_capture, "data_dir", lambda: output_root)
+    monkeypatch.setattr(
+        macos_wechat_capture,
+        "_prebuilt_path",
+        lambda: tmp_path / "missing.dylib",
+    )
+    monkeypatch.setattr(
+        macos_wechat_capture,
+        "_TRUSTED_CAPTURE_LIBRARY",
+        None,
+    )
+    library = macos_wechat_capture.ensure_capture_library()
+    assert library is not None
+
+    host_source = tmp_path / "capture_host.c"
+    host_source.write_text(
+        """
+#include <CommonCrypto/CommonKeyDerivation.h>
+#include <stdint.h>
+
+int main(void) {
+    char password[32] = {0};
+    uint8_t salt[16] = {0};
+    uint8_t derived[32] = {0};
+    return CCKeyDerivationPBKDF(
+        kCCPBKDF2, password, sizeof(password), salt, sizeof(salt),
+        kCCPRFHmacAlgSHA512, 256000, derived, sizeof(derived));
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    host = tmp_path / "capture-host"
+    compiled = subprocess.run(
+        ["xcrun", "clang", str(host_source), "-o", str(host)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert compiled.returncode == 0
+    signed = subprocess.run(
+        ["codesign", "--force", "--sign", "-", str(host)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert signed.returncode == 0
+
+    fifo = tmp_path / "capture.fifo"
+    os.mkfifo(fifo, 0o600)
+    os.chmod(fifo, 0o600)
+    read_fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        environment = os.environ.copy()
+        environment["DYLD_INSERT_LIBRARIES"] = str(library)
+        environment["CHATLOG_KEEPER_WECHAT_KEY_FIFO"] = str(fifo)
+        executed = subprocess.run(
+            [str(host)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=environment,
+        )
+        assert executed.returncode == 0
+        records = bytearray()
+        while True:
+            try:
+                chunk = os.read(read_fd, 4096)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            records.extend(chunk)
+    finally:
+        os.close(read_fd)
+
+    assert bytes(records) == b"WXK1" + bytes(32)
 
 
 def test_ad_hoc_resigned_capture_cache_is_rebuilt_from_source(
