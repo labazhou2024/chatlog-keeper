@@ -25,7 +25,10 @@ JSON/HTML 导出格式与 Windows 完全一致。
 `extract-key --method active` 是显式、可见的交互流程：
 
 - 在 `~/Library/Application Support/chatlog-keeper/debug-apps/` 创建隔离副本；
-- 保留原 entitlements，只增加 `com.apple.security.get-task-allow`；
+- QQ 保留原 entitlements，并增加 `com.apple.security.get-task-allow`；
+- ad-hoc 微信副本只移除其无权声明的腾讯签名身份，保留 sandbox 和其他无关的原始
+  entitlements，并为 PID 后缀的 rendezvous 服务增加限定的 Mach 注册例外；遇到未知的
+  developer、private 或 keychain 身份声明时安全失败；
 - QQ 副本保留 Hardened Runtime，并在验证签名、精确 entitlement 差异以及直接依赖的
   Team-ID 关系后才启动；
 - 微信采用上游 v0.2 的兼容签名：私有副本不启用 Hardened Runtime，因为 ad-hoc 主程序

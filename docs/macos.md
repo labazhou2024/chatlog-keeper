@@ -29,8 +29,13 @@ access. Modern hardened clients usually deny that request.
 
 - an isolated copy is created under
   `~/Library/Application Support/chatlog-keeper/debug-apps/`;
-- the copy preserves the original entitlements and adds only
+- QQ preserves its original entitlements and adds
   `com.apple.security.get-task-allow`;
+- the ad-hoc WeChat copy removes only Tencent signing-identity claims that an
+  ad-hoc signature cannot assert, preserves the sandbox and unrelated original
+  entitlements, and adds the scoped Mach-registration exception required by
+  its PID-suffixed rendezvous services; unknown developer, private, or
+  keychain identity claims fail closed;
 - QQ keeps Hardened Runtime and is launched only after its signature, exact
   entitlement delta, and direct-library Team-ID relation are verified;
 - WeChat uses the upstream v0.2 compatibility signature: Hardened Runtime is

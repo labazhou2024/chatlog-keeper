@@ -35,7 +35,30 @@ _APPS = {
     "qq": (Path("/Applications/QQ.app"), "QQ"),
 }
 _DEBUG_COPY_FORMAT = (
-    b"preserve-nested-signatures-v7-wechat-compat-exact-entitlements-kernel-pid"
+    b"preserve-nested-signatures-v10-wechat-mach-register-kernel-pid"
+)
+_GET_TASK_ALLOW_ENTITLEMENT = "com.apple.security.get-task-allow"
+_WECHAT_MACH_REGISTER_ENTITLEMENT = (
+    "com.apple.security.temporary-exception.mach-register.global-name"
+)
+_WECHAT_AD_HOC_STRIPPED_ENTITLEMENTS = frozenset(
+    {
+        # These values identify Tencent's signing team or registered groups.
+        # An ad-hoc signature cannot make those claims, and AMFI rejects the
+        # process before main() when they are copied from the Mac App Store
+        # client.  The private copy keeps its bundle identifier and sandbox;
+        # only signing-identity claims are removed.
+        "application-identifier",
+        "com.apple.application-identifier",
+        "com.apple.developer.team-identifier",
+        "com.apple.security.application-groups",
+    }
+)
+_WECHAT_AD_HOC_UNSUPPORTED_ENTITLEMENTS = frozenset(
+    {
+        "keychain-access-groups",
+        "com.apple.security.keychain-access-groups",
+    }
 )
 _LAST_ERROR = ""
 _RUNTIME_FLAGS_RE = re.compile(
@@ -316,6 +339,61 @@ def _entitlements(app: Path) -> Optional[dict]:
     return value if isinstance(value, dict) else None
 
 
+def _debug_copy_entitlements(
+    source: str,
+    original_entitlements: dict,
+) -> Optional[dict]:
+    """Return the exact entitlements that a private ad-hoc copy may claim.
+
+    QQ's current Mac App Store bundle does not carry Tencent application/team
+    identity claims, so its established exact-entitlements + get-task-allow
+    path remains unchanged.  WeChat 4.1.11 does carry those restricted claims;
+    preserving them under an ad-hoc signature passes ``codesign --verify`` but
+    is rejected by AMFI at exec time.  Remove only the known identity-bound
+    values.  The sandboxed WeChat process also registers one PID-suffixed Mach
+    rendezvous service under its original application identifier; after the
+    signing identity is removed, preserve only that exact capability through
+    Apple's scoped temporary-exception entitlement.  Fail closed if a future
+    client introduces another developer, private, or keychain identity claim
+    that needs a separate compatibility decision.
+    """
+
+    if source not in _APPS or not isinstance(original_entitlements, dict):
+        return None
+    expected = dict(original_entitlements)
+    if source == "wechat":
+        application_identifier = original_entitlements.get(
+            "com.apple.application-identifier"
+        ) or original_entitlements.get("application-identifier")
+        team_identifier = original_entitlements.get(
+            "com.apple.developer.team-identifier"
+        )
+        if (
+            not isinstance(application_identifier, str)
+            or not isinstance(team_identifier, str)
+            or not re.fullmatch(r"[A-Z0-9]{10}", team_identifier)
+            or application_identifier
+            != f"{team_identifier}.com.tencent.xinWeChat"
+        ):
+            return None
+        for entitlement in _WECHAT_AD_HOC_STRIPPED_ENTITLEMENTS:
+            expected.pop(entitlement, None)
+        if any(
+            entitlement in _WECHAT_AD_HOC_UNSUPPORTED_ENTITLEMENTS
+            or entitlement.startswith(
+                ("com.apple.developer.", "com.apple.private.")
+            )
+            for entitlement in expected
+        ):
+            return None
+        expected[_WECHAT_MACH_REGISTER_ENTITLEMENT] = [
+            f"{application_identifier}.MachPortRendezvousServer.*",
+            f"{application_identifier}.MMMojo.MachPortRendezvousServer.*",
+        ]
+    expected[_GET_TASK_ALLOW_ENTITLEMENT] = True
+    return expected
+
+
 def _has_hardened_runtime(app: Path) -> bool:
     proc = _run(["codesign", "-d", "--verbose=4", str(app)], timeout=30)
     raw = (
@@ -508,7 +586,7 @@ def _verified_debug_copy(
     return (
         verified.returncode == 0
         and current == expected_entitlements
-        and current.get("com.apple.security.get-task-allow") is True
+        and current.get(_GET_TASK_ALLOW_ENTITLEMENT) is True
         and _has_hardened_runtime(target) is hardened_runtime
         and _code_team_identifier(target) == ""
     )
@@ -601,8 +679,12 @@ def _validate_prepared_debug_copy(source: str, target: Path) -> bool:
     source_digest = _bundle_source_digest(original)
     if original_entitlements is None or source_digest is None:
         return False
-    expected_entitlements = dict(original_entitlements)
-    expected_entitlements["com.apple.security.get-task-allow"] = True
+    expected_entitlements = _debug_copy_entitlements(
+        source,
+        original_entitlements,
+    )
+    if expected_entitlements is None:
+        return False
     record = _TRUSTED_DEBUG_COPIES.get(source)
     expected_generation = None
     if (
@@ -652,8 +734,12 @@ def prepare_debug_copy(source: str) -> Optional[Path]:
     source_digest = _bundle_source_digest(original)
     if original_entitlements is None or source_digest is None:
         return None
-    expected_entitlements = dict(original_entitlements)
-    expected_entitlements["com.apple.security.get-task-allow"] = True
+    expected_entitlements = _debug_copy_entitlements(
+        source,
+        original_entitlements,
+    )
+    if expected_entitlements is None:
+        return None
     hardened_runtime = _copy_uses_hardened_runtime(source)
 
     target = root / f"{original.stem}-{identity}.app"
