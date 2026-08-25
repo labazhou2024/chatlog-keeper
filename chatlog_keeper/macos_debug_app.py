@@ -1240,12 +1240,21 @@ def terminate_debug_copy(
         generation_cleaned = _generation_state(token) in {"gone", "replaced"}
         if not generation_cleaned:
             generation_cleaned = _terminate_generation(token, wait_s=wait_s)
-        remaining = _exact_process_pids(token.executable)
+        from chatlog_keeper.macos_key import (
+            cleanup_debug_copy_bundle,
+            debug_copy_bundle_is_running,
+        )
+
+        target = token.executable.parents[2]
+        bundle_cleaned = (
+            cleanup_debug_copy_bundle(target) if watchdog_finished else False
+        )
+        remaining = debug_copy_bundle_is_running(target)
         cleaned = (
             watchdog_finished
             and generation_cleaned
-            and remaining is not None
-            and not remaining
+            and bundle_cleaned
+            and remaining is False
         )
         if not cleaned:
             _LAST_ERROR = "debug_copy_cleanup_failed"
@@ -1293,10 +1302,12 @@ def verified_debug_copy_is_running(source: str) -> bool:
     executable = _existing_verified_debug_executable(source)
     if executable is None:
         return False
-    pids = _exact_process_pids(executable)
-    if pids is None:
+    from chatlog_keeper.macos_key import debug_copy_bundle_is_running
+
+    running = debug_copy_bundle_is_running(executable.parents[2])
+    if running is None:
         raise RuntimeError("isolated process enumeration failed")
-    return bool(pids)
+    return running
 
 
 def terminate_verified_debug_copy(source: str) -> bool:
@@ -1308,18 +1319,16 @@ def terminate_verified_debug_copy(source: str) -> bool:
     executable = _existing_verified_debug_executable(source)
     if executable is None:
         return True
-    pids = _exact_process_pids(executable)
-    if pids is None:
-        return False
-    cleaned = True
-    for pid in pids:
-        token = _generation_for_pid(source, executable, pid)
-        if token is None:
-            cleaned = False
-            continue
-        cleaned = _terminate_generation(token, wait_s=5.0) and cleaned
-    remaining = _exact_process_pids(executable)
-    return cleaned and remaining is not None and not remaining
+    from chatlog_keeper.macos_key import (
+        cleanup_debug_copy_bundle,
+        debug_copy_bundle_is_running,
+    )
+
+    target = executable.parents[2]
+    return (
+        cleanup_debug_copy_bundle(target)
+        and debug_copy_bundle_is_running(target) is False
+    )
 
 
 def _recorded_debug_reference(record: dict[str, Any]) -> Optional[Path]:
@@ -1472,14 +1481,26 @@ def recorded_debug_copy_is_running(record: dict[str, Any]) -> bool:
     pids = _exact_process_pids(reference)
     if pids is None:
         raise RuntimeError("isolated process enumeration failed")
-    if record["state"] == "launching" and not pids:
-        return False
-    if (
-        record["state"] == "running"
-        and _recorded_pid_is_absent(record["pid"])
-        and not pids
-    ):
-        return False
+    main_generation_absent = not pids and (
+        record["state"] == "launching"
+        or _recorded_pid_is_absent(record["pid"])
+    )
+    if main_generation_absent:
+        target = reference.parents[2]
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            # A removed cache/client must not strand a completed durable lease.
+            return False
+        except OSError as exc:
+            raise RuntimeError("isolated bundle identity unavailable") from exc
+        from chatlog_keeper.macos_key import debug_copy_bundle_is_running
+
+        bundle_running = debug_copy_bundle_is_running(target)
+        if bundle_running is None:
+            raise RuntimeError("isolated process enumeration failed")
+        if not bundle_running:
+            return False
     executable = _recorded_debug_executable(record)
     if executable is None:
         # The process may have exited while an old cache/client artifact was
@@ -1495,8 +1516,10 @@ def recorded_debug_copy_is_running(record: dict[str, Any]) -> bool:
         ):
             return False
         raise RuntimeError("invalid durable debug-copy artifact")
-    pids = _exact_process_pids(executable)
-    if pids is None:
+    from chatlog_keeper.macos_key import debug_copy_bundle_is_running
+
+    bundle_running = debug_copy_bundle_is_running(executable.parents[2])
+    if bundle_running is None:
         raise RuntimeError("isolated process enumeration failed")
     if record["state"] == "running":
         token = _DebugProcessToken(
@@ -1512,7 +1535,7 @@ def recorded_debug_copy_is_running(record: dict[str, Any]) -> bool:
             raise RuntimeError("isolated process identity unavailable")
         if state == "same":
             return True
-    return bool(pids)
+    return bundle_running
 
 
 def terminate_recorded_debug_copy(record: dict[str, Any]) -> bool:
@@ -1524,14 +1547,25 @@ def terminate_recorded_debug_copy(record: dict[str, Any]) -> bool:
     pids = _exact_process_pids(reference)
     if pids is None:
         return False
-    if record["state"] == "launching" and not pids:
-        return True
-    if (
-        record["state"] == "running"
-        and _recorded_pid_is_absent(record["pid"])
-        and not pids
-    ):
-        return True
+    main_generation_absent = not pids and (
+        record["state"] == "launching"
+        or _recorded_pid_is_absent(record["pid"])
+    )
+    if main_generation_absent:
+        target = reference.parents[2]
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        from chatlog_keeper.macos_key import debug_copy_bundle_is_running
+
+        bundle_running = debug_copy_bundle_is_running(target)
+        if bundle_running is None:
+            return False
+        if not bundle_running:
+            return True
     executable = _recorded_debug_executable(record)
     if executable is None:
         current_pids = _exact_process_pids(reference)
@@ -1542,18 +1576,16 @@ def terminate_recorded_debug_copy(record: dict[str, Any]) -> bool:
                 or _recorded_pid_is_absent(record["pid"])
             )
         )
-    pids = _exact_process_pids(executable)
-    if pids is None:
-        return False
-    cleaned = True
-    for pid in pids:
-        token = _generation_for_pid(record["source"], executable, pid)
-        if token is None:
-            cleaned = False
-            continue
-        cleaned = _terminate_generation(token, wait_s=5.0) and cleaned
-    remaining = _exact_process_pids(executable)
-    return cleaned and remaining is not None and not remaining
+    from chatlog_keeper.macos_key import (
+        cleanup_debug_copy_bundle,
+        debug_copy_bundle_is_running,
+    )
+
+    target = executable.parents[2]
+    return (
+        cleanup_debug_copy_bundle(target)
+        and debug_copy_bundle_is_running(target) is False
+    )
 
 
 def launch_debug_copy(

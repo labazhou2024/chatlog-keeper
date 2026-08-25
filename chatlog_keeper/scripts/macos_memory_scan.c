@@ -181,11 +181,6 @@ static int owner_process_alive(pid_t expected_parent) {
     return expected_parent > 1 && getppid() == expected_parent;
 }
 
-static int pid_may_be_alive(pid_t pid) {
-    errno = 0;
-    return kill(pid, 0) == 0 || errno == EPERM;
-}
-
 static int printable(unsigned char c) { return c >= 0x20 && c <= 0x7e; }
 
 static void emit_hex(const char *kind, const unsigned char *p, size_t n) {
@@ -237,7 +232,7 @@ static void scan_wechat(const unsigned char *p, size_t n) {
     }
 }
 
-#define WATCH_MAX_GENERATIONS 16
+#define WATCH_MAX_GENERATIONS 64
 #define WATCH_CLEANUP_GRACE_MS 35000u
 #define WATCH_TERM_GRACE_MS 5000u
 
@@ -270,8 +265,14 @@ static int trusted_open_tool(void) {
            info.st_uid == 0 && !(info.st_mode & (S_IWGRP | S_IWOTH));
 }
 
-static int exact_path_generations(
-    const char *path,
+static int path_is_inside_bundle(const char *path, const char *bundle_path) {
+    size_t prefix_len = strlen(bundle_path);
+    return prefix_len > 0 && !strncmp(path, bundle_path, prefix_len) &&
+           path[prefix_len] == '/';
+}
+
+static int bundle_path_generations(
+    const char *bundle_path,
     struct watched_generation *out,
     size_t capacity,
     size_t *out_count) {
@@ -287,24 +288,20 @@ static int exact_path_generations(
         return 0;
     }
     size_t count = (size_t)used / sizeof(pid_t);
-    const char *target_name = strrchr(path, '/');
-    target_name = target_name ? target_name + 1 : path;
     for (size_t index = 0; index < count; ++index) {
         pid_t pid = pids[index];
         struct proc_bsdinfo info;
         struct process_identity identity;
         if (pid <= 1) continue;
         if (!read_process_info(pid, &info) || info.pbi_uid != geteuid()) continue;
-        if (!snapshot_identity(pid, &identity)) {
-            if (pid_may_be_alive(pid) &&
-                (!strcmp(info.pbi_name, target_name) ||
-                 !strcmp(info.pbi_comm, target_name))) {
-                free(pids);
-                return 0;
-            }
+        /* A same-user system process can still deny proc_pidpath.  Such a
+         * process is never signaled: only a twice-snapshotted identity whose
+         * kernel path lies inside the frozen owner-only bundle is admitted. */
+        if (!snapshot_identity(pid, &identity)) continue;
+        if (identity.uid != geteuid() ||
+            !path_is_inside_bundle(identity.path, bundle_path)) {
             continue;
         }
-        if (identity.uid != geteuid() || strcmp(identity.path, path)) continue;
         if (*out_count >= capacity) {
             free(pids);
             return 0;
@@ -335,6 +332,10 @@ static int remember_generation(
 
 static int open_child_finished(pid_t open_pid, int *finished) {
     if (*finished) return 1;
+    if (open_pid == 0) {
+        *finished = 1;
+        return 1;
+    }
     int status = 0;
     pid_t result = waitpid(open_pid, &status, WNOHANG);
     if (result == 0) return 1;
@@ -343,21 +344,21 @@ static int open_child_finished(pid_t open_pid, int *finished) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-static int cleanup_watched_target(
-    const char *path,
+static int cleanup_watched_bundle(
+    const char *bundle_path,
     pid_t open_pid,
     struct watched_generation *known,
     size_t *known_count) {
     uint64_t started = monotonic_ms();
     uint64_t deadline = started + WATCH_CLEANUP_GRACE_MS;
     uint64_t quiet_since = 0;
-    int open_finished = 0;
+    int open_finished = open_pid == 0;
     while (monotonic_ms() <= deadline) {
         if (!open_child_finished(open_pid, &open_finished)) return 0;
         struct watched_generation current[WATCH_MAX_GENERATIONS];
         size_t current_count = 0;
-        if (!exact_path_generations(
-                path, current, WATCH_MAX_GENERATIONS, &current_count)) {
+        if (!bundle_path_generations(
+                bundle_path, current, WATCH_MAX_GENERATIONS, &current_count)) {
             usleep(100000);
             continue;
         }
@@ -404,6 +405,31 @@ static int cleanup_watched_target(
     return 0;
 }
 
+static int bundle_status_main(int argc, char **argv, int cleanup) {
+    if (argc != 8) return 2;
+    pid_t owner_pid = 0;
+    struct frozen_launch_path app;
+    if (!parse_pid(argv[2], &owner_pid) ||
+        !parse_frozen_launch_path(argv, 3, &app)) {
+        return 2;
+    }
+    if (!owner_process_alive(owner_pid) ||
+        !frozen_launch_path_matches(&app, S_IFDIR, 0700)) {
+        return 7;
+    }
+    struct watched_generation current[WATCH_MAX_GENERATIONS];
+    size_t current_count = 0;
+    if (!bundle_path_generations(
+            app.path, current, WATCH_MAX_GENERATIONS, &current_count)) {
+        return 7;
+    }
+    if (!cleanup) return current_count ? 4 : 0;
+    if (!current_count) return 0;
+    size_t known_count = current_count;
+    return cleanup_watched_bundle(
+        app.path, 0, current, &known_count) ? 0 : 7;
+}
+
 static int wait_for_launch_command(pid_t owner_pid) {
     while (owner_process_alive(owner_pid) && !watch_interrupted) {
         struct pollfd control = {STDIN_FILENO, POLLIN | POLLHUP, 0};
@@ -448,8 +474,8 @@ static int watch_launch_main(int argc, char **argv) {
     }
     struct watched_generation baseline[WATCH_MAX_GENERATIONS];
     size_t baseline_count = 0;
-    if (!exact_path_generations(
-            target.path, baseline, WATCH_MAX_GENERATIONS, &baseline_count) ||
+    if (!bundle_path_generations(
+            app.path, baseline, WATCH_MAX_GENERATIONS, &baseline_count) ||
         baseline_count != 0) {
         fprintf(stderr, "watch_baseline_not_empty\n");
         return 7;
@@ -462,8 +488,8 @@ static int watch_launch_main(int argc, char **argv) {
     }
     if (!wait_for_launch_command(owner_pid)) return 6;
     if (!owner_process_alive(owner_pid) || watch_interrupted) return 6;
-    if (!exact_path_generations(
-            target.path, baseline, WATCH_MAX_GENERATIONS, &baseline_count) ||
+    if (!bundle_path_generations(
+            app.path, baseline, WATCH_MAX_GENERATIONS, &baseline_count) ||
         baseline_count != 0) {
         return 7;
     }
@@ -522,8 +548,8 @@ static int watch_launch_main(int argc, char **argv) {
     while (owner_process_alive(owner_pid) && !watch_interrupted) {
         struct watched_generation current[WATCH_MAX_GENERATIONS];
         size_t current_count = 0;
-        if (exact_path_generations(
-                target.path, current, WATCH_MAX_GENERATIONS, &current_count)) {
+        if (bundle_path_generations(
+                app.path, current, WATCH_MAX_GENERATIONS, &current_count)) {
             for (size_t index = 0; index < current_count; ++index) {
                 if (!remember_generation(known, &known_count, &current[index])) {
                     watch_interrupted = 1;
@@ -545,13 +571,19 @@ static int watch_launch_main(int argc, char **argv) {
             break;
         }
     }
-    int cleaned = cleanup_watched_target(
-        target.path, open_pid, known, &known_count);
+    int cleaned = cleanup_watched_bundle(
+        app.path, open_pid, known, &known_count);
     if (!cleaned) fprintf(stderr, "watch_cleanup_failed\n");
     return cleaned ? 0 : 7;
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "bundle-status")) {
+        return bundle_status_main(argc, argv, 0);
+    }
+    if (argc >= 2 && !strcmp(argv[1], "cleanup-bundle")) {
+        return bundle_status_main(argc, argv, 1);
+    }
     if (argc >= 2 && !strcmp(argv[1], "watch-launch")) {
         return watch_launch_main(argc, argv);
     }

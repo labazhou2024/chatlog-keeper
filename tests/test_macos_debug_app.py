@@ -1674,6 +1674,16 @@ def test_terminate_debug_copy_confirms_exit_after_sigkill(
         lambda pid, sig: signals.append((pid, sig)),
     )
     monkeypatch.setattr(macos_debug_app, "_exact_process_pids", lambda path: ())
+    monkeypatch.setattr(
+        macos_key,
+        "cleanup_debug_copy_bundle",
+        lambda target: target == executable.parents[2],
+    )
+    monkeypatch.setattr(
+        macos_key,
+        "debug_copy_bundle_is_running",
+        lambda target: False,
+    )
 
     assert macos_debug_app.terminate_debug_copy(
         "wechat", 42, wait_s=0

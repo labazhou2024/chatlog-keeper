@@ -65,11 +65,15 @@ content-addressed isolated copy rather than silently reusing the previous one.
 WeChat remains single-instance: quit the daily client normally from its menu
 and wait for it to close before starting the active flow. The tool does not
 force-quit the daily client. The private copy reuses the current login session
-and captures the key automatically; no account switching is required. Only an
-expired session requires scanning WeChat's official login QR code while the
-command waits. The command verifies the candidate against the database, closes
-only the process generation it launched, and removes the exact FIFO and staged
-dylib generations by inode.
+and captures the key automatically; no account switching is required. If the
+saved-session "Enter WeChat" window appears, do not click it while the command
+is waiting: the button may hand control back to the installed signed client
+before the private observer captures the key. Only an expired session requires
+scanning WeChat's official login QR code while the command waits. The command
+verifies the candidate against the database, closes every frozen process
+generation executing inside its private bundle (including nested helpers,
+never the installed client), and removes the exact FIFO and staged dylib
+generations by inode.
 
 This compatibility copy has fewer runtime protections than the installed
 WeChat client. It is private to the current user, is used only after an explicit

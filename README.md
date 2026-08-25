@@ -50,7 +50,7 @@ grouped by conversation and day — the way you remember it).
 | Windows | WeChat ≤ 4.0.x | raw-key (`enc_key` used directly) | passive memory scan |
 | Windows | WeChat 4.1.10.31+ | password mode — `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | one-time debugger |
 | Windows | QQ NTQQ 9.9.x | per-DB passphrase | passive scan or one-time debugger |
-| macOS arm64 | WeChat 4.1.9 (build 268575) | raw/password mode selected by page-1 HMAC | passive scan; active only when signature preflight passes |
+| macOS arm64 | WeChat 4.1.11 (build 269136) | raw/password mode selected by page-1 HMAC | passive scan; active startup capture after exact signature preflight |
 | macOS arm64 | QQ 6.9.95 (build 36385) | per-DB passphrase | passive scan; active only when signature preflight passes |
 
 On **WeChat 4.1.10.31** (released 2026-05-27) the plaintext key was moved out of
@@ -168,8 +168,8 @@ python -m chatlog_keeper.cli extract-key --source wechat
 # Passive only (lowest ban risk; may find nothing on WeChat 4.1.10.31+)
 python -m chatlog_keeper.cli extract-key --source wechat --method passive
 
-# Active only (newest builds; macOS WeChat reuses the current session and does
-# not require account switching; unsafe launch configurations fail closed)
+# Active only (newest builds; on macOS leave any "Enter WeChat" window
+# untouched while automatic capture runs; unsafe configurations fail closed)
 python -m chatlog_keeper.cli extract-key --source wechat --method active
 
 # Windows starts and debugs only a fresh child under the current user; it does
