@@ -10,6 +10,29 @@ import pytest
 from chatlog_keeper import macos_debug_app, macos_key, macos_wechat_capture
 
 
+_WECHAT_4_1_11 = ("4.1.11", "269136")
+_WECHAT_APPLICATION_IDENTIFIER = "5A4RE8SF68.com.tencent.xinWeChat"
+
+
+def _wechat_4_1_11_info() -> dict:
+    return {
+        "CFBundleExecutable": "WeChat",
+        "CFBundleShortVersionString": _WECHAT_4_1_11[0],
+        "CFBundleVersion": _WECHAT_4_1_11[1],
+    }
+
+
+def _wechat_4_1_11_entitlements() -> dict:
+    return {
+        "com.apple.application-identifier": _WECHAT_APPLICATION_IDENTIFIER,
+        "com.apple.developer.team-identifier": "5A4RE8SF68",
+        "com.apple.security.app-sandbox": True,
+        "com.apple.security.application-groups": [
+            _WECHAT_APPLICATION_IDENTIFIER
+        ],
+    }
+
+
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin",
     reason="macOS debug-copy tests require Darwin process and filesystem semantics",
@@ -50,16 +73,22 @@ def test_prepare_debug_copy_is_macos_only(monkeypatch):
 
 def test_wechat_debug_copy_strips_only_ad_hoc_identity_entitlements():
     original = {
-        "application-identifier": "5A4RE8SF68.com.tencent.xinWeChat",
-        "com.apple.application-identifier": "5A4RE8SF68.com.tencent.xinWeChat",
+        "application-identifier": _WECHAT_APPLICATION_IDENTIFIER,
+        "com.apple.application-identifier": _WECHAT_APPLICATION_IDENTIFIER,
         "com.apple.developer.team-identifier": "5A4RE8SF68",
-        "com.apple.security.application-groups": ["group.tencent.wechat"],
+        "com.apple.security.application-groups": [
+            _WECHAT_APPLICATION_IDENTIFIER
+        ],
         "com.apple.security.app-sandbox": True,
         "com.apple.security.cs.allow-jit": True,
         "com.apple.security.network.client": True,
     }
 
-    assert macos_debug_app._debug_copy_entitlements("wechat", original) == {
+    assert macos_debug_app._debug_copy_entitlements(
+        "wechat",
+        original,
+        client_version=_WECHAT_4_1_11,
+    ) == {
         "com.apple.security.app-sandbox": True,
         "com.apple.security.cs.allow-jit": True,
         "com.apple.security.network.client": True,
@@ -89,7 +118,69 @@ def test_wechat_debug_copy_rejects_unexpected_signing_identity():
                 "com.apple.application-identifier": application_identifier,
                 "com.apple.developer.team-identifier": team_identifier,
                 "com.apple.security.app-sandbox": True,
+                "com.apple.security.application-groups": [
+                    _WECHAT_APPLICATION_IDENTIFIER
+                ],
             },
+            client_version=_WECHAT_4_1_11,
+        ) is None
+
+
+def test_wechat_debug_copy_rejects_conflicting_identifiers_and_sandbox():
+    valid = {
+        "com.apple.application-identifier": _WECHAT_APPLICATION_IDENTIFIER,
+        "com.apple.developer.team-identifier": "5A4RE8SF68",
+        "com.apple.security.application-groups": [
+            _WECHAT_APPLICATION_IDENTIFIER
+        ],
+        "com.apple.security.app-sandbox": True,
+    }
+    for change in (
+        {"application-identifier": "OTHERTEAM1.com.tencent.xinWeChat"},
+        {"com.apple.security.app-sandbox": False},
+        {"com.apple.security.app-sandbox": "true"},
+    ):
+        assert macos_debug_app._debug_copy_entitlements(
+            "wechat",
+            {**valid, **change},
+            client_version=_WECHAT_4_1_11,
+        ) is None
+
+
+def test_wechat_debug_copy_requires_exact_application_group_allowlist():
+    base = {
+        "com.apple.application-identifier": _WECHAT_APPLICATION_IDENTIFIER,
+        "com.apple.developer.team-identifier": "5A4RE8SF68",
+        "com.apple.security.app-sandbox": True,
+    }
+    for groups in (
+        [],
+        ["group.tencent.wechat"],
+        [_WECHAT_APPLICATION_IDENTIFIER, "group.tencent.wechat"],
+        [_WECHAT_APPLICATION_IDENTIFIER, _WECHAT_APPLICATION_IDENTIFIER],
+        _WECHAT_APPLICATION_IDENTIFIER,
+    ):
+        assert macos_debug_app._debug_copy_entitlements(
+            "wechat",
+            {**base, "com.apple.security.application-groups": groups},
+            client_version=_WECHAT_4_1_11,
+        ) is None
+
+
+def test_wechat_debug_copy_policy_is_scoped_to_affected_client():
+    entitlements = {
+        "com.apple.application-identifier": _WECHAT_APPLICATION_IDENTIFIER,
+        "com.apple.developer.team-identifier": "5A4RE8SF68",
+        "com.apple.security.application-groups": [
+            _WECHAT_APPLICATION_IDENTIFIER
+        ],
+        "com.apple.security.app-sandbox": True,
+    }
+    for client_version in (None, ("4.1.10", "268900"), ("4.1.12", "269500")):
+        assert macos_debug_app._debug_copy_entitlements(
+            "wechat",
+            entitlements,
+            client_version=client_version,
         ) is None
 
 
@@ -108,8 +199,12 @@ def test_wechat_debug_copy_rejects_new_identity_bound_entitlements():
                 ),
                 "com.apple.developer.team-identifier": "5A4RE8SF68",
                 "com.apple.security.app-sandbox": True,
+                "com.apple.security.application-groups": [
+                    _WECHAT_APPLICATION_IDENTIFIER
+                ],
                 entitlement: ["identity-bound-value"],
             },
+            client_version=_WECHAT_4_1_11,
         ) is None
 
 
@@ -994,7 +1089,7 @@ def test_failed_debug_copy_leaves_no_partial_canonical_app(monkeypatch, tmp_path
     original = tmp_path / "Applications" / "WeChat.app"
     info = original / "Contents" / "Info.plist"
     info.parent.mkdir(parents=True)
-    info.write_bytes(plistlib.dumps({"CFBundleExecutable": "WeChat"}))
+    info.write_bytes(plistlib.dumps(_wechat_4_1_11_info()))
     executable = original / "Contents" / "MacOS" / "WeChat"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"main")
@@ -1082,21 +1177,17 @@ def test_prepare_wechat_debug_copy_uses_upstream_compatibility_signature(
     original = tmp_path / "Applications" / "WeChat.app"
     info = original / "Contents" / "Info.plist"
     info.parent.mkdir(parents=True)
-    info.write_bytes(plistlib.dumps({"CFBundleExecutable": "WeChat"}))
+    info.write_bytes(plistlib.dumps(_wechat_4_1_11_info()))
     executable = original / "Contents" / "MacOS" / "WeChat"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"main")
     private_root = tmp_path / "private"
     signing_calls = []
-    source_entitlements = {
-        "com.apple.application-identifier": (
-            "5A4RE8SF68.com.tencent.xinWeChat"
-        ),
-        "com.apple.developer.team-identifier": "5A4RE8SF68",
-        "com.apple.security.app-sandbox": True,
-    }
+    source_entitlements = _wechat_4_1_11_entitlements()
     debug_entitlements = macos_debug_app._debug_copy_entitlements(
-        "wechat", source_entitlements
+        "wechat",
+        source_entitlements,
+        client_version=_WECHAT_4_1_11,
     )
     assert debug_entitlements is not None
     source_entitlement_xml = plistlib.dumps(
@@ -1214,7 +1305,7 @@ def test_ad_hoc_resigned_debug_cache_is_rebuilt_from_installed_bundle(
     original = tmp_path / "Applications" / "WeChat.app"
     info = original / "Contents" / "Info.plist"
     info.parent.mkdir(parents=True)
-    info.write_bytes(plistlib.dumps({"CFBundleExecutable": "WeChat"}))
+    info.write_bytes(plistlib.dumps(_wechat_4_1_11_info()))
     executable = original / "Contents" / "MacOS" / "WeChat"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"trusted-main")
@@ -1223,15 +1314,11 @@ def test_ad_hoc_resigned_debug_cache_is_rebuilt_from_installed_bundle(
     resource.write_bytes(b"trusted-resource")
     private_root = tmp_path / "private"
     signing_calls = []
-    source_entitlements = {
-        "com.apple.application-identifier": (
-            "5A4RE8SF68.com.tencent.xinWeChat"
-        ),
-        "com.apple.developer.team-identifier": "5A4RE8SF68",
-        "com.apple.security.app-sandbox": True,
-    }
+    source_entitlements = _wechat_4_1_11_entitlements()
     debug_entitlements = macos_debug_app._debug_copy_entitlements(
-        "wechat", source_entitlements
+        "wechat",
+        source_entitlements,
+        client_version=_WECHAT_4_1_11,
     )
     assert debug_entitlements is not None
     source_entitlement_xml = plistlib.dumps(

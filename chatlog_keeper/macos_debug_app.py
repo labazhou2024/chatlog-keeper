@@ -34,10 +34,23 @@ _APPS = {
     "wechat": (Path("/Applications/WeChat.app"), "WeChat"),
     "qq": (Path("/Applications/QQ.app"), "QQ"),
 }
-_DEBUG_COPY_FORMAT = (
-    b"preserve-nested-signatures-v10-wechat-mach-register-kernel-pid"
-)
+_DEBUG_COPY_FORMATS = {
+    # Keep QQ on the pre-WeChat-recovery cache generation.  A WeChat-only
+    # entitlement decision must not invalidate an unrelated QQ private copy.
+    "qq": b"preserve-nested-signatures-v7-wechat-compat-exact-entitlements-kernel-pid",
+    "wechat": b"preserve-nested-signatures-v11-wechat-4.1.11-entitlement-allowlist",
+}
 _GET_TASK_ALLOW_ENTITLEMENT = "com.apple.security.get-task-allow"
+_APP_SANDBOX_ENTITLEMENT = "com.apple.security.app-sandbox"
+_WECHAT_TEAM_IDENTIFIER = "5A4RE8SF68"
+_WECHAT_APPLICATION_IDENTIFIER = "5A4RE8SF68.com.tencent.xinWeChat"
+_WECHAT_APPLICATION_IDENTIFIER_ENTITLEMENTS = (
+    "application-identifier",
+    "com.apple.application-identifier",
+)
+_WECHAT_APPLICATION_GROUPS_ENTITLEMENT = "com.apple.security.application-groups"
+_WECHAT_APPLICATION_GROUP_ALLOWLIST = frozenset({_WECHAT_APPLICATION_IDENTIFIER})
+_WECHAT_AD_HOC_SUPPORTED_CLIENTS = frozenset({("4.1.11", "269136")})
 _WECHAT_MACH_REGISTER_ENTITLEMENT = (
     "com.apple.security.temporary-exception.mach-register.global-name"
 )
@@ -112,12 +125,31 @@ def _run(argv: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     )
 
 
-def _app_identity(app: Path) -> str:
+def _app_metadata(app: Path) -> dict[str, Any]:
     info = (app / "Contents" / "Info.plist").read_bytes()
     try:
         metadata = plistlib.loads(info)
     except Exception as exc:
         raise OSError("app bundle has an invalid Info.plist") from exc
+    if not isinstance(metadata, dict):
+        raise OSError("app bundle has invalid metadata")
+    return metadata
+
+
+def _app_client_version(app: Path) -> tuple[str, str]:
+    metadata = _app_metadata(app)
+    version = metadata.get("CFBundleShortVersionString")
+    build = metadata.get("CFBundleVersion")
+    if not isinstance(version, str) or not version.strip():
+        raise OSError("app bundle has no CFBundleShortVersionString")
+    if not isinstance(build, str) or not build.strip():
+        raise OSError("app bundle has no CFBundleVersion")
+    return version.strip(), build.strip()
+
+
+def _app_identity(app: Path, *, source: Optional[str] = None) -> str:
+    info = (app / "Contents" / "Info.plist").read_bytes()
+    metadata = _app_metadata(app)
     executable_name = metadata.get("CFBundleExecutable")
     if not isinstance(executable_name, str) or not executable_name:
         raise OSError("app bundle has no CFBundleExecutable")
@@ -131,7 +163,10 @@ def _app_identity(app: Path) -> str:
                 break
             digest.update(chunk)
     digest.update(b"\0chatlog-keeper-debug-copy\0")
-    digest.update(_DEBUG_COPY_FORMAT)
+    cache_format = _DEBUG_COPY_FORMATS.get(source or "qq")
+    if cache_format is None:
+        raise OSError("unsupported debug-copy source")
+    digest.update(cache_format)
     return digest.hexdigest()[:12]
 
 
@@ -342,6 +377,8 @@ def _entitlements(app: Path) -> Optional[dict]:
 def _debug_copy_entitlements(
     source: str,
     original_entitlements: dict,
+    *,
+    client_version: Optional[tuple[str, str]] = None,
 ) -> Optional[dict]:
     """Return the exact entitlements that a private ad-hoc copy may claim.
 
@@ -362,18 +399,29 @@ def _debug_copy_entitlements(
         return None
     expected = dict(original_entitlements)
     if source == "wechat":
-        application_identifier = original_entitlements.get(
-            "com.apple.application-identifier"
-        ) or original_entitlements.get("application-identifier")
+        if client_version not in _WECHAT_AD_HOC_SUPPORTED_CLIENTS:
+            return None
+        identifier_values = [
+            original_entitlements[key]
+            for key in _WECHAT_APPLICATION_IDENTIFIER_ENTITLEMENTS
+            if key in original_entitlements
+        ]
         team_identifier = original_entitlements.get(
             "com.apple.developer.team-identifier"
         )
+        application_groups = original_entitlements.get(
+            _WECHAT_APPLICATION_GROUPS_ENTITLEMENT
+        )
         if (
-            not isinstance(application_identifier, str)
-            or not isinstance(team_identifier, str)
-            or not re.fullmatch(r"[A-Z0-9]{10}", team_identifier)
-            or application_identifier
-            != f"{team_identifier}.com.tencent.xinWeChat"
+            not identifier_values
+            or any(not isinstance(value, str) for value in identifier_values)
+            or set(identifier_values) != {_WECHAT_APPLICATION_IDENTIFIER}
+            or team_identifier != _WECHAT_TEAM_IDENTIFIER
+            or original_entitlements.get(_APP_SANDBOX_ENTITLEMENT) is not True
+            or not isinstance(application_groups, list)
+            or any(not isinstance(value, str) for value in application_groups)
+            or len(application_groups) != len(_WECHAT_APPLICATION_GROUP_ALLOWLIST)
+            or set(application_groups) != _WECHAT_APPLICATION_GROUP_ALLOWLIST
         ):
             return None
         for entitlement in _WECHAT_AD_HOC_STRIPPED_ENTITLEMENTS:
@@ -387,8 +435,8 @@ def _debug_copy_entitlements(
         ):
             return None
         expected[_WECHAT_MACH_REGISTER_ENTITLEMENT] = [
-            f"{application_identifier}.MachPortRendezvousServer.*",
-            f"{application_identifier}.MMMojo.MachPortRendezvousServer.*",
+            f"{_WECHAT_APPLICATION_IDENTIFIER}.MachPortRendezvousServer.*",
+            f"{_WECHAT_APPLICATION_IDENTIFIER}.MMMojo.MachPortRendezvousServer.*",
         ]
     expected[_GET_TASK_ALLOW_ENTITLEMENT] = True
     return expected
@@ -672,7 +720,10 @@ def _validate_prepared_debug_copy(source: str, target: Path) -> bool:
     if actual_parent != canonical_root:
         return True
     try:
-        identity = _app_identity(original)
+        identity = _app_identity(original, source=source)
+        client_version = (
+            _app_client_version(original) if source == "wechat" else None
+        )
     except OSError:
         return False
     original_entitlements = _entitlements(original)
@@ -682,6 +733,7 @@ def _validate_prepared_debug_copy(source: str, target: Path) -> bool:
     expected_entitlements = _debug_copy_entitlements(
         source,
         original_entitlements,
+        client_version=client_version,
     )
     if expected_entitlements is None:
         return False
@@ -724,7 +776,10 @@ def prepare_debug_copy(source: str) -> Optional[Path]:
     if not original.is_dir():
         return None
     try:
-        identity = _app_identity(original)
+        identity = _app_identity(original, source=source)
+        client_version = (
+            _app_client_version(original) if source == "wechat" else None
+        )
     except OSError:
         return None
     root = data_dir() / "debug-apps"
@@ -737,6 +792,7 @@ def prepare_debug_copy(source: str) -> Optional[Path]:
     expected_entitlements = _debug_copy_entitlements(
         source,
         original_entitlements,
+        client_version=client_version,
     )
     if expected_entitlements is None:
         return None
@@ -1206,7 +1262,7 @@ def _existing_verified_debug_executable(source: str) -> Optional[Path]:
         return None
     original, executable_name = configured
     try:
-        identity = _app_identity(original)
+        identity = _app_identity(original, source=source)
     except OSError:
         return None
     target = data_dir() / "debug-apps" / f"{original.stem}-{identity}.app"
@@ -1370,7 +1426,10 @@ def _recorded_debug_executable(record: dict[str, Any]) -> Optional[Path]:
         return None
     try:
         root_info = target.parent.lstat()
-        identity = _app_identity(original)
+        identity = _app_identity(original, source=source)
+        client_version = (
+            _app_client_version(original) if source == "wechat" else None
+        )
         original_entitlements = _entitlements(original)
         source_digest = _bundle_source_digest(original)
     except OSError:
@@ -1385,8 +1444,13 @@ def _recorded_debug_executable(record: dict[str, Any]) -> Optional[Path]:
         or source_digest is None
     ):
         return None
-    expected_entitlements = dict(original_entitlements)
-    expected_entitlements["com.apple.security.get-task-allow"] = True
+    expected_entitlements = _debug_copy_entitlements(
+        source,
+        original_entitlements,
+        client_version=client_version,
+    )
+    if expected_entitlements is None:
+        return None
     marker = target / "Contents" / "Resources" / _DEBUG_COPY_MARKER
     valid = _verified_cached_debug_copy(
         target,

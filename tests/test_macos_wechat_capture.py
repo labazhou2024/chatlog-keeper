@@ -212,43 +212,63 @@ def test_ensure_capture_library_targets_macos_11_arm64_and_stable_install_name(
     assert not staged.exists()
 
 
-def test_real_interposer_forwards_once_without_recursing(monkeypatch, tmp_path):
-    """Exercise dyld interposition against the real CommonCrypto image."""
-    output_root = tmp_path / "data"
-    monkeypatch.setattr(macos_wechat_capture, "data_dir", lambda: output_root)
-    monkeypatch.setattr(
-        macos_wechat_capture,
-        "_prebuilt_path",
-        lambda: tmp_path / "missing.dylib",
-    )
-    monkeypatch.setattr(
-        macos_wechat_capture,
-        "_TRUSTED_CAPTURE_LIBRARY",
-        None,
-    )
-    library = macos_wechat_capture.ensure_capture_library()
-    assert library is not None
-
+def _build_concurrent_capture_host(tmp_path: Path) -> Path:
     host_source = tmp_path / "capture_host.c"
     host_source.write_text(
         """
 #include <CommonCrypto/CommonKeyDerivation.h>
+#include <pthread.h>
 #include <stdint.h>
+#include <string.h>
 
-int main(void) {
+#define THREAD_COUNT 16
+
+static pthread_mutex_t gate_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gate_cond = PTHREAD_COND_INITIALIZER;
+static unsigned int ready = 0;
+static int go = 0;
+
+static void *derive(void *raw_index) {
+    uintptr_t index = (uintptr_t)raw_index;
     char password[32] = {0};
     uint8_t salt[16] = {0};
     uint8_t derived[32] = {0};
-    return CCKeyDerivationPBKDF(
+    password[0] = (char)index;
+    if (pthread_mutex_lock(&gate_lock) != 0) return (void *)(uintptr_t)1;
+    ready += 1;
+    pthread_cond_broadcast(&gate_cond);
+    while (!go) pthread_cond_wait(&gate_cond, &gate_lock);
+    pthread_mutex_unlock(&gate_lock);
+    int status = CCKeyDerivationPBKDF(
         kCCPBKDF2, password, sizeof(password), salt, sizeof(salt),
         kCCPRFHmacAlgSHA512, 256000, derived, sizeof(derived));
+    return (void *)(uintptr_t)(status != 0);
+}
+
+int main(void) {
+    pthread_t threads[THREAD_COUNT];
+    for (uintptr_t index = 1; index <= THREAD_COUNT; ++index) {
+        if (pthread_create(&threads[index - 1], NULL, derive, (void *)index) != 0)
+            return 3;
+    }
+    if (pthread_mutex_lock(&gate_lock) != 0) return 2;
+    while (ready != THREAD_COUNT) pthread_cond_wait(&gate_cond, &gate_lock);
+    go = 1;
+    pthread_cond_broadcast(&gate_cond);
+    pthread_mutex_unlock(&gate_lock);
+    for (uintptr_t index = 1; index <= THREAD_COUNT; ++index) {
+        void *status = NULL;
+        if (pthread_join(threads[index - 1], &status) != 0 || status != NULL)
+            return 4;
+    }
+    return 0;
 }
 """.strip(),
         encoding="utf-8",
     )
     host = tmp_path / "capture-host"
     compiled = subprocess.run(
-        ["xcrun", "clang", str(host_source), "-o", str(host)],
+        ["xcrun", "clang", "-pthread", str(host_source), "-o", str(host)],
         capture_output=True,
         text=True,
         timeout=60,
@@ -263,8 +283,14 @@ int main(void) {
         check=False,
     )
     assert signed.returncode == 0
+    return host
 
-    fifo = tmp_path / "capture.fifo"
+
+def _run_capture_host(
+    host: Path,
+    library: Path,
+    fifo: Path,
+) -> tuple[subprocess.CompletedProcess, bytes]:
     os.mkfifo(fifo, 0o600)
     os.chmod(fifo, 0o600)
     read_fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
@@ -280,7 +306,6 @@ int main(void) {
             check=False,
             env=environment,
         )
-        assert executed.returncode == 0
         records = bytearray()
         while True:
             try:
@@ -292,8 +317,79 @@ int main(void) {
             records.extend(chunk)
     finally:
         os.close(read_fd)
+    return executed, bytes(records)
 
-    assert bytes(records) == b"WXK1" + bytes(32)
+
+def test_real_interposer_forwards_concurrent_calls_without_recursing(
+    monkeypatch,
+    tmp_path,
+):
+    """Exercise concurrent dyld interposition against real CommonCrypto."""
+    output_root = tmp_path / "data"
+    monkeypatch.setattr(macos_wechat_capture, "data_dir", lambda: output_root)
+    monkeypatch.setattr(
+        macos_wechat_capture,
+        "_prebuilt_path",
+        lambda: tmp_path / "missing.dylib",
+    )
+    monkeypatch.setattr(
+        macos_wechat_capture,
+        "_TRUSTED_CAPTURE_LIBRARY",
+        None,
+    )
+    library = macos_wechat_capture.ensure_capture_library()
+    assert library is not None
+    host = _build_concurrent_capture_host(tmp_path)
+
+    fifo = tmp_path / "capture.fifo"
+    executed, records = _run_capture_host(host, library, fifo)
+    assert executed.returncode == 0
+    assert len(records) == 16 * 36
+    captured = [records[index:index + 36] for index in range(0, len(records), 36)]
+    assert all(record[:4] == b"WXK1" for record in captured)
+    assert sorted(record[4:] for record in captured) == [
+        bytes([index]) + bytes(31) for index in range(1, 17)
+    ]
+
+
+def test_interposer_hard_fails_when_concrete_commoncrypto_is_unavailable(tmp_path):
+    source = macos_wechat_capture._source_path()
+    library = tmp_path / "bad-image-capture.dylib"
+    compiled = subprocess.run(
+        [
+            "xcrun",
+            "clang",
+            "-dynamiclib",
+            "-arch",
+            "arm64",
+            "-mmacosx-version-min=11.0",
+            '-DCOMMON_CRYPTO_IMAGE_PATH="/invalid/libcommonCrypto.dylib"',
+            str(source),
+            "-o",
+            str(library),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert compiled.returncode == 0
+    signed = subprocess.run(
+        ["codesign", "--force", "--sign", "-", str(library)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert signed.returncode == 0
+    host = _build_concurrent_capture_host(tmp_path)
+
+    executed, _records = _run_capture_host(
+        host,
+        library,
+        tmp_path / "hard-fail.fifo",
+    )
+    assert executed.returncode == 127
 
 
 def test_ad_hoc_resigned_capture_cache_is_rebuilt_from_source(

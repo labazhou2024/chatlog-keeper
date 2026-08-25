@@ -26,9 +26,11 @@ JSON/HTML 导出格式与 Windows 完全一致。
 
 - 在 `~/Library/Application Support/chatlog-keeper/debug-apps/` 创建隔离副本；
 - QQ 保留原 entitlements，并增加 `com.apple.security.get-task-allow`；
-- ad-hoc 微信副本只移除其无权声明的腾讯签名身份，保留 sandbox 和其他无关的原始
-  entitlements，并为 PID 后缀的 rendezvous 服务增加限定的 Mach 注册例外；遇到未知的
-  developer、private 或 keychain 身份声明时安全失败；
+- 只有验证通过的微信 4.1.11（build 269136）策略会移除 ad-hoc 副本无权声明的腾讯
+  签名身份；该策略要求 application identifier、application group 与 sandbox 严格匹配
+  allowlist，再保留其他无关 entitlements，并为 PID 后缀的 rendezvous 服务增加限定的
+  Mach 注册例外；其他客户端版本以及未知 developer、private 或 keychain 身份声明均
+  安全失败；
 - QQ 副本保留 Hardened Runtime，并在验证签名、精确 entitlement 差异以及直接依赖的
   Team-ID 关系后才启动；
 - 微信采用上游 v0.2 的兼容签名：私有副本不启用 Hardened Runtime，因为 ad-hoc 主程序
@@ -37,6 +39,8 @@ JSON/HTML 导出格式与 Windows 完全一致。
   sandbox 的 `Data/tmp`；LaunchServices 只给这个进程传入固定 dylib 和 FIFO 路径；
 - 捕获器在自动登录之前生效，只接受符合微信 4.x 参数形状的 32 字节候选；候选只通过
   当前用户的 `0600` FIFO 返回，不写日志或临时文件；
+- 捕获器只从精确的系统 CommonCrypto 映像解析 PBKDF2，并验证最终地址归属；无法证明
+  来源时会立即终止私有副本，不会回退到 `RTLD_NEXT`；
 - helper 以当前用户身份运行，不提权，也不会请求管理员密码；
 - helper 在取得 task port 前后核对精确可执行路径和内核进程启动代际；
 - 内置 helper 只读候选字节，不向客户端写入；
