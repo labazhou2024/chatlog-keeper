@@ -34,8 +34,44 @@ _APPS = {
     "wechat": (Path("/Applications/WeChat.app"), "WeChat"),
     "qq": (Path("/Applications/QQ.app"), "QQ"),
 }
-_DEBUG_COPY_FORMAT = (
-    b"preserve-nested-signatures-v7-wechat-compat-exact-entitlements-kernel-pid"
+_DEBUG_COPY_FORMATS = {
+    # Keep QQ on the pre-WeChat-recovery cache generation.  A WeChat-only
+    # entitlement decision must not invalidate an unrelated QQ private copy.
+    "qq": b"preserve-nested-signatures-v7-wechat-compat-exact-entitlements-kernel-pid",
+    "wechat": b"preserve-nested-signatures-v11-wechat-4.1.11-entitlement-allowlist",
+}
+_GET_TASK_ALLOW_ENTITLEMENT = "com.apple.security.get-task-allow"
+_APP_SANDBOX_ENTITLEMENT = "com.apple.security.app-sandbox"
+_WECHAT_TEAM_IDENTIFIER = "5A4RE8SF68"
+_WECHAT_APPLICATION_IDENTIFIER = "5A4RE8SF68.com.tencent.xinWeChat"
+_WECHAT_APPLICATION_IDENTIFIER_ENTITLEMENTS = (
+    "application-identifier",
+    "com.apple.application-identifier",
+)
+_WECHAT_APPLICATION_GROUPS_ENTITLEMENT = "com.apple.security.application-groups"
+_WECHAT_APPLICATION_GROUP_ALLOWLIST = frozenset({_WECHAT_APPLICATION_IDENTIFIER})
+_WECHAT_AD_HOC_SUPPORTED_CLIENTS = frozenset({("4.1.11", "269136")})
+_WECHAT_MACH_REGISTER_ENTITLEMENT = (
+    "com.apple.security.temporary-exception.mach-register.global-name"
+)
+_WECHAT_AD_HOC_STRIPPED_ENTITLEMENTS = frozenset(
+    {
+        # These values identify Tencent's signing team or registered groups.
+        # An ad-hoc signature cannot make those claims, and AMFI rejects the
+        # process before main() when they are copied from the Mac App Store
+        # client.  The private copy keeps its bundle identifier and sandbox;
+        # only signing-identity claims are removed.
+        "application-identifier",
+        "com.apple.application-identifier",
+        "com.apple.developer.team-identifier",
+        "com.apple.security.application-groups",
+    }
+)
+_WECHAT_AD_HOC_UNSUPPORTED_ENTITLEMENTS = frozenset(
+    {
+        "keychain-access-groups",
+        "com.apple.security.keychain-access-groups",
+    }
 )
 _LAST_ERROR = ""
 _RUNTIME_FLAGS_RE = re.compile(
@@ -89,12 +125,31 @@ def _run(argv: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     )
 
 
-def _app_identity(app: Path) -> str:
+def _app_metadata(app: Path) -> dict[str, Any]:
     info = (app / "Contents" / "Info.plist").read_bytes()
     try:
         metadata = plistlib.loads(info)
     except Exception as exc:
         raise OSError("app bundle has an invalid Info.plist") from exc
+    if not isinstance(metadata, dict):
+        raise OSError("app bundle has invalid metadata")
+    return metadata
+
+
+def _app_client_version(app: Path) -> tuple[str, str]:
+    metadata = _app_metadata(app)
+    version = metadata.get("CFBundleShortVersionString")
+    build = metadata.get("CFBundleVersion")
+    if not isinstance(version, str) or not version.strip():
+        raise OSError("app bundle has no CFBundleShortVersionString")
+    if not isinstance(build, str) or not build.strip():
+        raise OSError("app bundle has no CFBundleVersion")
+    return version.strip(), build.strip()
+
+
+def _app_identity(app: Path, *, source: Optional[str] = None) -> str:
+    info = (app / "Contents" / "Info.plist").read_bytes()
+    metadata = _app_metadata(app)
     executable_name = metadata.get("CFBundleExecutable")
     if not isinstance(executable_name, str) or not executable_name:
         raise OSError("app bundle has no CFBundleExecutable")
@@ -108,7 +163,10 @@ def _app_identity(app: Path) -> str:
                 break
             digest.update(chunk)
     digest.update(b"\0chatlog-keeper-debug-copy\0")
-    digest.update(_DEBUG_COPY_FORMAT)
+    cache_format = _DEBUG_COPY_FORMATS.get(source or "qq")
+    if cache_format is None:
+        raise OSError("unsupported debug-copy source")
+    digest.update(cache_format)
     return digest.hexdigest()[:12]
 
 
@@ -316,6 +374,74 @@ def _entitlements(app: Path) -> Optional[dict]:
     return value if isinstance(value, dict) else None
 
 
+def _debug_copy_entitlements(
+    source: str,
+    original_entitlements: dict,
+    *,
+    client_version: Optional[tuple[str, str]] = None,
+) -> Optional[dict]:
+    """Return the exact entitlements that a private ad-hoc copy may claim.
+
+    QQ's current Mac App Store bundle does not carry Tencent application/team
+    identity claims, so its established exact-entitlements + get-task-allow
+    path remains unchanged.  WeChat 4.1.11 does carry those restricted claims;
+    preserving them under an ad-hoc signature passes ``codesign --verify`` but
+    is rejected by AMFI at exec time.  Remove only the known identity-bound
+    values.  The sandboxed WeChat process also registers one PID-suffixed Mach
+    rendezvous service under its original application identifier; after the
+    signing identity is removed, preserve only that exact capability through
+    Apple's scoped temporary-exception entitlement.  Fail closed if a future
+    client introduces another developer, private, or keychain identity claim
+    that needs a separate compatibility decision.
+    """
+
+    if source not in _APPS or not isinstance(original_entitlements, dict):
+        return None
+    expected = dict(original_entitlements)
+    if source == "wechat":
+        if client_version not in _WECHAT_AD_HOC_SUPPORTED_CLIENTS:
+            return None
+        identifier_values = [
+            original_entitlements[key]
+            for key in _WECHAT_APPLICATION_IDENTIFIER_ENTITLEMENTS
+            if key in original_entitlements
+        ]
+        team_identifier = original_entitlements.get(
+            "com.apple.developer.team-identifier"
+        )
+        application_groups = original_entitlements.get(
+            _WECHAT_APPLICATION_GROUPS_ENTITLEMENT
+        )
+        if (
+            not identifier_values
+            or any(not isinstance(value, str) for value in identifier_values)
+            or set(identifier_values) != {_WECHAT_APPLICATION_IDENTIFIER}
+            or team_identifier != _WECHAT_TEAM_IDENTIFIER
+            or original_entitlements.get(_APP_SANDBOX_ENTITLEMENT) is not True
+            or not isinstance(application_groups, list)
+            or any(not isinstance(value, str) for value in application_groups)
+            or len(application_groups) != len(_WECHAT_APPLICATION_GROUP_ALLOWLIST)
+            or set(application_groups) != _WECHAT_APPLICATION_GROUP_ALLOWLIST
+        ):
+            return None
+        for entitlement in _WECHAT_AD_HOC_STRIPPED_ENTITLEMENTS:
+            expected.pop(entitlement, None)
+        if any(
+            entitlement in _WECHAT_AD_HOC_UNSUPPORTED_ENTITLEMENTS
+            or entitlement.startswith(
+                ("com.apple.developer.", "com.apple.private.")
+            )
+            for entitlement in expected
+        ):
+            return None
+        expected[_WECHAT_MACH_REGISTER_ENTITLEMENT] = [
+            f"{_WECHAT_APPLICATION_IDENTIFIER}.MachPortRendezvousServer.*",
+            f"{_WECHAT_APPLICATION_IDENTIFIER}.MMMojo.MachPortRendezvousServer.*",
+        ]
+    expected[_GET_TASK_ALLOW_ENTITLEMENT] = True
+    return expected
+
+
 def _has_hardened_runtime(app: Path) -> bool:
     proc = _run(["codesign", "-d", "--verbose=4", str(app)], timeout=30)
     raw = (
@@ -508,7 +634,7 @@ def _verified_debug_copy(
     return (
         verified.returncode == 0
         and current == expected_entitlements
-        and current.get("com.apple.security.get-task-allow") is True
+        and current.get(_GET_TASK_ALLOW_ENTITLEMENT) is True
         and _has_hardened_runtime(target) is hardened_runtime
         and _code_team_identifier(target) == ""
     )
@@ -594,15 +720,23 @@ def _validate_prepared_debug_copy(source: str, target: Path) -> bool:
     if actual_parent != canonical_root:
         return True
     try:
-        identity = _app_identity(original)
+        identity = _app_identity(original, source=source)
+        client_version = (
+            _app_client_version(original) if source == "wechat" else None
+        )
     except OSError:
         return False
     original_entitlements = _entitlements(original)
     source_digest = _bundle_source_digest(original)
     if original_entitlements is None or source_digest is None:
         return False
-    expected_entitlements = dict(original_entitlements)
-    expected_entitlements["com.apple.security.get-task-allow"] = True
+    expected_entitlements = _debug_copy_entitlements(
+        source,
+        original_entitlements,
+        client_version=client_version,
+    )
+    if expected_entitlements is None:
+        return False
     record = _TRUSTED_DEBUG_COPIES.get(source)
     expected_generation = None
     if (
@@ -642,7 +776,10 @@ def prepare_debug_copy(source: str) -> Optional[Path]:
     if not original.is_dir():
         return None
     try:
-        identity = _app_identity(original)
+        identity = _app_identity(original, source=source)
+        client_version = (
+            _app_client_version(original) if source == "wechat" else None
+        )
     except OSError:
         return None
     root = data_dir() / "debug-apps"
@@ -652,8 +789,13 @@ def prepare_debug_copy(source: str) -> Optional[Path]:
     source_digest = _bundle_source_digest(original)
     if original_entitlements is None or source_digest is None:
         return None
-    expected_entitlements = dict(original_entitlements)
-    expected_entitlements["com.apple.security.get-task-allow"] = True
+    expected_entitlements = _debug_copy_entitlements(
+        source,
+        original_entitlements,
+        client_version=client_version,
+    )
+    if expected_entitlements is None:
+        return None
     hardened_runtime = _copy_uses_hardened_runtime(source)
 
     target = root / f"{original.stem}-{identity}.app"
@@ -1098,12 +1240,21 @@ def terminate_debug_copy(
         generation_cleaned = _generation_state(token) in {"gone", "replaced"}
         if not generation_cleaned:
             generation_cleaned = _terminate_generation(token, wait_s=wait_s)
-        remaining = _exact_process_pids(token.executable)
+        from chatlog_keeper.macos_key import (
+            cleanup_debug_copy_bundle,
+            debug_copy_bundle_is_running,
+        )
+
+        target = token.executable.parents[2]
+        bundle_cleaned = (
+            cleanup_debug_copy_bundle(target) if watchdog_finished else False
+        )
+        remaining = debug_copy_bundle_is_running(target)
         cleaned = (
             watchdog_finished
             and generation_cleaned
-            and remaining is not None
-            and not remaining
+            and bundle_cleaned
+            and remaining is False
         )
         if not cleaned:
             _LAST_ERROR = "debug_copy_cleanup_failed"
@@ -1120,7 +1271,7 @@ def _existing_verified_debug_executable(source: str) -> Optional[Path]:
         return None
     original, executable_name = configured
     try:
-        identity = _app_identity(original)
+        identity = _app_identity(original, source=source)
     except OSError:
         return None
     target = data_dir() / "debug-apps" / f"{original.stem}-{identity}.app"
@@ -1151,10 +1302,12 @@ def verified_debug_copy_is_running(source: str) -> bool:
     executable = _existing_verified_debug_executable(source)
     if executable is None:
         return False
-    pids = _exact_process_pids(executable)
-    if pids is None:
+    from chatlog_keeper.macos_key import debug_copy_bundle_is_running
+
+    running = debug_copy_bundle_is_running(executable.parents[2])
+    if running is None:
         raise RuntimeError("isolated process enumeration failed")
-    return bool(pids)
+    return running
 
 
 def terminate_verified_debug_copy(source: str) -> bool:
@@ -1166,18 +1319,16 @@ def terminate_verified_debug_copy(source: str) -> bool:
     executable = _existing_verified_debug_executable(source)
     if executable is None:
         return True
-    pids = _exact_process_pids(executable)
-    if pids is None:
-        return False
-    cleaned = True
-    for pid in pids:
-        token = _generation_for_pid(source, executable, pid)
-        if token is None:
-            cleaned = False
-            continue
-        cleaned = _terminate_generation(token, wait_s=5.0) and cleaned
-    remaining = _exact_process_pids(executable)
-    return cleaned and remaining is not None and not remaining
+    from chatlog_keeper.macos_key import (
+        cleanup_debug_copy_bundle,
+        debug_copy_bundle_is_running,
+    )
+
+    target = executable.parents[2]
+    return (
+        cleanup_debug_copy_bundle(target)
+        and debug_copy_bundle_is_running(target) is False
+    )
 
 
 def _recorded_debug_reference(record: dict[str, Any]) -> Optional[Path]:
@@ -1284,7 +1435,10 @@ def _recorded_debug_executable(record: dict[str, Any]) -> Optional[Path]:
         return None
     try:
         root_info = target.parent.lstat()
-        identity = _app_identity(original)
+        identity = _app_identity(original, source=source)
+        client_version = (
+            _app_client_version(original) if source == "wechat" else None
+        )
         original_entitlements = _entitlements(original)
         source_digest = _bundle_source_digest(original)
     except OSError:
@@ -1299,8 +1453,13 @@ def _recorded_debug_executable(record: dict[str, Any]) -> Optional[Path]:
         or source_digest is None
     ):
         return None
-    expected_entitlements = dict(original_entitlements)
-    expected_entitlements["com.apple.security.get-task-allow"] = True
+    expected_entitlements = _debug_copy_entitlements(
+        source,
+        original_entitlements,
+        client_version=client_version,
+    )
+    if expected_entitlements is None:
+        return None
     marker = target / "Contents" / "Resources" / _DEBUG_COPY_MARKER
     valid = _verified_cached_debug_copy(
         target,
@@ -1322,14 +1481,26 @@ def recorded_debug_copy_is_running(record: dict[str, Any]) -> bool:
     pids = _exact_process_pids(reference)
     if pids is None:
         raise RuntimeError("isolated process enumeration failed")
-    if record["state"] == "launching" and not pids:
-        return False
-    if (
-        record["state"] == "running"
-        and _recorded_pid_is_absent(record["pid"])
-        and not pids
-    ):
-        return False
+    main_generation_absent = not pids and (
+        record["state"] == "launching"
+        or _recorded_pid_is_absent(record["pid"])
+    )
+    if main_generation_absent:
+        target = reference.parents[2]
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            # A removed cache/client must not strand a completed durable lease.
+            return False
+        except OSError as exc:
+            raise RuntimeError("isolated bundle identity unavailable") from exc
+        from chatlog_keeper.macos_key import debug_copy_bundle_is_running
+
+        bundle_running = debug_copy_bundle_is_running(target)
+        if bundle_running is None:
+            raise RuntimeError("isolated process enumeration failed")
+        if not bundle_running:
+            return False
     executable = _recorded_debug_executable(record)
     if executable is None:
         # The process may have exited while an old cache/client artifact was
@@ -1345,8 +1516,10 @@ def recorded_debug_copy_is_running(record: dict[str, Any]) -> bool:
         ):
             return False
         raise RuntimeError("invalid durable debug-copy artifact")
-    pids = _exact_process_pids(executable)
-    if pids is None:
+    from chatlog_keeper.macos_key import debug_copy_bundle_is_running
+
+    bundle_running = debug_copy_bundle_is_running(executable.parents[2])
+    if bundle_running is None:
         raise RuntimeError("isolated process enumeration failed")
     if record["state"] == "running":
         token = _DebugProcessToken(
@@ -1362,7 +1535,7 @@ def recorded_debug_copy_is_running(record: dict[str, Any]) -> bool:
             raise RuntimeError("isolated process identity unavailable")
         if state == "same":
             return True
-    return bool(pids)
+    return bundle_running
 
 
 def terminate_recorded_debug_copy(record: dict[str, Any]) -> bool:
@@ -1374,14 +1547,25 @@ def terminate_recorded_debug_copy(record: dict[str, Any]) -> bool:
     pids = _exact_process_pids(reference)
     if pids is None:
         return False
-    if record["state"] == "launching" and not pids:
-        return True
-    if (
-        record["state"] == "running"
-        and _recorded_pid_is_absent(record["pid"])
-        and not pids
-    ):
-        return True
+    main_generation_absent = not pids and (
+        record["state"] == "launching"
+        or _recorded_pid_is_absent(record["pid"])
+    )
+    if main_generation_absent:
+        target = reference.parents[2]
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        from chatlog_keeper.macos_key import debug_copy_bundle_is_running
+
+        bundle_running = debug_copy_bundle_is_running(target)
+        if bundle_running is None:
+            return False
+        if not bundle_running:
+            return True
     executable = _recorded_debug_executable(record)
     if executable is None:
         current_pids = _exact_process_pids(reference)
@@ -1392,18 +1576,16 @@ def terminate_recorded_debug_copy(record: dict[str, Any]) -> bool:
                 or _recorded_pid_is_absent(record["pid"])
             )
         )
-    pids = _exact_process_pids(executable)
-    if pids is None:
-        return False
-    cleaned = True
-    for pid in pids:
-        token = _generation_for_pid(record["source"], executable, pid)
-        if token is None:
-            cleaned = False
-            continue
-        cleaned = _terminate_generation(token, wait_s=5.0) and cleaned
-    remaining = _exact_process_pids(executable)
-    return cleaned and remaining is not None and not remaining
+    from chatlog_keeper.macos_key import (
+        cleanup_debug_copy_bundle,
+        debug_copy_bundle_is_running,
+    )
+
+    target = executable.parents[2]
+    return (
+        cleanup_debug_copy_bundle(target)
+        and debug_copy_bundle_is_running(target) is False
+    )
 
 
 def launch_debug_copy(

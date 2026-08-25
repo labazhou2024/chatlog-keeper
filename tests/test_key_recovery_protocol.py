@@ -1398,7 +1398,7 @@ def test_macos_watchdog_arms_before_open_and_freezes_exact_generations():
     launch_command = source.index("wait_for_launch_command(owner_pid)")
     spawn = source.index("posix_spawn(", launch_command)
     launched = source.index('emit_watch_marker("WATCH_LAUNCHED\\n")', spawn)
-    cleanup = source.index("cleanup_watched_target(", launched)
+    cleanup = source.index("cleanup_watched_bundle(", launched)
     assert sigpipe_ignored < armed < launch_command < spawn < launched < cleanup
     marker_failure = source[launched:cleanup]
     assert "watch_interrupted = 1;" in marker_failure
@@ -1419,6 +1419,7 @@ def test_macos_watchdog_arms_before_open_and_freezes_exact_generations():
     )
     assert launch_command < final_identity_check < spawn
     assert "same_identity(&known[index].identity" in source
+    assert "path_is_inside_bundle(identity.path, bundle_path)" in source
     assert source.index("identity_matches(known[index].pid") < source.index(
         "kill(known[index].pid"
     )

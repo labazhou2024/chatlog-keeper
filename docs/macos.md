@@ -29,8 +29,14 @@ access. Modern hardened clients usually deny that request.
 
 - an isolated copy is created under
   `~/Library/Application Support/chatlog-keeper/debug-apps/`;
-- the copy preserves the original entitlements and adds only
+- QQ preserves its original entitlements and adds
   `com.apple.security.get-task-allow`;
+- only the verified WeChat 4.1.11 (build 269136) policy may remove Tencent
+  signing-identity claims that an ad-hoc signature cannot assert; it requires
+  the exact Tencent application identifier/group allowlist and sandbox before
+  preserving unrelated entitlements and adding the scoped Mach-registration
+  exception required by PID-suffixed rendezvous services; other client builds
+  and unknown developer, private, or keychain identity claims fail closed;
 - QQ keeps Hardened Runtime and is launched only after its signature, exact
   entitlement delta, and direct-library Team-ID relation are verified;
 - WeChat uses the upstream v0.2 compatibility signature: Hardened Runtime is
@@ -44,6 +50,9 @@ access. Modern hardened clients usually deny that request.
 - the observer is active before automatic login, accepts only the narrow
   WeChat 4.x 32-byte candidate shape, and sends candidates through a same-user
   `0600` FIFO without writing them to logs or temporary files;
+- the observer resolves PBKDF2 only from the exact system CommonCrypto image,
+  verifies the final address owner, and terminates the private copy if that
+  provenance cannot be proved; it never falls back to `RTLD_NEXT`;
 - the helper runs as the current user, without elevation or an administrator
   password prompt;
 - the helper checks the exact executable path and kernel process generation
@@ -56,11 +65,15 @@ content-addressed isolated copy rather than silently reusing the previous one.
 WeChat remains single-instance: quit the daily client normally from its menu
 and wait for it to close before starting the active flow. The tool does not
 force-quit the daily client. The private copy reuses the current login session
-and captures the key automatically; no account switching is required. Only an
-expired session requires scanning WeChat's official login QR code while the
-command waits. The command verifies the candidate against the database, closes
-only the process generation it launched, and removes the exact FIFO and staged
-dylib generations by inode.
+and captures the key automatically; no account switching is required. If the
+saved-session "Enter WeChat" window appears, do not click it while the command
+is waiting: the button may hand control back to the installed signed client
+before the private observer captures the key. Only an expired session requires
+scanning WeChat's official login QR code while the command waits. The command
+verifies the candidate against the database, closes every frozen process
+generation executing inside its private bundle (including nested helpers,
+never the installed client), and removes the exact FIFO and staged dylib
+generations by inode.
 
 This compatibility copy has fewer runtime protections than the installed
 WeChat client. It is private to the current user, is used only after an explicit

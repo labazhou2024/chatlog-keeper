@@ -22,7 +22,7 @@ from chatlog_keeper.core._path_resolver import data_dir
 
 _LAST_ERROR = ""
 _DEBUGGER_ENTITLEMENTS = {"com.apple.security.cs.debugger": True}
-_HELPER_FORMAT = b"hardened-runtime-same-uid-pid-identity-owner-watch-v6"
+_HELPER_FORMAT = b"hardened-runtime-same-uid-bundle-generation-watch-v7"
 _RUNTIME_FLAGS_RE = re.compile(
     r"^CodeDirectory\b[^\n]*\bflags=0x[0-9a-f]+\([^\n)]*\bruntime\b[^\n)]*\)",
     re.IGNORECASE | re.MULTILINE,
@@ -885,6 +885,94 @@ def _launch_path_arguments(
     if not path_bytes.startswith(b"/") or b"\0" in path_bytes:
         raise ValueError("invalid launch path")
     return [path_bytes.hex(), *(str(value) for value in identity)]
+
+
+def debug_copy_bundle_is_running(app_bundle: Path) -> Optional[bool]:
+    """Prove whether any same-user process executes inside ``app_bundle``."""
+
+    global _LAST_ERROR
+    _LAST_ERROR = ""
+    if sys.platform != "darwin":
+        _LAST_ERROR = "bundle_status_unavailable"
+        return None
+    helper = ensure_helper()
+    if helper is None or not _trusted_helper_for_launch(helper):
+        if not _LAST_ERROR:
+            _LAST_ERROR = "bundle_status_unavailable"
+        return None
+    identity = _launch_path_identity(
+        app_bundle,
+        expected_type=stat.S_IFDIR,
+        expected_permissions=0o700,
+    )
+    if identity is None:
+        _LAST_ERROR = "bundle_status_invalid"
+        return None
+    try:
+        argv = [
+            str(helper),
+            "bundle-status",
+            str(os.getpid()),
+            *_launch_path_arguments(app_bundle, identity),
+        ]
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+        _LAST_ERROR = "bundle_status_unavailable"
+        return None
+    if result.returncode == 0:
+        return False
+    if result.returncode == 4:
+        return True
+    _LAST_ERROR = "bundle_status_unavailable"
+    return None
+
+
+def cleanup_debug_copy_bundle(app_bundle: Path) -> bool:
+    """Terminate only frozen process generations executing inside a copy."""
+
+    global _LAST_ERROR
+    _LAST_ERROR = ""
+    if sys.platform != "darwin":
+        _LAST_ERROR = "bundle_cleanup_unavailable"
+        return False
+    helper = ensure_helper()
+    if helper is None or not _trusted_helper_for_launch(helper):
+        if not _LAST_ERROR:
+            _LAST_ERROR = "bundle_cleanup_unavailable"
+        return False
+    identity = _launch_path_identity(
+        app_bundle,
+        expected_type=stat.S_IFDIR,
+        expected_permissions=0o700,
+    )
+    if identity is None:
+        _LAST_ERROR = "bundle_cleanup_invalid"
+        return False
+    try:
+        argv = [
+            str(helper),
+            "cleanup-bundle",
+            str(os.getpid()),
+            *_launch_path_arguments(app_bundle, identity),
+        ]
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            timeout=45,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+        _LAST_ERROR = "bundle_cleanup_failed"
+        return False
+    if result.returncode != 0:
+        _LAST_ERROR = "bundle_cleanup_failed"
+        return False
+    return True
 
 
 def launch_debug_copy_watchdog(

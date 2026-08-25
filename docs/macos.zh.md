@@ -25,7 +25,12 @@ JSON/HTML 导出格式与 Windows 完全一致。
 `extract-key --method active` 是显式、可见的交互流程：
 
 - 在 `~/Library/Application Support/chatlog-keeper/debug-apps/` 创建隔离副本；
-- 保留原 entitlements，只增加 `com.apple.security.get-task-allow`；
+- QQ 保留原 entitlements，并增加 `com.apple.security.get-task-allow`；
+- 只有验证通过的微信 4.1.11（build 269136）策略会移除 ad-hoc 副本无权声明的腾讯
+  签名身份；该策略要求 application identifier、application group 与 sandbox 严格匹配
+  allowlist，再保留其他无关 entitlements，并为 PID 后缀的 rendezvous 服务增加限定的
+  Mach 注册例外；其他客户端版本以及未知 developer、private 或 keychain 身份声明均
+  安全失败；
 - QQ 副本保留 Hardened Runtime，并在验证签名、精确 entitlement 差异以及直接依赖的
   Team-ID 关系后才启动；
 - 微信采用上游 v0.2 的兼容签名：私有副本不启用 Hardened Runtime，因为 ad-hoc 主程序
@@ -34,6 +39,8 @@ JSON/HTML 导出格式与 Windows 完全一致。
   sandbox 的 `Data/tmp`；LaunchServices 只给这个进程传入固定 dylib 和 FIFO 路径；
 - 捕获器在自动登录之前生效，只接受符合微信 4.x 参数形状的 32 字节候选；候选只通过
   当前用户的 `0600` FIFO 返回，不写日志或临时文件；
+- 捕获器只从精确的系统 CommonCrypto 映像解析 PBKDF2，并验证最终地址归属；无法证明
+  来源时会立即终止私有副本，不会回退到 `RTLD_NEXT`；
 - helper 以当前用户身份运行，不提权，也不会请求管理员密码；
 - helper 在取得 task port 前后核对精确可执行路径和内核进程启动代际；
 - 内置 helper 只读候选字节，不向客户端写入；
@@ -42,9 +49,11 @@ JSON/HTML 导出格式与 Windows 完全一致。
 原应用保持不变。客户端升级后会按新内容身份创建新的隔离副本，不会静默复用旧副本。
 微信仍是单实例应用：运行主动流程前，请从微信菜单正常退出日常客户端并等待它完全关闭；
 工具不会强制退出日常微信。私有副本会直接复用当前登录会话并自动捕获 key，用户无需
-切换账号；只有登录会话确实失效时，才需要在命令等待期间扫描微信显示的官方登录二维码。
-命令会在有界时间内保持该精确进程，使用数据库验证候选 key，最后只关闭自己启动的那个
-进程代际，并按 inode 清理本次 FIFO 与临时 dylib。
+切换账号。如果出现“进入微信”窗口，在命令等待期间不要点击：该按钮可能在捕获完成前把
+会话交回已安装的正式签名客户端。只有登录会话确实失效时，才需要在命令等待期间扫描微信
+显示的官方登录二维码。命令会使用数据库验证候选 key，最后关闭隔离 bundle 内所有被冻结
+的进程代际（包括内嵌 helper，绝不关闭正式版微信），并按 inode 清理本次 FIFO 与临时
+dylib。
 
 这个兼容副本的运行时保护低于已安装微信。它仅对当前用户可见，只在用户明确请求主动取
 key 时使用，不能替代日常客户端。SIP 始终开启，不使用管理员进程，不重签原应用，任何候选

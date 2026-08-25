@@ -714,6 +714,52 @@ def test_watchdog_freezes_capture_library_and_fifo_identity(monkeypatch, tmp_pat
     ]
 
 
+def test_bundle_cleanup_covers_nested_processes_and_preserves_external(tmp_path):
+    app = tmp_path / "debug-apps" / "WeChat.app"
+    nested = app / "Contents" / "Frameworks" / "wxutility"
+    nested.parent.mkdir(parents=True)
+    app.chmod(0o700)
+    source = tmp_path / "sleeper.c"
+    source.write_text(
+        "#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n",
+        encoding="ascii",
+    )
+    subprocess.run(
+        ["clang", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(nested)],
+        check=True,
+        capture_output=True,
+    )
+    nested.chmod(0o700)
+    external = tmp_path / "external-sleep"
+    subprocess.run(
+        ["clang", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(external)],
+        check=True,
+        capture_output=True,
+    )
+    external.chmod(0o700)
+
+    private_process = subprocess.Popen([str(nested)])
+    external_process = subprocess.Popen([str(external)])
+    external_was_running = False
+    try:
+        external_identity = macos_key.process_identity(external_process.pid)
+        assert external_identity is not None
+        assert external_identity[0] == os.fsencode(external.resolve(strict=True))
+        assert macos_key.debug_copy_bundle_is_running(app) is True
+        assert macos_key.cleanup_debug_copy_bundle(app) is True
+        assert private_process.wait(timeout=5) in (-15, -9)
+        assert macos_key.debug_copy_bundle_is_running(app) is False
+        external_was_running = external_process.poll() is None
+    finally:
+        if private_process.poll() is None:
+            private_process.kill()
+            private_process.wait(timeout=5)
+        if external_process.poll() is None:
+            external_process.kill()
+            external_process.wait(timeout=5)
+    assert external_was_running
+
+
 def test_launch_path_identity_rejects_symlink_and_unsafe_permissions(tmp_path):
     target = tmp_path / "target"
     target.write_bytes(b"target")
