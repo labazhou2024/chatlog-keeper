@@ -37,6 +37,21 @@ def test_version_contract_requires_tag_module_and_installed_metadata_agreement()
         )
 
 
+def test_version_contract_maps_preview_tag_to_python_release_candidate() -> None:
+    assert release_metadata.validate_version_contract(
+        tag="v0.3.6-preview",
+        module_version="0.3.6rc0",
+        metadata_version="0.3.6rc0",
+    ) == "0.3.6-preview"
+
+    with pytest.raises(release_metadata.ReleaseMetadataError, match="differ"):
+        release_metadata.validate_version_contract(
+            tag="v0.3.6-preview",
+            module_version="0.3.6-preview",
+            metadata_version="0.3.6rc0",
+        )
+
+
 def _message_capability() -> dict:
     return {
         "protocol": "message-stream-v1",
