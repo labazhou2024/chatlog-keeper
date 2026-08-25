@@ -140,6 +140,14 @@ def _validated_version(value: str) -> str:
     return version
 
 
+def _package_version_for_release(version: str) -> str:
+    """Map a human-facing preview tag to its canonical Python package version."""
+
+    if version.endswith("-preview"):
+        return f"{version[:-len('-preview')]}rc0"
+    return version
+
+
 def _validated_commit(value: str) -> str:
     commit = str(value or "").strip().lower()
     if not _COMMIT_RE.fullmatch(commit):
@@ -227,7 +235,8 @@ def validate_version_contract(*, tag: str, module_version: str, metadata_version
     if not normalized_tag.startswith("v"):
         raise ReleaseMetadataError("release tag must start with v")
     expected = _validated_version(normalized_tag[1:])
-    if module_version != expected or metadata_version != expected:
+    expected_package = _package_version_for_release(expected)
+    if module_version != expected_package or metadata_version != expected_package:
         raise ReleaseMetadataError("tag, module version, and installed metadata version differ")
     return expected
 

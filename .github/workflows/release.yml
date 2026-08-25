@@ -370,6 +370,10 @@ jobs:
           test "$current_tag_commit" = "$RELEASE_COMMIT"
           test "$current_tag_name" = "$RELEASE_TAG"
           version="${RELEASE_TAG#v}"
+          release_flags=()
+          if [[ "$version" == *-preview ]]; then
+            release_flags+=(--prerelease)
+          fi
           gh release create "$RELEASE_TAG" \
             release_inputs/dist_exe/chatlog-keeper.exe \
             release_inputs/dist_exe/chatlog-keeper.exe.sha256 \
@@ -384,4 +388,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "chatlog-keeper $RELEASE_TAG" \
-            --generate-notes
+            --generate-notes \
+            "${release_flags[@]}"
