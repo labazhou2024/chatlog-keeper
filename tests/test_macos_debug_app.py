@@ -1763,3 +1763,146 @@ def test_terminate_debug_copy_fails_closed_when_generation_is_unknown(
     assert macos_debug_app.terminate_debug_copy("wechat", 42) is False
     assert macos_debug_app.last_error() == "debug_copy_cleanup_failed"
     assert signals == []
+
+
+# --- WeChat 4.1.13 support (fork) ------------------------------------------
+#
+# 4.1.13 dropped the `com.apple.developer.team-identifier` entitlement that
+# 4.1.11 carried.  Absence is strictly safer than a present-and-correct claim:
+# there is one less identity assertion for the ad-hoc copy to strip, and the
+# team is still pinned twice over by the application identifier and the
+# application-group allowlist.  The policy must therefore accept an absent
+# claim while still refusing a present-but-wrong one.
+
+_WECHAT_4_1_13 = ("4.1.13", "269579")
+
+
+def _wechat_4_1_13_entitlements() -> dict:
+    """The entitlements actually carried by the installed 4.1.13 bundle."""
+    return {
+        "com.apple.application-identifier": _WECHAT_APPLICATION_IDENTIFIER,
+        "com.apple.security.app-sandbox": True,
+        "com.apple.security.application-groups": [
+            _WECHAT_APPLICATION_IDENTIFIER
+        ],
+        "com.apple.security.cs.allow-jit": True,
+        "com.apple.security.network.client": True,
+        "com.apple.security.temporary-exception.mach-lookup.global-name": [
+            "com.tencent.xinWeChat-spks"
+        ],
+    }
+
+
+def test_wechat_4_1_13_accepts_absent_team_identifier():
+    granted = macos_debug_app._debug_copy_entitlements(
+        "wechat",
+        _wechat_4_1_13_entitlements(),
+        client_version=_WECHAT_4_1_13,
+    )
+    assert granted is not None
+    # The identity claim is stripped (it was never there) and get-task-allow
+    # is added; unrelated capabilities survive untouched.
+    assert "com.apple.application-identifier" not in granted
+    assert "com.apple.developer.team-identifier" not in granted
+    assert "com.apple.security.application-groups" not in granted
+    assert granted["com.apple.security.get-task-allow"] is True
+    assert granted["com.apple.security.app-sandbox"] is True
+    assert granted["com.apple.security.cs.allow-jit"] is True
+    assert granted[
+        "com.apple.security.temporary-exception.mach-lookup.global-name"
+    ] == ["com.tencent.xinWeChat-spks"]
+
+
+def test_wechat_4_1_13_still_rejects_present_but_wrong_team_identifier():
+    # Relaxing "present and equal" to "absent or equal" must not degrade into
+    # "ignored".  A bundle that does claim a team must claim Tencent's.
+    for team_identifier in ("OTHERTEAM1", "short", "", 5, None if False else "5A4RE8SF69"):
+        assert macos_debug_app._debug_copy_entitlements(
+            "wechat",
+            {
+                **_wechat_4_1_13_entitlements(),
+                "com.apple.developer.team-identifier": team_identifier,
+            },
+            client_version=_WECHAT_4_1_13,
+        ) is None
+
+
+def test_wechat_4_1_13_shape_is_still_scoped_to_allowlisted_clients():
+    entitlements = _wechat_4_1_13_entitlements()
+    for client_version in (None, ("4.1.12", "269500"), ("4.1.14", "269999"),
+                           ("4.1.13", "999999")):
+        assert macos_debug_app._debug_copy_entitlements(
+            "wechat",
+            entitlements,
+            client_version=client_version,
+        ) is None
+
+
+def test_wechat_4_1_13_still_rejects_new_identity_bound_entitlements():
+    for entitlement in (
+        "keychain-access-groups",
+        "com.apple.security.keychain-access-groups",
+        "com.apple.developer.icloud-container-identifiers",
+        "com.apple.private.example",
+    ):
+        assert macos_debug_app._debug_copy_entitlements(
+            "wechat",
+            {
+                **_wechat_4_1_13_entitlements(),
+                entitlement: ["identity-bound-value"],
+            },
+            client_version=_WECHAT_4_1_13,
+        ) is None
+
+
+def test_wechat_4_1_13_still_requires_exact_identifier_and_groups():
+    base = _wechat_4_1_13_entitlements()
+    for change in (
+        {"com.apple.application-identifier": "OTHERTEAM1.com.tencent.xinWeChat"},
+        {"com.apple.application-identifier": "5A4RE8SF68.com.tencent.other"},
+        {"com.apple.security.app-sandbox": False},
+        {"com.apple.security.application-groups": ["group.tencent.wechat"]},
+        {"com.apple.security.application-groups": []},
+    ):
+        assert macos_debug_app._debug_copy_entitlements(
+            "wechat",
+            {**base, **change},
+            client_version=_WECHAT_4_1_13,
+        ) is None
+
+
+def test_installed_wechat_bundle_is_allowlisted_and_accepted():
+    """Anchor the allowlist to the machine's real, installed bundle.
+
+    This fork exists to support the WeChat actually installed here, so the
+    test asserts that positively.  A WeChat update must fail loudly -- naming
+    the new version -- rather than quietly flipping to a "correctly refused"
+    branch, which would let a wrong allowlist entry pass unnoticed.
+    """
+    app = Path("/Applications/WeChat.app")
+    if not app.exists():
+        pytest.skip("WeChat is not installed on this machine")
+
+    client_version = macos_debug_app._app_client_version(app)
+    entitlements = macos_debug_app._entitlements(app)
+    assert entitlements is not None, "could not read installed entitlements"
+
+    assert client_version in macos_debug_app._WECHAT_AD_HOC_SUPPORTED_CLIENTS, (
+        f"installed WeChat {client_version} is not allowlisted; re-verify its "
+        "entitlements against _debug_copy_entitlements before adding it"
+    )
+    granted = macos_debug_app._debug_copy_entitlements(
+        "wechat", entitlements, client_version=client_version
+    )
+    assert granted is not None, (
+        f"installed WeChat {client_version} is allowlisted but its real "
+        "entitlements were refused by the policy"
+    )
+    assert granted["com.apple.security.get-task-allow"] is True
+    assert granted["com.apple.security.app-sandbox"] is True
+    # The gate is real: the same bundle under a neighbouring build is refused.
+    assert macos_debug_app._debug_copy_entitlements(
+        "wechat",
+        entitlements,
+        client_version=(client_version[0], client_version[1] + "0"),
+    ) is None

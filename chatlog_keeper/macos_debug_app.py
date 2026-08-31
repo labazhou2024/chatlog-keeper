@@ -38,7 +38,7 @@ _DEBUG_COPY_FORMATS = {
     # Keep QQ on the pre-WeChat-recovery cache generation.  A WeChat-only
     # entitlement decision must not invalidate an unrelated QQ private copy.
     "qq": b"preserve-nested-signatures-v7-wechat-compat-exact-entitlements-kernel-pid",
-    "wechat": b"preserve-nested-signatures-v11-wechat-4.1.11-entitlement-allowlist",
+    "wechat": b"preserve-nested-signatures-v12-wechat-4.1.11-4.1.13-entitlement-allowlist",
 }
 _GET_TASK_ALLOW_ENTITLEMENT = "com.apple.security.get-task-allow"
 _APP_SANDBOX_ENTITLEMENT = "com.apple.security.app-sandbox"
@@ -50,7 +50,15 @@ _WECHAT_APPLICATION_IDENTIFIER_ENTITLEMENTS = (
 )
 _WECHAT_APPLICATION_GROUPS_ENTITLEMENT = "com.apple.security.application-groups"
 _WECHAT_APPLICATION_GROUP_ALLOWLIST = frozenset({_WECHAT_APPLICATION_IDENTIFIER})
-_WECHAT_AD_HOC_SUPPORTED_CLIENTS = frozenset({("4.1.11", "269136")})
+_WECHAT_AD_HOC_SUPPORTED_CLIENTS = frozenset(
+    {
+        ("4.1.11", "269136"),
+        # 4.1.13 drops the developer team-identifier entitlement that
+        # 4.1.11 carried; see _debug_copy_entitlements for why absence
+        # is accepted while a wrong claim is still refused.
+        ("4.1.13", "269579"),
+    }
+)
 _WECHAT_MACH_REGISTER_ENTITLEMENT = (
     "com.apple.security.temporary-exception.mach-register.global-name"
 )
@@ -387,7 +395,12 @@ def _debug_copy_entitlements(
     path remains unchanged.  WeChat 4.1.11 does carry those restricted claims;
     preserving them under an ad-hoc signature passes ``codesign --verify`` but
     is rejected by AMFI at exec time.  Remove only the known identity-bound
-    values.  The sandboxed WeChat process also registers one PID-suffixed Mach
+    values.  WeChat 4.1.13 no longer carries the developer team-identifier
+    claim at all; an absent claim is accepted because it is strictly weaker
+    than a present one, while a present-but-wrong team is still refused.  The
+    team remains pinned twice over by the application identifier and the
+    application-group allowlist.  The sandboxed WeChat process also registers
+    one PID-suffixed Mach
     rendezvous service under its original application identifier; after the
     signing identity is removed, preserve only that exact capability through
     Apple's scoped temporary-exception entitlement.  Fail closed if a future
@@ -416,7 +429,10 @@ def _debug_copy_entitlements(
             not identifier_values
             or any(not isinstance(value, str) for value in identifier_values)
             or set(identifier_values) != {_WECHAT_APPLICATION_IDENTIFIER}
-            or team_identifier != _WECHAT_TEAM_IDENTIFIER
+            or (
+                team_identifier is not None
+                and team_identifier != _WECHAT_TEAM_IDENTIFIER
+            )
             or original_entitlements.get(_APP_SANDBOX_ENTITLEMENT) is not True
             or not isinstance(application_groups, list)
             or any(not isinstance(value, str) for value in application_groups)
