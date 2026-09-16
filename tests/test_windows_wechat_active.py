@@ -1,6 +1,7 @@
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -79,6 +80,8 @@ def test_candidate_backlog_declares_bounds_and_strict_round_robin():
 
 
 def test_embedded_csharp_queue_bounds_fairness_and_shutdown(tmp_path):
+    if sys.platform != "win32":
+        pytest.skip("Windows is required to compile the Win32 debugger harness")
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
         pytest.skip("PowerShell is required to compile the embedded C# harness")
