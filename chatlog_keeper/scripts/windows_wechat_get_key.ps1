@@ -270,6 +270,90 @@ namespace DebugApiWx
         private readonly byte[] _calibrateKey; // 校准诊断 (env CHATLOG_CALIBRATE_KEY): 已知标尺 key, 命中时定位其真实位置
         private Dictionary<uint, ulong> _steppingThreads = new Dictionary<uint, ulong>();
 
+        // Bounded verifier backlog: one source is one (PID, breakpoint address).
+        // A source retains one full register/stack snapshot (<=186 addresses today),
+        // while 32 sources x 192 values (including any in-flight value) bounds
+        // copied candidate bytes at 192 KiB (plus collection overhead).
+        // Once admitted, work is immutable until verification, deadline, or cleanup.
+        // Overflow rejects and zeroes only the new arrival; every returned key still
+        // passes the database HMAC oracle.
+        private const int MaxCandidateSources = 32;
+        private const int MaxCandidatesPerSource = 192;
+        private const int VerificationIterationsPerSlice = 1024;
+        private sealed class CandidateBatch
+        {
+            public string sourceKey;
+            public Queue<byte[]> candidates = new Queue<byte[]>();
+            public bool scheduled;
+        }
+        private sealed class CandidateVerification : IDisposable
+        {
+            public readonly byte[] candidate;
+            private readonly byte[] page1;
+            private HMACSHA512 kdf;
+            private byte[] u;
+            private byte[] accumulator;
+            private int iterations;
+            private bool initialized;
+            public bool complete;
+            public bool verified;
+
+            public CandidateVerification(byte[] candidateBytes, byte[] databasePage)
+            { candidate = candidateBytes; page1 = databasePage; }
+
+            public void Advance(int iterationBudget)
+            {
+                if (complete) return;
+                try
+                {
+                    if (!initialized)
+                    {
+                        initialized = true;
+                        if (KeyExtractor.HmacCheck(candidate, page1))
+                        { verified = true; complete = true; return; }
+                        byte[] saltBlock = new byte[20];
+                        Array.Copy(page1, 0, saltBlock, 0, 16);
+                        saltBlock[19] = 1; // PBKDF2 block index 1, big-endian
+                        kdf = new HMACSHA512(candidate);
+                        u = kdf.ComputeHash(saltBlock);
+                        accumulator = (byte[])u.Clone();
+                        iterations = 1;
+                    }
+                    while (iterationBudget-- > 0 && iterations < 256000)
+                    {
+                        byte[] previous = u;
+                        u = kdf.ComputeHash(previous);
+                        Array.Clear(previous, 0, previous.Length);
+                        for (int i = 0; i < accumulator.Length; i++) accumulator[i] ^= u[i];
+                        iterations++;
+                    }
+                    if (iterations == 256000)
+                    {
+                        byte[] derived = new byte[32];
+                        Array.Copy(accumulator, derived, 32);
+                        verified = KeyExtractor.HmacCheck(derived, page1);
+                        Array.Clear(derived, 0, derived.Length);
+                        complete = true;
+                    }
+                }
+                catch { verified = false; complete = true; }
+                finally { if (complete) Dispose(); }
+            }
+
+            public void Dispose()
+            {
+                if (kdf != null) { kdf.Dispose(); kdf = null; }
+                if (u != null) { Array.Clear(u, 0, u.Length); u = null; }
+                if (accumulator != null) { Array.Clear(accumulator, 0, accumulator.Length); accumulator = null; }
+            }
+        }
+        private readonly Dictionary<string, CandidateBatch> _candidateBatches = new Dictionary<string, CandidateBatch>();
+        private readonly Queue<CandidateBatch> _candidateSchedule = new Queue<CandidateBatch>();
+        private readonly HashSet<string> _candidateDigests = new HashSet<string>();
+        private CandidateVerification _activeVerification;
+        private string _activeSourceKey;
+        private string _verifiedKey;
+
         public KeyExtractor(string exePath, ulong[] functionRvas, byte[] dbPage1, Action<string> log, Action<string> logVerbose, int timeoutSeconds)
         {
             _exePath = exePath; _functionRvas = functionRvas; _dbPage1 = dbPage1;
@@ -310,25 +394,148 @@ namespace DebugApiWx
             catch { return false; }
         }
 
-        // Returns the candidate IF it is a valid master key for this db (raw-key
-        // <=4.0.x, OR 256000-derived 4.1.10.31+), else null. We always cache the
-        // candidate (master); decryption derives each db's page key from it.
-        private static bool IsValidMasterKey(byte[] cand, byte[] page1)
+        private static string BytesToHex(byte[] bytes)
         {
-            if (cand == null || cand.Length != 32) return false;
-            // cheap entropy gate: skip all-zero / low-entropy buffers before PBKDF2
-            int nz = 0; for (int i = 0; i < 32; i++) if (cand[i] != 0) nz++;
-            if (nz < 8) return false;
-            if (HmacCheck(cand, page1)) return true;               // raw-key mode
-            try
+            var sb = new StringBuilder(bytes.Length * 2);
+            for (int i = 0; i < bytes.Length; i++) sb.Append(bytes[i].ToString("x2"));
+            return sb.ToString();
+        }
+
+        private static string CandidateDigest(byte[] candidate)
+        {
+            using (var sha = SHA256.Create())
+                return Convert.ToBase64String(sha.ComputeHash(candidate));
+        }
+
+        private void DropCandidate(byte[] candidate)
+        {
+            _candidateDigests.Remove(CandidateDigest(candidate));
+            Array.Clear(candidate, 0, candidate.Length);
+        }
+
+        private void QueueCandidateBatch(uint pid, ulong breakpointAddress, List<byte[]> captured)
+        {
+            if (_verifiedKey != null)
             {
-                byte[] salt = new byte[16]; Array.Copy(page1, 0, salt, 0, 16);
-                byte[] derived;
-                using (var kdf = new Rfc2898DeriveBytes(cand, salt, 256000, HashAlgorithmName.SHA512))
-                    derived = kdf.GetBytes(32);
-                return HmacCheck(derived, page1);                  // password mode (4.1.10.31+)
+                foreach (byte[] capturedCandidate in captured)
+                    if (capturedCandidate != null) Array.Clear(capturedCandidate, 0, capturedCandidate.Length);
+                return;
             }
-            catch { return false; }
+            string sourceKey = pid.ToString("X8") + ":" + breakpointAddress.ToString("X16");
+            CandidateBatch batch;
+            if (!_candidateBatches.TryGetValue(sourceKey, out batch))
+            {
+                bool activeSameSource = _activeVerification != null && _activeSourceKey == sourceKey;
+                if (!activeSameSource && AdmittedSourceCount() >= MaxCandidateSources)
+                {
+                    foreach (byte[] capturedCandidate in captured)
+                        if (capturedCandidate != null) Array.Clear(capturedCandidate, 0, capturedCandidate.Length);
+                    _logVerbose("候选校验队列达到 source 上限，已拒绝并清零新批次");
+                    return;
+                }
+                batch = new CandidateBatch { sourceKey = sourceKey };
+                _candidateBatches[sourceKey] = batch;
+            }
+            foreach (byte[] candidate in captured)
+            {
+                if (candidate == null) continue;
+                if (candidate.Length != 32) { Array.Clear(candidate, 0, candidate.Length); continue; }
+                int nz = 0; for (int i = 0; i < candidate.Length; i++) if (candidate[i] != 0) nz++;
+                if (nz < 8) { Array.Clear(candidate, 0, candidate.Length); continue; }
+                string digest = CandidateDigest(candidate);
+                if (_candidateDigests.Contains(digest)) { Array.Clear(candidate, 0, candidate.Length); continue; }
+                int activeForSource = (_activeVerification != null && _activeSourceKey == sourceKey) ? 1 : 0;
+                if (batch.candidates.Count + activeForSource >= MaxCandidatesPerSource)
+                {
+                    Array.Clear(candidate, 0, candidate.Length);
+                    _logVerbose("候选校验队列达到 per-source 上限，已拒绝并清零新候选");
+                    continue;
+                }
+                _candidateDigests.Add(digest);
+                batch.candidates.Enqueue(candidate);
+            }
+            if (!batch.scheduled && batch.candidates.Count > 0)
+            {
+                batch.scheduled = true;
+                _candidateSchedule.Enqueue(batch);
+            }
+        }
+
+        private int AdmittedSourceCount()
+        {
+            int count = _candidateBatches.Count;
+            if (_activeVerification != null && _activeSourceKey != null &&
+                !_candidateBatches.ContainsKey(_activeSourceKey)) count++;
+            return count;
+        }
+
+        private byte[] TakeNextCandidate()
+        {
+            if (_candidateSchedule.Count == 0) return null;
+            CandidateBatch batch = _candidateSchedule.Dequeue();
+            batch.scheduled = false;
+            byte[] candidate = batch.candidates.Dequeue();
+            if (batch.candidates.Count > 0)
+            {
+                // Requeue before any new debug event can append work.  This makes the
+                // schedule strict round-robin even under sustained breakpoint hits.
+                batch.scheduled = true;
+                _candidateSchedule.Enqueue(batch);
+            }
+            else _candidateBatches.Remove(batch.sourceKey);
+            _activeSourceKey = batch.sourceKey;
+            return candidate;
+        }
+
+        private string GetVerifiedKey()
+        {
+            return _verifiedKey;
+        }
+
+        private bool HasCandidateWork()
+        {
+            return _activeVerification != null || _candidateSchedule.Count > 0;
+        }
+
+        private void ProcessCandidateVerificationSlice()
+        {
+            if (_verifiedKey != null) return;
+            if (_activeVerification == null)
+            {
+                byte[] next = TakeNextCandidate();
+                if (next == null) return;
+                _activeVerification = new CandidateVerification(next, _dbPage1);
+            }
+            _activeVerification.Advance(VerificationIterationsPerSlice);
+            if (!_activeVerification.complete) return;
+            byte[] completedCandidate = _activeVerification.candidate;
+            if (_activeVerification.verified) _verifiedKey = BytesToHex(completedCandidate);
+            _candidateDigests.Remove(CandidateDigest(completedCandidate));
+            Array.Clear(completedCandidate, 0, completedCandidate.Length);
+            _activeVerification.Dispose();
+            _activeVerification = null;
+            _activeSourceKey = null;
+        }
+
+        private void ClearCandidateVerifier()
+        {
+            if (_activeVerification != null)
+            {
+                byte[] active = _activeVerification.candidate;
+                _activeVerification.Dispose();
+                _activeVerification = null;
+                _candidateDigests.Remove(CandidateDigest(active));
+                Array.Clear(active, 0, active.Length);
+            }
+            _activeSourceKey = null;
+            while (_candidateSchedule.Count > 0)
+            {
+                CandidateBatch batch = _candidateSchedule.Dequeue();
+                batch.scheduled = false;
+                while (batch.candidates.Count > 0) DropCandidate(batch.candidates.Dequeue());
+            }
+            _candidateBatches.Clear();
+            _candidateDigests.Clear();
         }
 
         private byte[] Read(IntPtr hProcess, ulong addr, int n)
@@ -432,78 +639,103 @@ namespace DebugApiWx
 
         private string DebugLoop()
         {
-            DEBUG_EVENT ev; bool go = true; string foundKey = null;
-            while (go)
+            DEBUG_EVENT ev; bool debuggeeRunning = true; string foundKey = null;
+            try
             {
-                double remainingMs = (_deadlineUtc - DateTime.UtcNow).TotalMilliseconds;
-                if (remainingMs <= 0) { _log("等待登录/密钥超时，已安全结束调试实例"); break; }
-                uint waitMs = (uint)Math.Max(1, Math.Min(10000, remainingMs));
-                if (!Native.WaitForDebugEvent(out ev, waitMs)) { continue; }
-                uint pid = ev.dwProcessId;
-                uint cont = Native.DBG_CONTINUE;
-                switch (ev.dwDebugEventCode)
+                while (debuggeeRunning || HasCandidateWork())
                 {
-                    case Native.CREATE_PROCESS_DEBUG_EVENT:
+                    // One bounded PBKDF2 slice runs only between debug events.  No
+                    // verifier thread or disposable wait handle can outlive us.
+                    ProcessCandidateVerificationSlice();
+                    foundKey = GetVerifiedKey();
+                    if (foundKey != null && _steppingThreads.Count == 0)
+                    { _log("master key HMAC 校验命中"); break; }
+                    double remainingMs = (_deadlineUtc - DateTime.UtcNow).TotalMilliseconds;
+                    if (remainingMs <= 0) { _log("等待登录/密钥超时，已安全结束调试实例"); break; }
+                    // Once the main debuggee exits, finish already-copied candidates
+                    // within the same deadline without waiting for further events.
+                    if (!debuggeeRunning) continue;
+                    uint pollCeiling = HasCandidateWork() ? 1u : 100u;
+                    uint waitMs = (uint)Math.Max(1, Math.Min(pollCeiling, remainingMs));
+                    if (!Native.WaitForDebugEvent(out ev, waitMs)) { continue; }
+                    uint pid = ev.dwProcessId;
+                    uint cont = Native.DBG_CONTINUE;
+                    try
+                    {
+                        switch (ev.dwDebugEventCode)
                         {
-                            IntPtr hProc = DebugEventParser.GetCreateProcessHandle(ev.u);
-                            IntPtr hThr  = DebugEventParser.GetCreateThreadHandle(ev.u);
-                            IntPtr hFile = DebugEventParser.GetFileHandle(ev.u);
-                            ProcCtx pc;
-                            if (!_procs.TryGetValue(pid, out pc)) { _procs[pid] = new ProcCtx { hProcess = hProc }; if (pid != _mainPid) _logVerbose("子进程创建 PID=" + pid); }
-                            else if (pc.hProcess == IntPtr.Zero) { pc.hProcess = hProc; }
-                            TrySetBreakpoint(pid); // Weixin.dll 在 CREATE 时可能已加载
-                            if (hThr != IntPtr.Zero && hThr != new IntPtr(-1)) Native.CloseHandle(hThr);
-                            if (hFile != IntPtr.Zero && hFile != new IntPtr(-1)) Native.CloseHandle(hFile);
-                        }
-                        break;
-                    case Native.LOAD_DLL_DEBUG_EVENT:
-                        {
-                            IntPtr h = DebugEventParser.GetFileHandle(ev.u); if (h != IntPtr.Zero && h != new IntPtr(-1)) Native.CloseHandle(h);
-                            TrySetBreakpoint(pid); // 该进程加载新 dll, 试设断点 (含 Weixin.dll)
-                        }
-                        break;
-                    case Native.EXCEPTION_DEBUG_EVENT:
-                        {
-                            uint code = DebugEventParser.GetExceptionCode(ev.u);
-                            ulong addr = DebugEventParser.GetExceptionAddress(ev.u);
-                            ProcCtx pc; bool known = _procs.TryGetValue(pid, out pc);
-                            if (code == Native.EXCEPTION_BREAKPOINT && known && pc.bps.ContainsKey(addr))
+                            case Native.CREATE_PROCESS_DEBUG_EVENT:
                             {
-                                RestoreOriginalByte(pc, addr);
-                                string k = HandleBreakpoint(pc, pid, ev.dwThreadId);
-                                if (k != null) { foundKey = k; go = false; }
-                                else { SetSingleStepForRearm(pc, ev.dwThreadId, addr); }
+                                IntPtr hProc = DebugEventParser.GetCreateProcessHandle(ev.u);
+                                IntPtr hThr  = DebugEventParser.GetCreateThreadHandle(ev.u);
+                                IntPtr hFile = DebugEventParser.GetFileHandle(ev.u);
+                                ProcCtx pc;
+                                if (!_procs.TryGetValue(pid, out pc)) { _procs[pid] = new ProcCtx { hProcess = hProc }; if (pid != _mainPid) _logVerbose("子进程创建 PID=" + pid); }
+                                else if (pc.hProcess == IntPtr.Zero) { pc.hProcess = hProc; }
+                                TrySetBreakpoint(pid); // Weixin.dll 在 CREATE 时可能已加载
+                                if (hThr != IntPtr.Zero && hThr != new IntPtr(-1)) Native.CloseHandle(hThr);
+                                if (hFile != IntPtr.Zero && hFile != new IntPtr(-1)) Native.CloseHandle(hFile);
                             }
-                            else if (code == Native.EXCEPTION_SINGLE_STEP)
+                            break;
+                            case Native.LOAD_DLL_DEBUG_EVENT:
                             {
-                                ulong rearmAddr; bool inStep = _steppingThreads.TryGetValue(ev.dwThreadId, out rearmAddr);
-                                _logVerbose("[rearm] 单步异常 T=" + ev.dwThreadId + " inStep=" + inStep + " PID=" + pid);
-                                if (inStep)
-                                { ClearTrapFlag(ev.dwThreadId); if (known) { ReinstallBreakpoint(pc, rearmAddr); _logVerbose("[rearm] 已重装0xCC @0x" + rearmAddr.ToString("X") + " PID=" + pid); } _steppingThreads.Remove(ev.dwThreadId); }
+                                IntPtr h = DebugEventParser.GetFileHandle(ev.u); if (h != IntPtr.Zero && h != new IntPtr(-1)) Native.CloseHandle(h);
+                                TrySetBreakpoint(pid); // 该进程加载新 dll, 试设断点 (含 Weixin.dll)
                             }
-                            else if (code != Native.EXCEPTION_BREAKPOINT) { cont = Native.DBG_EXCEPTION_NOT_HANDLED; } // 交给微信自己的 SEH
+                            break;
+                            case Native.EXCEPTION_DEBUG_EVENT:
+                            {
+                                uint code = DebugEventParser.GetExceptionCode(ev.u);
+                                ulong addr = DebugEventParser.GetExceptionAddress(ev.u);
+                                ProcCtx pc; bool known = _procs.TryGetValue(pid, out pc);
+                                if (code == Native.EXCEPTION_BREAKPOINT && known && pc.bps.ContainsKey(addr))
+                                {
+                                    RestoreOriginalByte(pc, addr);
+                                    CaptureBreakpointCandidates(pc, pid, ev.dwThreadId, addr);
+                                    SetSingleStepForRearm(pc, ev.dwThreadId, addr);
+                                }
+                                else if (code == Native.EXCEPTION_SINGLE_STEP)
+                                {
+                                    ulong rearmAddr; bool inStep = _steppingThreads.TryGetValue(ev.dwThreadId, out rearmAddr);
+                                    _logVerbose("[rearm] 单步异常 T=" + ev.dwThreadId + " inStep=" + inStep + " PID=" + pid);
+                                    if (inStep)
+                                    { ClearTrapFlag(ev.dwThreadId); if (known) { ReinstallBreakpoint(pc, rearmAddr); _logVerbose("[rearm] 已重装0xCC @0x" + rearmAddr.ToString("X") + " PID=" + pid); } _steppingThreads.Remove(ev.dwThreadId); }
+                                }
+                                else if (code != Native.EXCEPTION_BREAKPOINT) { cont = Native.DBG_EXCEPTION_NOT_HANDLED; } // 交给微信自己的 SEH
+                            }
+                            break;
+                            case Native.EXIT_THREAD_DEBUG_EVENT:
+                                _steppingThreads.Remove(ev.dwThreadId);
+                                break;
+                            case Native.EXIT_PROCESS_DEBUG_EVENT:
+                            {
+                                ProcCtx pc; if (_procs.TryGetValue(pid, out pc)) { if (pc.hProcess != IntPtr.Zero) Native.CloseHandle(pc.hProcess); _procs.Remove(pid); }
+                                if (pid == _mainPid) debuggeeRunning = false;
+                            }
+                            break;
                         }
-                        break;
-                    case Native.EXIT_PROCESS_DEBUG_EVENT:
-                        {
-                            ProcCtx pc; if (_procs.TryGetValue(pid, out pc)) { if (pc.hProcess != IntPtr.Zero) Native.CloseHandle(pc.hProcess); _procs.Remove(pid); }
-                            if (pid == _mainPid) go = false; // 主进程退出才结束
-                        }
-                        break;
+                    }
+                    finally
+                    {
+                        if (!Native.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, cont))
+                            throw new Exception("ContinueDebugEvent 失败, 错误: " + Marshal.GetLastWin32Error());
+                    }
                 }
-                Native.ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, cont);
+                if (foundKey == null) foundKey = GetVerifiedKey();
+                return foundKey;
             }
-            return foundKey;
+            finally { ClearCandidateVerifier(); }
         }
 
-        // The HMAC oracle: collect every plausible 32-byte buffer reachable from the
-        // registers/stack at the breakpoint and return the one that verifies. No
-        // register layout is assumed; the [rdx+0x08] heuristic is just tried first.
-        private string HandleBreakpoint(ProcCtx pc, uint pid, uint threadId)
+        // Snapshot every plausible 32-byte buffer reachable from registers/stack.
+        // The cooperative verifier applies the HMAC oracle in bounded slices after
+        // this debug event is continued, so a false candidate cannot pause the client.
+        // No register layout is assumed; the [rdx+0x08] heuristic is tried first.
+        private void CaptureBreakpointCandidates(ProcCtx pc, uint pid, uint threadId, ulong breakpointAddress)
         {
             _hitCount++;
             IntPtr hThread = Native.OpenThread(Native.THREAD_ALL_ACCESS, false, threadId);
-            if (hThread == IntPtr.Zero) return null;
+            if (hThread == IntPtr.Zero) return;
             try
             {
                 CONTEXT64 ctx = new CONTEXT64();
@@ -512,7 +744,7 @@ namespace DebugApiWx
                 ctx.ContextFlags = Native.CONTEXT_INTEGER | Native.CONTEXT_CONTROL;
                 ctx.FltSave = new byte[512];
                 ctx.VectorRegister = new ulong[26];
-                if (!Native.GetThreadContext(hThread, ref ctx)) return null;
+                if (!Native.GetThreadContext(hThread, ref ctx)) return;
                 ctx.Rip = ctx.Rip - 1; // step back over the 0xCC
                 ctx.ContextFlags = Native.CONTEXT_CONTROL; // 只写回 Rip/EFlags 控制寄存器
                 Native.SetThreadContext(hThread, ref ctx);
@@ -538,18 +770,13 @@ namespace DebugApiWx
                     if (!found) _log("[校准] 本次命中未在 寄存器/一层间接/栈 找到标尺 key (此调用可能不传 master key)");
                 }
                 var tried = new HashSet<ulong>();
-                Func<ulong, string> tryAddr = (addr) =>
+                var captured = new List<byte[]>();
+                Action<ulong> captureAddr = (addr) =>
                 {
-                    if (addr < 0x10000UL || addr > 0x7FFFFFFFFFFFUL) return null;
-                    if (!tried.Add(addr)) return null;
+                    if (addr < 0x10000UL || addr > 0x7FFFFFFFFFFFUL) return;
+                    if (!tried.Add(addr)) return;
                     byte[] b = Read(hp, addr, 32);
-                    if (b != null && IsValidMasterKey(b, _dbPage1))
-                    {
-                        var sb = new StringBuilder(64);
-                        for (int i = 0; i < 32; i++) sb.Append(b[i].ToString("x2"));
-                        return sb.ToString();
-                    }
-                    return null;
+                    if (b != null) captured.Add(b);
                 };
 
                 ulong[] regs = { ctx.Rdx, ctx.Rcx, ctx.R8, ctx.R9, ctx.Rax, ctx.Rbx,
@@ -559,30 +786,19 @@ namespace DebugApiWx
                 // 1. Heuristic first: key pointer at [rdx+0x08], size at [rdx+0x10]==32
                 ulong sz = ReadPtr(hp, ctx.Rdx + 0x10);
                 if (sz == 32)
-                {
-                    string k = tryAddr(ReadPtr(hp, ctx.Rdx + 0x08));
-                    if (k != null) { _log("master key 命中 (PID=" + pid + " rdx+0x08, 第" + _hitCount + "次)"); return k; }
-                }
+                    captureAddr(ReadPtr(hp, ctx.Rdx + 0x08));
                 // 2. each register: as a direct pointer to the key, and via [reg+off] indirections
                 foreach (ulong r in regs)
                 {
-                    string k = tryAddr(r);
-                    if (k != null) { _log("master key 命中 (PID=" + pid + " 寄存器直指, 第" + _hitCount + "次)"); return k; }
+                    captureAddr(r);
                     foreach (ulong o in offs)
-                    {
-                        string k2 = tryAddr(ReadPtr(hp, r + o));
-                        if (k2 != null) { _log("master key 命中 (PID=" + pid + " 寄存器间接, 第" + _hitCount + "次)"); return k2; }
-                    }
+                        captureAddr(ReadPtr(hp, r + o));
                 }
                 // 3. stack: pointers in the first 0x200 bytes from rsp
                 for (ulong off = 0; off <= 0x200; off += 8)
-                {
-                    string k = tryAddr(ReadPtr(hp, ctx.Rsp + off));
-                    if (k != null) { _log("master key 命中 (PID=" + pid + " 栈指针, 第" + _hitCount + "次)"); return k; }
-                }
-                // not this hit; let the breakpoint re-arm and try the next call
-                _logVerbose("第" + _hitCount + "次断点未命中 key (PID=" + pid + "), 继续等待…");
-                return null;
+                    captureAddr(ReadPtr(hp, ctx.Rsp + off));
+                QueueCandidateBatch(pid, breakpointAddress, captured);
+                _logVerbose("第" + _hitCount + "次断点已捕获 " + captured.Count + " 个候选 (PID=" + pid + "), 分片校验并继续运行…");
             }
             finally { Native.CloseHandle(hThread); }
         }
@@ -600,7 +816,7 @@ namespace DebugApiWx
                     ctx.EFlags = ctx.EFlags | 0x100; // trap flag → 单步过被恢复的原指令
                     ctx.ContextFlags = Native.CONTEXT_CONTROL;
                     bool ok = Native.SetThreadContext(hThread, ref ctx);
-                    _steppingThreads[threadId] = addr;
+                    if (ok) _steppingThreads[threadId] = addr;
                     _logVerbose("[rearm] 设单步 T=" + threadId + " addr=0x" + addr.ToString("X") + " setctx=" + ok + " ef=0x" + ctx.EFlags.ToString("X"));
                 }
                 else { _logVerbose("[rearm] GetThreadContext 失败 T=" + threadId); }
