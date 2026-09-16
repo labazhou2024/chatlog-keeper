@@ -50,7 +50,7 @@ grouped by conversation and day — the way you remember it).
 | Windows | WeChat ≤ 4.0.x | raw-key (`enc_key` used directly) | passive memory scan |
 | Windows | WeChat 4.1.10.31+ | password mode — `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | one-time debugger |
 | Windows | QQ NTQQ 9.9.x | per-DB passphrase | passive scan or one-time debugger |
-| macOS arm64 | WeChat 4.1.11 (build 269136) | raw/password mode selected by page-1 HMAC | passive scan; active startup capture after exact signature preflight |
+| macOS arm64 | WeChat 4.1.11 (269136), 4.1.12 (269364), 4.1.13 (269579) | raw/password mode selected by page-1 HMAC | passive scan; active startup capture after exact signature preflight |
 | macOS arm64 | QQ 6.9.95 (build 36385) | per-DB passphrase | passive scan; active only when signature preflight passes |
 
 On **WeChat 4.1.10.31** (released 2026-05-27) the plaintext key was moved out of

@@ -39,8 +39,8 @@ _DEBUG_COPY_FORMATS = {
     # entitlement decision must not invalidate an unrelated QQ private copy.
     "qq": b"preserve-nested-signatures-v7-wechat-compat-exact-entitlements-kernel-pid",
     "wechat": (
-        b"preserve-nested-signatures-v12-wechat-exact-build-"
-        b"entitlement-allowlist-root-seal"
+        b"preserve-nested-signatures-v13-wechat-exact-build-"
+        b"optional-team-entitlement-root-seal"
     ),
 }
 _GET_TASK_ALLOW_ENTITLEMENT = "com.apple.security.get-task-allow"
@@ -57,6 +57,10 @@ _WECHAT_AD_HOC_SUPPORTED_CLIENTS = frozenset(
     {
         ("4.1.11", "269136"),
         ("4.1.12", "269364"),
+        # 4.1.13 drops the developer team-identifier entitlement that
+        # 4.1.11 carried; see _debug_copy_entitlements for why absence
+        # is accepted while a wrong claim is still refused.
+        ("4.1.13", "269579"),
     }
 )
 _WECHAT_MACH_REGISTER_ENTITLEMENT = (
@@ -403,12 +407,17 @@ def _debug_copy_entitlements(
     restricted claims;
     preserving them under an ad-hoc signature passes ``codesign --verify`` but
     is rejected by AMFI at exec time.  Remove only the known identity-bound
-    values.  The sandboxed WeChat process also registers one PID-suffixed Mach
-    rendezvous service under its original application identifier; after the
-    signing identity is removed, preserve only that exact capability through
-    Apple's scoped temporary-exception entitlement.  Fail closed if a future
-    client introduces another developer, private, or keychain identity claim
-    that needs a separate compatibility decision.
+    values.  WeChat 4.1.13 no longer carries the developer team-identifier
+    claim at all; an absent claim is accepted because it is strictly weaker
+    than a present one, while a present-but-wrong team is still refused.  The
+    team remains pinned twice over by the application identifier and the
+    application-group allowlist.  Older allowlisted builds must retain their
+    exact team claim.  The sandboxed WeChat process also registers one
+    PID-suffixed Mach rendezvous service under its original application
+    identifier; after the signing identity is removed, preserve only that
+    exact capability through Apple's scoped temporary-exception entitlement.
+    Fail closed if a future client introduces another developer, private, or
+    keychain identity claim that needs a separate compatibility decision.
     """
 
     if source not in _APPS or not isinstance(original_entitlements, dict):
@@ -422,9 +431,10 @@ def _debug_copy_entitlements(
             for key in _WECHAT_APPLICATION_IDENTIFIER_ENTITLEMENTS
             if key in original_entitlements
         ]
-        team_identifier = original_entitlements.get(
-            "com.apple.developer.team-identifier"
-        )
+        team_identifier_key = "com.apple.developer.team-identifier"
+        has_team_identifier = team_identifier_key in original_entitlements
+        team_identifier = original_entitlements.get(team_identifier_key)
+        may_omit_team_identifier = client_version == ("4.1.13", "269579")
         application_groups = original_entitlements.get(
             _WECHAT_APPLICATION_GROUPS_ENTITLEMENT
         )
@@ -432,7 +442,10 @@ def _debug_copy_entitlements(
             not identifier_values
             or any(not isinstance(value, str) for value in identifier_values)
             or set(identifier_values) != {_WECHAT_APPLICATION_IDENTIFIER}
-            or team_identifier != _WECHAT_TEAM_IDENTIFIER
+            or (
+                (has_team_identifier or not may_omit_team_identifier)
+                and team_identifier != _WECHAT_TEAM_IDENTIFIER
+            )
             or original_entitlements.get(_APP_SANDBOX_ENTITLEMENT) is not True
             or not isinstance(application_groups, list)
             or any(not isinstance(value, str) for value in application_groups)

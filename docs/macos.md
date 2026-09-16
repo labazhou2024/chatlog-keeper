@@ -31,12 +31,15 @@ access. Modern hardened clients usually deny that request.
   `~/Library/Application Support/chatlog-keeper/debug-apps/`;
 - QQ preserves its original entitlements and adds
   `com.apple.security.get-task-allow`;
-- only the verified WeChat 4.1.11 (build 269136) policy may remove Tencent
-  signing-identity claims that an ad-hoc signature cannot assert; it requires
-  the exact Tencent application identifier/group allowlist and sandbox before
-  preserving unrelated entitlements and adding the scoped Mach-registration
-  exception required by PID-suffixed rendezvous services; other client builds
-  and unknown developer, private, or keychain identity claims fail closed;
+- only the verified WeChat 4.1.11 (269136), 4.1.12 (269364), and 4.1.13
+  (269579) policies may remove Tencent signing-identity claims that an ad-hoc
+  signature cannot assert; they require the exact Tencent application
+  identifier/group allowlist and sandbox before preserving unrelated
+  entitlements and adding the scoped Mach-registration exception required by
+  PID-suffixed rendezvous services; 4.1.11 and 4.1.12 must carry the exact
+  Tencent Team ID, while only 4.1.13 may omit that entitlement; other client
+  builds and unknown developer, private, or keychain identity claims fail
+  closed;
 - QQ keeps Hardened Runtime and is launched only after its signature, exact
   entitlement delta, and direct-library Team-ID relation are verified;
 - WeChat uses the upstream v0.2 compatibility signature: Hardened Runtime is
