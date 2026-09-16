@@ -9,4 +9,4 @@ readers — pure standard library + pycryptodome, no telemetry, no network calls
 in the decryption path.
 """
 
-__version__ = "0.3.6rc0"
+__version__ = "0.3.7rc0"
