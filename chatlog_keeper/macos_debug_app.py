@@ -246,12 +246,14 @@ def _unsigned_executable_digest(executable: Path) -> Optional[bytes]:
 
 
 def _bundle_source_digest(app: Path) -> Optional[bytes]:
-    """Canonical bundle digest excluding only our top signature and marker.
+    """Canonical bundle digest excluding root signature seals and our marker.
 
     The copied main executable is normalized by removing its signature, because
-    adding ``get-task-allow`` necessarily changes that signature. Every other
-    file and symlink, including nested code signatures, must remain identical
-    to the installed source application.
+    adding ``get-task-allow`` necessarily changes that signature. ``codesign``
+    also regenerates both the root ``_CodeSignature`` tree and its legacy
+    ``Contents/CodeResources`` compatibility seal. Every other file and
+    symlink, including nested code signatures, must remain identical to the
+    installed source application.
     """
     try:
         root_info = app.lstat()
@@ -275,13 +277,18 @@ def _bundle_source_digest(app: Path) -> Optional[bytes]:
     digest = hashlib.sha256()
     digest.update(b"chatlog-debug-copy-source-v1\0")
     marker_relative = Path("Contents") / "Resources" / _DEBUG_COPY_MARKER
+    root_signature_relative = Path("Contents") / "_CodeSignature"
+    compatibility_seal_relative = Path("Contents") / "CodeResources"
     for entry in entries:
         try:
             relative = entry.relative_to(app)
-            parts = relative.parts
             if relative == marker_relative:
                 continue
-            if len(parts) >= 2 and parts[:2] == ("Contents", "_CodeSignature"):
+            if (
+                relative == compatibility_seal_relative
+                or relative == root_signature_relative
+                or root_signature_relative in relative.parents
+            ):
                 continue
             info = entry.lstat()
         except (OSError, ValueError):
