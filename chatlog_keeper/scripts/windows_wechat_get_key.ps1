@@ -272,11 +272,12 @@ namespace DebugApiWx
 
         // Bounded verifier backlog: one source is one (PID, breakpoint address).
         // A source retains one full register/stack snapshot (<=186 addresses today),
-        // while 32 pending sources x 192 values plus one in-flight value bounds
-        // copied candidate bytes below ~200 KiB (plus collection overhead).
-        // Overflow replaces the oldest pending source/value; every returned key
-        // still passes the database HMAC oracle.
-        private const int MaxPendingCandidateSources = 32;
+        // while 32 sources x 192 values (including any in-flight value) bounds
+        // copied candidate bytes at 192 KiB (plus collection overhead).
+        // Once admitted, work is immutable until verification, deadline, or cleanup.
+        // Overflow rejects and zeroes only the new arrival; every returned key still
+        // passes the database HMAC oracle.
+        private const int MaxCandidateSources = 32;
         private const int MaxCandidatesPerSource = 192;
         private const int VerificationIterationsPerSlice = 1024;
         private sealed class CandidateBatch
@@ -350,6 +351,7 @@ namespace DebugApiWx
         private readonly Queue<CandidateBatch> _candidateSchedule = new Queue<CandidateBatch>();
         private readonly HashSet<string> _candidateDigests = new HashSet<string>();
         private CandidateVerification _activeVerification;
+        private string _activeSourceKey;
         private string _verifiedKey;
 
         public KeyExtractor(string exePath, ulong[] functionRvas, byte[] dbPage1, Action<string> log, Action<string> logVerbose, int timeoutSeconds)
@@ -411,16 +413,6 @@ namespace DebugApiWx
             Array.Clear(candidate, 0, candidate.Length);
         }
 
-        private void EvictOldestCandidateBatch()
-        {
-            if (_candidateSchedule.Count == 0) return;
-            CandidateBatch evicted = _candidateSchedule.Dequeue();
-            evicted.scheduled = false;
-            _candidateBatches.Remove(evicted.sourceKey);
-            while (evicted.candidates.Count > 0) DropCandidate(evicted.candidates.Dequeue());
-            _logVerbose("候选校验队列达到 source 上限，已丢弃最旧待校验批次");
-        }
-
         private void QueueCandidateBatch(uint pid, ulong breakpointAddress, List<byte[]> captured)
         {
             if (_verifiedKey != null)
@@ -433,12 +425,12 @@ namespace DebugApiWx
             CandidateBatch batch;
             if (!_candidateBatches.TryGetValue(sourceKey, out batch))
             {
-                if (_candidateBatches.Count >= MaxPendingCandidateSources) EvictOldestCandidateBatch();
-                if (_candidateBatches.Count >= MaxPendingCandidateSources)
+                bool activeSameSource = _activeVerification != null && _activeSourceKey == sourceKey;
+                if (!activeSameSource && AdmittedSourceCount() >= MaxCandidateSources)
                 {
                     foreach (byte[] capturedCandidate in captured)
                         if (capturedCandidate != null) Array.Clear(capturedCandidate, 0, capturedCandidate.Length);
-                    _logVerbose("候选校验队列无法安全淘汰旧 source，本批次已丢弃");
+                    _logVerbose("候选校验队列达到 source 上限，已拒绝并清零新批次");
                     return;
                 }
                 batch = new CandidateBatch { sourceKey = sourceKey };
@@ -452,10 +444,12 @@ namespace DebugApiWx
                 if (nz < 8) { Array.Clear(candidate, 0, candidate.Length); continue; }
                 string digest = CandidateDigest(candidate);
                 if (_candidateDigests.Contains(digest)) { Array.Clear(candidate, 0, candidate.Length); continue; }
-                if (batch.candidates.Count >= MaxCandidatesPerSource)
+                int activeForSource = (_activeVerification != null && _activeSourceKey == sourceKey) ? 1 : 0;
+                if (batch.candidates.Count + activeForSource >= MaxCandidatesPerSource)
                 {
-                    DropCandidate(batch.candidates.Dequeue());
-                    _logVerbose("候选校验队列达到 per-source 上限，已用最新候选替换最旧值");
+                    Array.Clear(candidate, 0, candidate.Length);
+                    _logVerbose("候选校验队列达到 per-source 上限，已拒绝并清零新候选");
+                    continue;
                 }
                 _candidateDigests.Add(digest);
                 batch.candidates.Enqueue(candidate);
@@ -465,6 +459,14 @@ namespace DebugApiWx
                 batch.scheduled = true;
                 _candidateSchedule.Enqueue(batch);
             }
+        }
+
+        private int AdmittedSourceCount()
+        {
+            int count = _candidateBatches.Count;
+            if (_activeVerification != null && _activeSourceKey != null &&
+                !_candidateBatches.ContainsKey(_activeSourceKey)) count++;
+            return count;
         }
 
         private byte[] TakeNextCandidate()
@@ -481,6 +483,7 @@ namespace DebugApiWx
                 _candidateSchedule.Enqueue(batch);
             }
             else _candidateBatches.Remove(batch.sourceKey);
+            _activeSourceKey = batch.sourceKey;
             return candidate;
         }
 
@@ -511,6 +514,7 @@ namespace DebugApiWx
             Array.Clear(completedCandidate, 0, completedCandidate.Length);
             _activeVerification.Dispose();
             _activeVerification = null;
+            _activeSourceKey = null;
         }
 
         private void ClearCandidateVerifier()
@@ -523,6 +527,7 @@ namespace DebugApiWx
                 _candidateDigests.Remove(CandidateDigest(active));
                 Array.Clear(active, 0, active.Length);
             }
+            _activeSourceKey = null;
             while (_candidateSchedule.Count > 0)
             {
                 CandidateBatch batch = _candidateSchedule.Dequeue();

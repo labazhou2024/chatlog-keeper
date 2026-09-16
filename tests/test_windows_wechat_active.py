@@ -65,10 +65,12 @@ def test_candidate_backlog_declares_bounds_and_strict_round_robin():
     enqueue = _method_body(csharp, "private void QueueCandidateBatch(")
     take = _method_body(csharp, "private byte[] TakeNextCandidate()")
 
-    assert "MaxPendingCandidateSources = 32" in csharp
+    assert "MaxCandidateSources = 32" in csharp
     assert "MaxCandidatesPerSource = 192" in csharp
-    assert "EvictOldestCandidateBatch" in enqueue
-    assert "DropCandidate(batch.candidates.Dequeue())" in enqueue
+    assert "EvictOldestCandidateBatch" not in csharp
+    assert "DropCandidate(batch.candidates.Dequeue())" not in enqueue
+    assert "已拒绝并清零新批次" in enqueue
+    assert "已拒绝并清零新候选" in enqueue
     # Requeue happens synchronously while taking one candidate; later arrivals
     # append behind it and therefore cannot starve an admitted source.
     assert take.index("_candidateSchedule.Enqueue(batch)") < take.index(
@@ -146,6 +148,19 @@ namespace DebugApiWx
             return BitConverter.ToInt32(candidate, 0);
         }
 
+        private static bool AllZero(byte[] candidate)
+        {
+            for (int i = 0; i < candidate.Length; i++) if (candidate[i] != 0) return false;
+            return true;
+        }
+
+        private static bool ContainsSource(KeyExtractor extractor, uint pid, ulong address)
+        {
+            object batches = Field(extractor, "_candidateBatches");
+            string key = pid.ToString("X8") + ":" + address.ToString("X16");
+            return (bool)batches.GetType().GetMethod("ContainsKey").Invoke(batches, new object[] { key });
+        }
+
         private static byte[] BuildPasswordModePage(byte[] master)
         {
             byte[] page = new byte[4096];
@@ -186,25 +201,76 @@ namespace DebugApiWx
             for (int i = 0; i < order.Length; i++) if (order[i] != expected[i]) throw new Exception("round-robin failed");
             Method("ClearCandidateVerifier").Invoke(fair, null);
 
-            // Per-source overflow retains exactly the declared bound.
+            // Per-source overflow retains admitted work and zeroes the rejected copy.
             int maxPerSource = Constant("MaxCandidatesPerSource");
             KeyExtractor perSource = NewExtractor(blankPage);
             var many = new List<byte[]>();
             for (int i = 0; i < maxPerSource + 9; i++) many.Add(Candidate(1000 + i));
+            byte[] rejectedPerSource = many[maxPerSource];
             Method("QueueCandidateBatch").Invoke(perSource, new object[] { (uint)1, (ulong)0x3000, many });
             if (Count(perSource, "_candidateDigests") != maxPerSource) throw new Exception("per-source bound failed");
+            if (!AllZero(rejectedPerSource)) throw new Exception("rejected per-source candidate was not zeroed");
+            if (AllZero(many[0])) throw new Exception("admitted per-source candidate was replaced");
             Method("ClearCandidateVerifier").Invoke(perSource, null);
 
-            // Source overflow evicts the oldest source and admits the newest.
-            int maxSources = Constant("MaxPendingCandidateSources");
+            // The declared limits include the one candidate currently in flight.
+            int maxSources = Constant("MaxCandidateSources");
+            KeyExtractor activeBounds = NewExtractor(blankPage);
+            Queue(activeBounds, 1, 0x3500, Candidate(30000));
+            Method("ProcessCandidateVerificationSlice").Invoke(activeBounds, null);
+            var activeSourceFlood = new List<byte[]>();
+            for (int i = 0; i < maxPerSource; i++) activeSourceFlood.Add(Candidate(31000 + i));
+            byte[] rejectedAlongsideActive = activeSourceFlood[maxPerSource - 1];
+            Method("QueueCandidateBatch").Invoke(activeBounds, new object[] { (uint)1, (ulong)0x3500, activeSourceFlood });
+            if (Count(activeBounds, "_candidateDigests") != maxPerSource) throw new Exception("active per-source bound failed");
+            if (!AllZero(rejectedAlongsideActive)) throw new Exception("active per-source overflow was not zeroed");
+            for (int i = 2; i <= maxSources; i++) Queue(activeBounds, (uint)i, (ulong)0x3500, Candidate(32000 + i));
+            byte[] rejectedAlongsideActiveSource = Candidate(32999);
+            Queue(activeBounds, (uint)(maxSources + 1), 0x3500, rejectedAlongsideActiveSource);
+            int admittedWithActive = (int)Method("AdmittedSourceCount").Invoke(activeBounds, null);
+            if (admittedWithActive != maxSources) throw new Exception("active source bound failed");
+            if (!AllZero(rejectedAlongsideActiveSource)) throw new Exception("active source overflow was not zeroed");
+            Method("ClearCandidateVerifier").Invoke(activeBounds, null);
+
+            // Source overflow keeps every admitted source and zeroes the new copy.
             KeyExtractor sources = NewExtractor(blankPage);
-            for (int i = 0; i < maxSources + 1; i++) Queue(sources, (uint)(i + 1), (ulong)0x4000, Candidate(2000 + i));
+            for (int i = 0; i < maxSources; i++) Queue(sources, (uint)(i + 1), (ulong)0x4000, Candidate(2000 + i));
+            byte[] rejectedSource = Candidate(2999);
+            Queue(sources, (uint)(maxSources + 1), (ulong)0x4000, rejectedSource);
             if (Count(sources, "_candidateBatches") != maxSources) throw new Exception("source bound failed");
-            object batches = Field(sources, "_candidateBatches");
-            string newest = ((uint)(maxSources + 1)).ToString("X8") + ":" + ((ulong)0x4000).ToString("X16");
-            bool admitted = (bool)batches.GetType().GetMethod("ContainsKey").Invoke(batches, new object[] { newest });
-            if (!admitted) throw new Exception("new source was starved");
+            if (!ContainsSource(sources, 1, 0x4000)) throw new Exception("oldest admitted source was evicted");
+            if (ContainsSource(sources, (uint)(maxSources + 1), 0x4000)) throw new Exception("overflow source was admitted");
+            if (!AllZero(rejectedSource)) throw new Exception("rejected source candidate was not zeroed");
             Method("ClearCandidateVerifier").Invoke(sources, null);
+
+            // A non-first sentinel remains scheduled despite sustained arrivals
+            // against both its own source and brand-new sources.
+            KeyExtractor immutable = NewExtractor(blankPage);
+            byte[] sentinel = Candidate(6002);
+            Queue(immutable, 1, 0x6000, Candidate(6001), sentinel, Candidate(6003));
+            for (int batchIndex = 0; batchIndex < 16; batchIndex++)
+            {
+                var flood = new List<byte[]>();
+                for (int item = 0; item < 32; item++) flood.Add(Candidate(7000 + batchIndex * 32 + item));
+                Method("QueueCandidateBatch").Invoke(immutable, new object[] { (uint)1, (ulong)0x6000, flood });
+            }
+            for (int i = 2; i <= maxSources; i++) Queue(immutable, (uint)i, (ulong)0x6000, Candidate(8000 + i));
+            for (int i = maxSources + 1; i <= maxSources + 16; i++)
+            {
+                byte[] rejected = Candidate(9000 + i);
+                Queue(immutable, (uint)i, (ulong)0x6000, rejected);
+                if (!AllZero(rejected)) throw new Exception("sustained overflow source was not zeroed");
+            }
+            if (Count(immutable, "_candidateBatches") != maxSources) throw new Exception("sustained source bound failed");
+            if (!ContainsSource(immutable, 1, 0x6000)) throw new Exception("sentinel source was evicted");
+            bool sawSentinel = false;
+            for (int i = 0; i < maxSources + 2; i++)
+            {
+                byte[] next = Take(immutable);
+                if (next != null && CandidateId(next) == 6002) { sawSentinel = true; break; }
+            }
+            if (!sawSentinel || AllZero(sentinel)) throw new Exception("accepted non-first sentinel was lost");
+            Method("ClearCandidateVerifier").Invoke(immutable, null);
 
             // Exercise the incremental PBKDF2/HMAC path, then clean it.  The
             // verified result survives cleanup while all copied byte queues vanish.

@@ -69,7 +69,7 @@ _RECOVERY_CLIENT_OPEN_MARKER = "CHATLOG_KEY_RECOVERY_CLIENT_OPEN_V1"
 _RECOVERY_OPERATION_ID_RE = re.compile(r"[0-9a-f]{64}")
 _BUNDLED_SCRIPT_SHA256 = {
     "windows_ntqq_get_key.ps1": "afae9d5c54352bb796d70715a2860d96c1ef7181ce765cf2ebd297534a0d4ada",
-    "windows_wechat_get_key.ps1": "3602761cceb840554d61df483439347fea487f2000b6ad0ab2514f0b1172b5e8",
+    "windows_wechat_get_key.ps1": "3e7a1d14757b03db2552affa0d5d18a216fffd6d6a1c4507075ca704c5785f83",
 }
 
 
