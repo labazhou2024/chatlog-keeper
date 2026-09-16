@@ -38,7 +38,10 @@ _DEBUG_COPY_FORMATS = {
     # Keep QQ on the pre-WeChat-recovery cache generation.  A WeChat-only
     # entitlement decision must not invalidate an unrelated QQ private copy.
     "qq": b"preserve-nested-signatures-v7-wechat-compat-exact-entitlements-kernel-pid",
-    "wechat": b"preserve-nested-signatures-v11-wechat-4.1.11-entitlement-allowlist",
+    "wechat": (
+        b"preserve-nested-signatures-v12-wechat-exact-build-"
+        b"entitlement-allowlist-root-seal"
+    ),
 }
 _GET_TASK_ALLOW_ENTITLEMENT = "com.apple.security.get-task-allow"
 _APP_SANDBOX_ENTITLEMENT = "com.apple.security.app-sandbox"
@@ -50,7 +53,12 @@ _WECHAT_APPLICATION_IDENTIFIER_ENTITLEMENTS = (
 )
 _WECHAT_APPLICATION_GROUPS_ENTITLEMENT = "com.apple.security.application-groups"
 _WECHAT_APPLICATION_GROUP_ALLOWLIST = frozenset({_WECHAT_APPLICATION_IDENTIFIER})
-_WECHAT_AD_HOC_SUPPORTED_CLIENTS = frozenset({("4.1.11", "269136")})
+_WECHAT_AD_HOC_SUPPORTED_CLIENTS = frozenset(
+    {
+        ("4.1.11", "269136"),
+        ("4.1.12", "269364"),
+    }
+)
 _WECHAT_MACH_REGISTER_ENTITLEMENT = (
     "com.apple.security.temporary-exception.mach-register.global-name"
 )
@@ -246,12 +254,14 @@ def _unsigned_executable_digest(executable: Path) -> Optional[bytes]:
 
 
 def _bundle_source_digest(app: Path) -> Optional[bytes]:
-    """Canonical bundle digest excluding only our top signature and marker.
+    """Canonical bundle digest excluding root signature seals and our marker.
 
     The copied main executable is normalized by removing its signature, because
-    adding ``get-task-allow`` necessarily changes that signature. Every other
-    file and symlink, including nested code signatures, must remain identical
-    to the installed source application.
+    adding ``get-task-allow`` necessarily changes that signature. ``codesign``
+    also regenerates both the root ``_CodeSignature`` tree and its legacy
+    ``Contents/CodeResources`` compatibility seal. Every other file and
+    symlink, including nested code signatures, must remain identical to the
+    installed source application.
     """
     try:
         root_info = app.lstat()
@@ -275,13 +285,18 @@ def _bundle_source_digest(app: Path) -> Optional[bytes]:
     digest = hashlib.sha256()
     digest.update(b"chatlog-debug-copy-source-v1\0")
     marker_relative = Path("Contents") / "Resources" / _DEBUG_COPY_MARKER
+    root_signature_relative = Path("Contents") / "_CodeSignature"
+    compatibility_seal_relative = Path("Contents") / "CodeResources"
     for entry in entries:
         try:
             relative = entry.relative_to(app)
-            parts = relative.parts
             if relative == marker_relative:
                 continue
-            if len(parts) >= 2 and parts[:2] == ("Contents", "_CodeSignature"):
+            if (
+                relative == compatibility_seal_relative
+                or relative == root_signature_relative
+                or root_signature_relative in relative.parents
+            ):
                 continue
             info = entry.lstat()
         except (OSError, ValueError):
@@ -384,7 +399,8 @@ def _debug_copy_entitlements(
 
     QQ's current Mac App Store bundle does not carry Tencent application/team
     identity claims, so its established exact-entitlements + get-task-allow
-    path remains unchanged.  WeChat 4.1.11 does carry those restricted claims;
+    path remains unchanged.  Supported WeChat 4.1.x builds carry those
+    restricted claims;
     preserving them under an ad-hoc signature passes ``codesign --verify`` but
     is rejected by AMFI at exec time.  Remove only the known identity-bound
     values.  The sandboxed WeChat process also registers one PID-suffixed Mach

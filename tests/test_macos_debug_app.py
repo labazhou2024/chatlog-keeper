@@ -11,6 +11,7 @@ from chatlog_keeper import macos_debug_app, macos_key, macos_wechat_capture
 
 
 _WECHAT_4_1_11 = ("4.1.11", "269136")
+_WECHAT_4_1_12 = ("4.1.12", "269364")
 _WECHAT_APPLICATION_IDENTIFIER = "5A4RE8SF68.com.tencent.xinWeChat"
 
 
@@ -31,6 +32,26 @@ def _wechat_4_1_11_entitlements() -> dict:
             _WECHAT_APPLICATION_IDENTIFIER
         ],
     }
+
+
+def _write_digest_test_bundle(app: Path) -> None:
+    files = {
+        Path("Contents/Info.plist"): plistlib.dumps(
+            {"CFBundleExecutable": "WeChat"}
+        ),
+        Path("Contents/MacOS/WeChat"): b"main-executable",
+        Path("Contents/Resources/payload.dat"): b"trusted-resource",
+        Path("Contents/_CodeSignature/CodeResources"): b"original-root-seal",
+        Path("Contents/CodeResources"): b"original-compatibility-seal",
+        Path(
+            "Contents/Frameworks/Helper.framework/"
+            "_CodeSignature/CodeResources"
+        ): b"trusted-nested-seal",
+    }
+    for relative, content in files.items():
+        target = app / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
 
 
 pytestmark = pytest.mark.skipif(
@@ -71,6 +92,70 @@ def test_prepare_debug_copy_is_macos_only(monkeypatch):
     assert macos_debug_app.prepare_debug_copy("wechat") is None
 
 
+def test_bundle_digest_allows_only_regenerated_root_signature_seals(
+    monkeypatch,
+    tmp_path,
+):
+    source = tmp_path / "source.app"
+    resigned = tmp_path / "resigned.app"
+    _write_digest_test_bundle(source)
+    shutil.copytree(source, resigned)
+    monkeypatch.setattr(
+        macos_debug_app,
+        "_unsigned_executable_digest",
+        macos_debug_app._stable_regular_file_digest,
+    )
+
+    (resigned / "Contents/_CodeSignature/CodeResources").write_bytes(
+        b"regenerated-root-seal"
+    )
+    (resigned / "Contents/CodeResources").write_bytes(
+        b"regenerated-compatibility-seal"
+    )
+
+    source_digest = macos_debug_app._bundle_source_digest(source)
+    assert source_digest is not None
+    assert macos_debug_app._bundle_source_digest(resigned) == source_digest
+
+
+@pytest.mark.parametrize(
+    "tampered_relative",
+    (
+        Path("Contents/Resources/payload.dat"),
+        Path(
+            "Contents/Frameworks/Helper.framework/"
+            "_CodeSignature/CodeResources"
+        ),
+    ),
+    ids=("resource", "nested-signature"),
+)
+def test_bundle_digest_rejects_non_root_signature_tampering(
+    monkeypatch,
+    tmp_path,
+    tampered_relative,
+):
+    source = tmp_path / "source.app"
+    resigned = tmp_path / "resigned.app"
+    _write_digest_test_bundle(source)
+    shutil.copytree(source, resigned)
+    monkeypatch.setattr(
+        macos_debug_app,
+        "_unsigned_executable_digest",
+        macos_debug_app._stable_regular_file_digest,
+    )
+    (resigned / "Contents/_CodeSignature/CodeResources").write_bytes(
+        b"regenerated-root-seal"
+    )
+    (resigned / "Contents/CodeResources").write_bytes(
+        b"regenerated-compatibility-seal"
+    )
+    (resigned / tampered_relative).write_bytes(b"tampered")
+
+    source_digest = macos_debug_app._bundle_source_digest(source)
+    assert source_digest is not None
+    assert macos_debug_app._bundle_source_digest(resigned) != source_digest
+
+
 def test_wechat_debug_copy_strips_only_ad_hoc_identity_entitlements():
     original = {
         "application-identifier": _WECHAT_APPLICATION_IDENTIFIER,
@@ -104,6 +189,23 @@ def test_wechat_debug_copy_strips_only_ad_hoc_identity_entitlements():
     # The source dictionary is evidence from the installed app and must never
     # be mutated while deriving the private-copy policy.
     assert original["com.apple.developer.team-identifier"] == "5A4RE8SF68"
+
+
+def test_wechat_4_1_12_exact_reported_build_uses_same_strict_entitlement_gate():
+    original = _wechat_4_1_11_entitlements()
+
+    transformed = macos_debug_app._debug_copy_entitlements(
+        "wechat",
+        original,
+        client_version=_WECHAT_4_1_12,
+    )
+
+    assert transformed == macos_debug_app._debug_copy_entitlements(
+        "wechat",
+        original,
+        client_version=_WECHAT_4_1_11,
+    )
+    assert transformed is not None
 
 
 def test_wechat_debug_copy_rejects_unexpected_signing_identity():
