@@ -11,6 +11,7 @@ from chatlog_keeper import macos_debug_app, macos_key, macos_wechat_capture
 
 
 _WECHAT_4_1_11 = ("4.1.11", "269136")
+_WECHAT_4_1_12 = ("4.1.12", "269364")
 _WECHAT_APPLICATION_IDENTIFIER = "5A4RE8SF68.com.tencent.xinWeChat"
 
 
@@ -188,6 +189,23 @@ def test_wechat_debug_copy_strips_only_ad_hoc_identity_entitlements():
     # The source dictionary is evidence from the installed app and must never
     # be mutated while deriving the private-copy policy.
     assert original["com.apple.developer.team-identifier"] == "5A4RE8SF68"
+
+
+def test_wechat_4_1_12_exact_reported_build_uses_same_strict_entitlement_gate():
+    original = _wechat_4_1_11_entitlements()
+
+    transformed = macos_debug_app._debug_copy_entitlements(
+        "wechat",
+        original,
+        client_version=_WECHAT_4_1_12,
+    )
+
+    assert transformed == macos_debug_app._debug_copy_entitlements(
+        "wechat",
+        original,
+        client_version=_WECHAT_4_1_11,
+    )
+    assert transformed is not None
 
 
 def test_wechat_debug_copy_rejects_unexpected_signing_identity():
