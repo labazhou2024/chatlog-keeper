@@ -138,7 +138,7 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert "& $executable --_qq-sqlite-helper --runtime-probe" in workflow
     assert (
         "conda-incubator/setup-miniconda@"
-        "835234971496cad1653abb28a638a281cf32541f"
+        "8ee1f361103df19b6f8c8655fd3967a8ecb162d5"
     ) in workflow
     assert "packaging/windows-release-environment.yml" in workflow
     assert 'miniconda-version: "py311_26.5.3-2"' in workflow
@@ -292,7 +292,7 @@ def test_ci_covers_release_python_and_runs_the_runtime_probe_on_windows():
     assert 'python-version: ["3.9", "3.11", "3.12"]' in workflow
     assert "windows-release-runtime:" in workflow
     assert 'python-version: "3.11"' in workflow
-    assert "conda-incubator/setup-miniconda@835234971496cad1653abb28a638a281cf32541f" in workflow
+    assert "conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5" in workflow
     assert "packaging/windows-release-environment.yml" in workflow
     assert "_qq_sqlite_helper.py --runtime-probe" in workflow
     assert "macos-release-runtime:" in workflow
