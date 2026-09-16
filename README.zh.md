@@ -48,7 +48,7 @@
 | Windows | 微信 ≤ 4.0.x | raw-key（`enc_key` 直接用） | 被动内存扫描 |
 | Windows | 微信 4.1.10.31+ | password 模式 —— `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | 一次性调试器 |
 | Windows | QQ NTQQ 9.9.x | 每库口令 | 被动扫描或一次性调试器 |
-| macOS arm64 | 微信 4.1.9（build 268575） | 由 page-1 HMAC 自动选择 raw/password 模式 | 被动扫描；主动流程仅在签名预检通过时可用 |
+| macOS arm64 | 微信 4.1.11（269136）、4.1.12（269364）、4.1.13（269579） | 由 page-1 HMAC 自动选择 raw/password 模式 | 被动扫描；主动流程仅在签名预检通过时可用 |
 | macOS arm64 | QQ 6.9.95（build 36385） | 每库口令 | 被动扫描；主动流程仅在签名预检通过时可用 |
 
 **微信 4.1.10.31**（2026-05-27 发布）把明文 key 移出了进程堆，因此被动内存扫描

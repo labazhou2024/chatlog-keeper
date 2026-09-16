@@ -11,6 +11,7 @@ from chatlog_keeper import macos_debug_app, macos_key, macos_wechat_capture
 
 
 _WECHAT_4_1_11 = ("4.1.11", "269136")
+_WECHAT_4_1_12 = ("4.1.12", "269364")
 _WECHAT_APPLICATION_IDENTIFIER = "5A4RE8SF68.com.tencent.xinWeChat"
 
 
@@ -31,6 +32,26 @@ def _wechat_4_1_11_entitlements() -> dict:
             _WECHAT_APPLICATION_IDENTIFIER
         ],
     }
+
+
+def _write_digest_test_bundle(app: Path) -> None:
+    files = {
+        Path("Contents/Info.plist"): plistlib.dumps(
+            {"CFBundleExecutable": "WeChat"}
+        ),
+        Path("Contents/MacOS/WeChat"): b"main-executable",
+        Path("Contents/Resources/payload.dat"): b"trusted-resource",
+        Path("Contents/_CodeSignature/CodeResources"): b"original-root-seal",
+        Path("Contents/CodeResources"): b"original-compatibility-seal",
+        Path(
+            "Contents/Frameworks/Helper.framework/"
+            "_CodeSignature/CodeResources"
+        ): b"trusted-nested-seal",
+    }
+    for relative, content in files.items():
+        target = app / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
 
 
 pytestmark = pytest.mark.skipif(
@@ -71,6 +92,70 @@ def test_prepare_debug_copy_is_macos_only(monkeypatch):
     assert macos_debug_app.prepare_debug_copy("wechat") is None
 
 
+def test_bundle_digest_allows_only_regenerated_root_signature_seals(
+    monkeypatch,
+    tmp_path,
+):
+    source = tmp_path / "source.app"
+    resigned = tmp_path / "resigned.app"
+    _write_digest_test_bundle(source)
+    shutil.copytree(source, resigned)
+    monkeypatch.setattr(
+        macos_debug_app,
+        "_unsigned_executable_digest",
+        macos_debug_app._stable_regular_file_digest,
+    )
+
+    (resigned / "Contents/_CodeSignature/CodeResources").write_bytes(
+        b"regenerated-root-seal"
+    )
+    (resigned / "Contents/CodeResources").write_bytes(
+        b"regenerated-compatibility-seal"
+    )
+
+    source_digest = macos_debug_app._bundle_source_digest(source)
+    assert source_digest is not None
+    assert macos_debug_app._bundle_source_digest(resigned) == source_digest
+
+
+@pytest.mark.parametrize(
+    "tampered_relative",
+    (
+        Path("Contents/Resources/payload.dat"),
+        Path(
+            "Contents/Frameworks/Helper.framework/"
+            "_CodeSignature/CodeResources"
+        ),
+    ),
+    ids=("resource", "nested-signature"),
+)
+def test_bundle_digest_rejects_non_root_signature_tampering(
+    monkeypatch,
+    tmp_path,
+    tampered_relative,
+):
+    source = tmp_path / "source.app"
+    resigned = tmp_path / "resigned.app"
+    _write_digest_test_bundle(source)
+    shutil.copytree(source, resigned)
+    monkeypatch.setattr(
+        macos_debug_app,
+        "_unsigned_executable_digest",
+        macos_debug_app._stable_regular_file_digest,
+    )
+    (resigned / "Contents/_CodeSignature/CodeResources").write_bytes(
+        b"regenerated-root-seal"
+    )
+    (resigned / "Contents/CodeResources").write_bytes(
+        b"regenerated-compatibility-seal"
+    )
+    (resigned / tampered_relative).write_bytes(b"tampered")
+
+    source_digest = macos_debug_app._bundle_source_digest(source)
+    assert source_digest is not None
+    assert macos_debug_app._bundle_source_digest(resigned) != source_digest
+
+
 def test_wechat_debug_copy_strips_only_ad_hoc_identity_entitlements():
     original = {
         "application-identifier": _WECHAT_APPLICATION_IDENTIFIER,
@@ -104,6 +189,23 @@ def test_wechat_debug_copy_strips_only_ad_hoc_identity_entitlements():
     # The source dictionary is evidence from the installed app and must never
     # be mutated while deriving the private-copy policy.
     assert original["com.apple.developer.team-identifier"] == "5A4RE8SF68"
+
+
+def test_wechat_4_1_12_exact_reported_build_uses_same_strict_entitlement_gate():
+    original = _wechat_4_1_11_entitlements()
+
+    transformed = macos_debug_app._debug_copy_entitlements(
+        "wechat",
+        original,
+        client_version=_WECHAT_4_1_12,
+    )
+
+    assert transformed == macos_debug_app._debug_copy_entitlements(
+        "wechat",
+        original,
+        client_version=_WECHAT_4_1_11,
+    )
+    assert transformed is not None
 
 
 def test_wechat_debug_copy_rejects_unexpected_signing_identity():
@@ -1765,7 +1867,7 @@ def test_terminate_debug_copy_fails_closed_when_generation_is_unknown(
     assert signals == []
 
 
-# --- WeChat 4.1.13 support (fork) ------------------------------------------
+# --- WeChat 4.1.13 support -------------------------------------------------
 #
 # 4.1.13 dropped the `com.apple.developer.team-identifier` entitlement that
 # 4.1.11 carried.  Absence is strictly safer than a present-and-correct claim:
@@ -1816,7 +1918,7 @@ def test_wechat_4_1_13_accepts_absent_team_identifier():
 def test_wechat_4_1_13_still_rejects_present_but_wrong_team_identifier():
     # Relaxing "present and equal" to "absent or equal" must not degrade into
     # "ignored".  A bundle that does claim a team must claim Tencent's.
-    for team_identifier in ("OTHERTEAM1", "short", "", 5, None if False else "5A4RE8SF69"):
+    for team_identifier in ("OTHERTEAM1", "short", "", 5, None):
         assert macos_debug_app._debug_copy_entitlements(
             "wechat",
             {
@@ -1827,10 +1929,23 @@ def test_wechat_4_1_13_still_rejects_present_but_wrong_team_identifier():
         ) is None
 
 
+def test_only_wechat_4_1_13_may_omit_team_identifier():
+    for client_version in (_WECHAT_4_1_11, _WECHAT_4_1_12):
+        assert macos_debug_app._debug_copy_entitlements(
+            "wechat",
+            _wechat_4_1_13_entitlements(),
+            client_version=client_version,
+        ) is None
+
+
 def test_wechat_4_1_13_shape_is_still_scoped_to_allowlisted_clients():
     entitlements = _wechat_4_1_13_entitlements()
-    for client_version in (None, ("4.1.12", "269500"), ("4.1.14", "269999"),
-                           ("4.1.13", "999999")):
+    for client_version in (
+        None,
+        ("4.1.12", "269500"),
+        ("4.1.14", "269999"),
+        ("4.1.13", "999999"),
+    ):
         assert macos_debug_app._debug_copy_entitlements(
             "wechat",
             entitlements,
@@ -1887,6 +2002,10 @@ def test_installed_wechat_bundle_is_allowlisted_and_accepted():
     entitlements = macos_debug_app._entitlements(app)
     assert entitlements is not None, "could not read installed entitlements"
 
+    assert client_version == _WECHAT_4_1_13, (
+        f"installed WeChat {client_version} does not match the verified "
+        f"4.1.13 bundle {_WECHAT_4_1_13}"
+    )
     assert client_version in macos_debug_app._WECHAT_AD_HOC_SUPPORTED_CLIENTS, (
         f"installed WeChat {client_version} is not allowlisted; re-verify its "
         "entitlements against _debug_copy_entitlements before adding it"

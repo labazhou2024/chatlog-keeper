@@ -26,11 +26,12 @@ JSON/HTML 导出格式与 Windows 完全一致。
 
 - 在 `~/Library/Application Support/chatlog-keeper/debug-apps/` 创建隔离副本；
 - QQ 保留原 entitlements，并增加 `com.apple.security.get-task-allow`；
-- 只有验证通过的微信 4.1.11（build 269136）策略会移除 ad-hoc 副本无权声明的腾讯
-  签名身份；该策略要求 application identifier、application group 与 sandbox 严格匹配
-  allowlist，再保留其他无关 entitlements，并为 PID 后缀的 rendezvous 服务增加限定的
-  Mach 注册例外；其他客户端版本以及未知 developer、private 或 keychain 身份声明均
-  安全失败；
+- 只有验证通过的微信 4.1.11（269136）、4.1.12（269364）和 4.1.13（269579）策略
+  会移除 ad-hoc 副本无权声明的腾讯签名身份；这些策略要求 application identifier、
+  application group 与 sandbox 严格匹配 allowlist，再保留其他无关 entitlements，并为
+  PID 后缀的 rendezvous 服务增加限定的 Mach 注册例外；4.1.11 与 4.1.12 必须携带精确
+  的腾讯 Team ID，只有 4.1.13 可以缺少该 entitlement；其他客户端版本以及未知
+  developer、private 或 keychain 身份声明均安全失败；
 - QQ 副本保留 Hardened Runtime，并在验证签名、精确 entitlement 差异以及直接依赖的
   Team-ID 关系后才启动；
 - 微信采用上游 v0.2 的兼容签名：私有副本不启用 Hardened Runtime，因为 ad-hoc 主程序
