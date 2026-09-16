@@ -930,7 +930,7 @@ def _skip_header(db_path: Path, output_path: Path) -> bool:
     try:
         import shutil
         from chatlog_keeper.core._snapshot import snapshot_db_family
-        with snapshot_db_family(db_path) as snapshot:
+        with snapshot_db_family(db_path, allow_active_wal=True) as snapshot:
             # Stream the copy in chunks (skipping the 1024-byte header) to bound memory.
             with open(snapshot, "rb") as f:
                 f.seek(0, 2)

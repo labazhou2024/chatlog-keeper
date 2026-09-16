@@ -12,6 +12,8 @@ from typing import Iterable, Iterator
 
 _SIDECAR_SUFFIXES = ("-wal", "-shm")
 _MAX_SNAPSHOT_ATTEMPTS = 3
+_SQLITE_WALINDEX_LOCK_OFFSET = 120
+_SQLITE_WAL_MUTATION_LOCKS = 3
 
 
 def _copy_file(source: Path, destination: Path) -> None:
@@ -63,6 +65,61 @@ def _family_signature(
     return tuple(signature)
 
 
+def _main_wal_signature(
+    db_path: Path,
+) -> tuple[tuple[str, bool, int, int, str], ...]:
+    """Fingerprint the durable files while SQLite's WAL locks are held."""
+    signature = []
+    for suffix in ("", "-wal"):
+        path = db_path if not suffix else db_path.with_name(db_path.name + suffix)
+        try:
+            stat = path.stat()
+            fingerprint = _file_fingerprint(path, stat.st_size)
+        except FileNotFoundError:
+            signature.append((suffix, False, 0, 0, ""))
+        else:
+            signature.append(
+                (suffix, True, stat.st_size, stat.st_mtime_ns, fingerprint)
+            )
+    return tuple(signature)
+
+
+@contextmanager
+def _windows_sqlite_wal_lock(db_path: Path) -> Iterator[None]:
+    """Briefly stop SQLite WAL writers/checkpoints through their native locks.
+
+    SQLite's Windows VFS coordinates WAL writers, checkpoints, and recovery in
+    bytes 120 through 122 of the ``-shm`` file. Taking all three bytes in one
+    non-blocking exclusive request prevents mutation of the main DB/WAL pair
+    while it is copied. Existing readers remain usable.
+    """
+    if sys.platform != "win32":
+        raise OSError("SQLite WAL locking fallback is only available on Windows")
+
+    import msvcrt
+
+    shm_path = db_path.with_name(db_path.name + "-shm")
+    handle = shm_path.open("r+b", buffering=0)
+    try:
+        handle.seek(_SQLITE_WALINDEX_LOCK_OFFSET)
+        msvcrt.locking(
+            handle.fileno(),
+            msvcrt.LK_NBLCK,
+            _SQLITE_WAL_MUTATION_LOCKS,
+        )
+        try:
+            yield
+        finally:
+            handle.seek(_SQLITE_WALINDEX_LOCK_OFFSET)
+            msvcrt.locking(
+                handle.fileno(),
+                msvcrt.LK_UNLCK,
+                _SQLITE_WAL_MUTATION_LOCKS,
+            )
+    finally:
+        handle.close()
+
+
 def read_stable_prefix(db_path: Path, size: int) -> bytes:
     """Read a DB prefix only when the live DB family stays unchanged.
 
@@ -93,14 +150,21 @@ def read_stable_prefix(db_path: Path, size: int) -> bytes:
 
 
 @contextmanager
-def snapshot_db_family(db_path: Path) -> Iterator[Path]:
+def snapshot_db_family(
+    db_path: Path,
+    *,
+    allow_active_wal: bool = False,
+) -> Iterator[Path]:
     """Yield a stable private DB copy with any ``-wal``/``-shm`` siblings.
 
     SQLCipher cannot be opened through Python's SQLite backup API before it is
     decrypted. We therefore clone the file family and require its size/mtime
     signature to be unchanged across the copy. A busy writer gets three fast
     retries instead of silently producing a main-DB/WAL mixture from different
-    moments.
+    moments. Windows callers that will authenticate every SQLCipher page may
+    explicitly opt into one further bounded strategy: freeze SQLite's WAL
+    writer/checkpoint locks, copy the main DB and WAL, and omit the rebuildable
+    ``-shm`` index so recovery must validate the WAL stream itself.
     """
     db_path = Path(db_path)
     with tempfile.TemporaryDirectory(prefix="chatlog_db_snapshot_") as tmp:
@@ -126,6 +190,34 @@ def snapshot_db_family(db_path: Path) -> Iterator[Path]:
             if before == _family_signature(db_path):
                 yield snap
                 return
+        if allow_active_wal:
+            for _attempt in range(_MAX_SNAPSHOT_ATTEMPTS):
+                for suffix in ("", *_SIDECAR_SUFFIXES):
+                    destination = (
+                        snap if not suffix else snap.with_name(snap.name + suffix)
+                    )
+                    destination.unlink(missing_ok=True)
+                try:
+                    with _windows_sqlite_wal_lock(db_path):
+                        before = _main_wal_signature(db_path)
+                        if not before[0][1]:
+                            raise FileNotFoundError(db_path)
+                        _copy_file(db_path, snap)
+                        wal = db_path.with_name(db_path.name + "-wal")
+                        if wal.is_file():
+                            _copy_file(wal, snap.with_name(snap.name + "-wal"))
+                        after = _main_wal_signature(db_path)
+                except OSError:
+                    continue
+                if before == after:
+                    yield snap
+                    return
+            raise OSError(
+                "database remained active during "
+                f"{_MAX_SNAPSHOT_ATTEMPTS} stable and "
+                f"{_MAX_SNAPSHOT_ATTEMPTS} locked snapshot attempts: "
+                f"{db_path.name}"
+            )
         raise OSError(
             f"database remained active during {_MAX_SNAPSHOT_ATTEMPTS} snapshot attempts: "
             f"{db_path.name}"
