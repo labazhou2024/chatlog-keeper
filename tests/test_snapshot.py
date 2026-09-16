@@ -1,9 +1,11 @@
 import hashlib
 import hmac
 import os
+import sqlite3
 import struct
 import sys
 import time
+from contextlib import contextmanager
 
 import pytest
 from Crypto.Cipher import AES
@@ -42,6 +44,118 @@ def test_snapshot_retries_when_family_changes_during_copy(tmp_path, monkeypatch)
 
     with snapshot_db_family(db) as snap:
         assert snap.read_bytes() == b"db"
+
+
+def test_snapshot_active_wal_fallback_freezes_writer_and_omits_shm(
+    tmp_path,
+    monkeypatch,
+):
+    db = tmp_path / "nt_msg.db"
+    db.write_bytes(b"db")
+    db.with_name(db.name + "-wal").write_bytes(b"wal")
+    db.with_name(db.name + "-shm").write_bytes(b"shm")
+    signature_calls = 0
+
+    def continuously_active(_path):
+        nonlocal signature_calls
+        signature_calls += 1
+        return (
+            ("", True, 2, signature_calls, str(signature_calls)),
+            ("-wal", True, 3, signature_calls, str(signature_calls)),
+            ("-shm", True, 3, signature_calls, str(signature_calls)),
+        )
+
+    lock_calls = []
+
+    @contextmanager
+    def fake_wal_lock(path):
+        lock_calls.append(path)
+        yield
+
+    monkeypatch.setattr(_snapshot, "_family_signature", continuously_active)
+    monkeypatch.setattr(_snapshot, "_windows_sqlite_wal_lock", fake_wal_lock)
+
+    with snapshot_db_family(db, allow_active_wal=True) as snap:
+        assert snap.read_bytes() == b"db"
+        assert snap.with_name(snap.name + "-wal").read_bytes() == b"wal"
+        assert not snap.with_name(snap.name + "-shm").exists()
+
+    assert lock_calls == [db]
+    assert signature_calls == _snapshot._MAX_SNAPSHOT_ATTEMPTS * 2
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows WAL lock contract")
+def test_windows_wal_lock_blocks_sqlite_writer_and_releases(tmp_path):
+    db = tmp_path / "live.db"
+    owner = sqlite3.connect(db)
+    try:
+        assert owner.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        owner.execute("CREATE TABLE sample(value TEXT)")
+        owner.commit()
+
+        with _snapshot._windows_sqlite_wal_lock(db):
+            contender = sqlite3.connect(db, timeout=0)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    contender.execute("INSERT INTO sample VALUES ('blocked')")
+            finally:
+                contender.close()
+
+        owner.execute("INSERT INTO sample VALUES ('released')")
+        owner.commit()
+        assert owner.execute("SELECT value FROM sample").fetchall() == [
+            ("released",)
+        ]
+    finally:
+        owner.close()
+
+
+def test_snapshot_active_wal_fallback_still_rejects_a_noncooperating_writer(
+    tmp_path,
+    monkeypatch,
+):
+    db = tmp_path / "nt_msg.db"
+    db.write_bytes(b"db")
+    db.with_name(db.name + "-wal").write_bytes(b"wal")
+    db.with_name(db.name + "-shm").write_bytes(b"shm")
+    generation = 0
+
+    def changing_signature(_path):
+        nonlocal generation
+        generation += 1
+        return (("", True, 2, generation, str(generation)),)
+
+    @contextmanager
+    def fake_wal_lock(_path):
+        yield
+
+    monkeypatch.setattr(_snapshot, "_family_signature", changing_signature)
+    monkeypatch.setattr(_snapshot, "_main_wal_signature", changing_signature)
+    monkeypatch.setattr(_snapshot, "_windows_sqlite_wal_lock", fake_wal_lock)
+
+    with pytest.raises(OSError, match="locked snapshot attempts"):
+        with snapshot_db_family(db, allow_active_wal=True):
+            pass
+
+
+def test_qq_header_skip_opts_into_active_wal_snapshot(tmp_path, monkeypatch):
+    db = tmp_path / "nt_msg.db"
+    db.write_bytes(b"H" * 1024 + b"D" * 4096)
+    db.with_name(db.name + "-wal").write_bytes(b"wal")
+    output = tmp_path / "no_header.db"
+    requested = []
+
+    @contextmanager
+    def fake_snapshot(path, *, allow_active_wal=False):
+        requested.append((path, allow_active_wal))
+        yield path
+
+    monkeypatch.setattr(_snapshot, "snapshot_db_family", fake_snapshot)
+
+    assert qq_db._skip_header(db, output)
+    assert requested == [(db, True)]
+    assert output.read_bytes() == b"D" * 4096
+    assert output.with_name(output.name + "-wal").read_bytes() == b"wal"
 
 
 def test_aggregate_snapshot_retries_wal_only_change_across_families(
