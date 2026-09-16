@@ -45,3 +45,14 @@ def test_workflows_only_use_audited_node24_action_pins() -> None:
 
     expected = {action: {pin} for action, pin in APPROVED_NODE24_ACTIONS.items()}
     assert observed == expected
+
+
+def test_setup_miniconda_v4_uses_current_auto_activate_input() -> None:
+    root = Path(__file__).resolve().parents[1]
+    workflow_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((root / ".github" / "workflows").glob("*.yml"))
+    )
+
+    assert "auto-activate-base:" not in workflow_text
+    assert workflow_text.count("auto-activate: false") == 4
