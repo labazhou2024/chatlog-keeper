@@ -119,7 +119,6 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
-using System.Threading;
 
 namespace DebugApiWx
 {
@@ -270,13 +269,87 @@ namespace DebugApiWx
         private int _hitCount;
         private readonly byte[] _calibrateKey; // 校准诊断 (env CHATLOG_CALIBRATE_KEY): 已知标尺 key, 命中时定位其真实位置
         private Dictionary<uint, ulong> _steppingThreads = new Dictionary<uint, ulong>();
-        private sealed class CandidateBatch { public Queue<byte[]> candidates = new Queue<byte[]>(); }
-        private readonly object _candidateLock = new object();
-        private readonly Queue<CandidateBatch> _candidateBatches = new Queue<CandidateBatch>();
+
+        // Bounded verifier backlog: one source is one (PID, breakpoint address).
+        // A source retains one full register/stack snapshot (<=186 addresses today),
+        // while 32 pending sources x 192 values plus one in-flight value bounds
+        // copied candidate bytes below ~200 KiB (plus collection overhead).
+        // Overflow replaces the oldest pending source/value; every returned key
+        // still passes the database HMAC oracle.
+        private const int MaxPendingCandidateSources = 32;
+        private const int MaxCandidatesPerSource = 192;
+        private const int VerificationIterationsPerSlice = 1024;
+        private sealed class CandidateBatch
+        {
+            public string sourceKey;
+            public Queue<byte[]> candidates = new Queue<byte[]>();
+            public bool scheduled;
+        }
+        private sealed class CandidateVerification : IDisposable
+        {
+            public readonly byte[] candidate;
+            private readonly byte[] page1;
+            private HMACSHA512 kdf;
+            private byte[] u;
+            private byte[] accumulator;
+            private int iterations;
+            private bool initialized;
+            public bool complete;
+            public bool verified;
+
+            public CandidateVerification(byte[] candidateBytes, byte[] databasePage)
+            { candidate = candidateBytes; page1 = databasePage; }
+
+            public void Advance(int iterationBudget)
+            {
+                if (complete) return;
+                try
+                {
+                    if (!initialized)
+                    {
+                        initialized = true;
+                        if (KeyExtractor.HmacCheck(candidate, page1))
+                        { verified = true; complete = true; return; }
+                        byte[] saltBlock = new byte[20];
+                        Array.Copy(page1, 0, saltBlock, 0, 16);
+                        saltBlock[19] = 1; // PBKDF2 block index 1, big-endian
+                        kdf = new HMACSHA512(candidate);
+                        u = kdf.ComputeHash(saltBlock);
+                        accumulator = (byte[])u.Clone();
+                        iterations = 1;
+                    }
+                    while (iterationBudget-- > 0 && iterations < 256000)
+                    {
+                        byte[] previous = u;
+                        u = kdf.ComputeHash(previous);
+                        Array.Clear(previous, 0, previous.Length);
+                        for (int i = 0; i < accumulator.Length; i++) accumulator[i] ^= u[i];
+                        iterations++;
+                    }
+                    if (iterations == 256000)
+                    {
+                        byte[] derived = new byte[32];
+                        Array.Copy(accumulator, derived, 32);
+                        verified = KeyExtractor.HmacCheck(derived, page1);
+                        Array.Clear(derived, 0, derived.Length);
+                        complete = true;
+                    }
+                }
+                catch { verified = false; complete = true; }
+                finally { if (complete) Dispose(); }
+            }
+
+            public void Dispose()
+            {
+                if (kdf != null) { kdf.Dispose(); kdf = null; }
+                if (u != null) { Array.Clear(u, 0, u.Length); u = null; }
+                if (accumulator != null) { Array.Clear(accumulator, 0, accumulator.Length); accumulator = null; }
+            }
+        }
+        private readonly Dictionary<string, CandidateBatch> _candidateBatches = new Dictionary<string, CandidateBatch>();
+        private readonly Queue<CandidateBatch> _candidateSchedule = new Queue<CandidateBatch>();
         private readonly HashSet<string> _candidateDigests = new HashSet<string>();
-        private readonly AutoResetEvent _candidateReady = new AutoResetEvent(false);
-        private Thread _candidateVerifier;
-        private bool _stopCandidateVerifier;
+        private CandidateVerification _activeVerification;
         private string _verifiedKey;
 
         public KeyExtractor(string exePath, ulong[] functionRvas, byte[] dbPage1, Action<string> log, Action<string> logVerbose, int timeoutSeconds)
@@ -319,27 +392,6 @@ namespace DebugApiWx
             catch { return false; }
         }
 
-        // Returns the candidate IF it is a valid master key for this db (raw-key
-        // <=4.0.x, OR 256000-derived 4.1.10.31+), else null. We always cache the
-        // candidate (master); decryption derives each db's page key from it.
-        private static bool IsValidMasterKey(byte[] cand, byte[] page1)
-        {
-            if (cand == null || cand.Length != 32) return false;
-            // cheap entropy gate: skip all-zero / low-entropy buffers before PBKDF2
-            int nz = 0; for (int i = 0; i < 32; i++) if (cand[i] != 0) nz++;
-            if (nz < 8) return false;
-            if (HmacCheck(cand, page1)) return true;               // raw-key mode
-            try
-            {
-                byte[] salt = new byte[16]; Array.Copy(page1, 0, salt, 0, 16);
-                byte[] derived;
-                using (var kdf = new Rfc2898DeriveBytes(cand, salt, 256000, HashAlgorithmName.SHA512))
-                    derived = kdf.GetBytes(32);
-                return HmacCheck(derived, page1);                  // password mode (4.1.10.31+)
-            }
-            catch { return false; }
-        }
-
         private static string BytesToHex(byte[] bytes)
         {
             var sb = new StringBuilder(bytes.Length * 2);
@@ -347,88 +399,138 @@ namespace DebugApiWx
             return sb.ToString();
         }
 
-        private void QueueCandidateBatch(List<byte[]> captured)
+        private static string CandidateDigest(byte[] candidate)
         {
-            var batch = new CandidateBatch();
-            lock (_candidateLock)
+            using (var sha = SHA256.Create())
+                return Convert.ToBase64String(sha.ComputeHash(candidate));
+        }
+
+        private void DropCandidate(byte[] candidate)
+        {
+            _candidateDigests.Remove(CandidateDigest(candidate));
+            Array.Clear(candidate, 0, candidate.Length);
+        }
+
+        private void EvictOldestCandidateBatch()
+        {
+            if (_candidateSchedule.Count == 0) return;
+            CandidateBatch evicted = _candidateSchedule.Dequeue();
+            evicted.scheduled = false;
+            _candidateBatches.Remove(evicted.sourceKey);
+            while (evicted.candidates.Count > 0) DropCandidate(evicted.candidates.Dequeue());
+            _logVerbose("候选校验队列达到 source 上限，已丢弃最旧待校验批次");
+        }
+
+        private void QueueCandidateBatch(uint pid, ulong breakpointAddress, List<byte[]> captured)
+        {
+            if (_verifiedKey != null)
             {
-                if (_stopCandidateVerifier || _verifiedKey != null) return;
-                foreach (byte[] candidate in captured)
+                foreach (byte[] capturedCandidate in captured)
+                    if (capturedCandidate != null) Array.Clear(capturedCandidate, 0, capturedCandidate.Length);
+                return;
+            }
+            string sourceKey = pid.ToString("X8") + ":" + breakpointAddress.ToString("X16");
+            CandidateBatch batch;
+            if (!_candidateBatches.TryGetValue(sourceKey, out batch))
+            {
+                if (_candidateBatches.Count >= MaxPendingCandidateSources) EvictOldestCandidateBatch();
+                if (_candidateBatches.Count >= MaxPendingCandidateSources)
                 {
-                    int nz = 0; for (int i = 0; i < candidate.Length; i++) if (candidate[i] != 0) nz++;
-                    if (candidate.Length != 32 || nz < 8) continue;
-                    string digest;
-                    using (var sha = SHA256.Create()) digest = Convert.ToBase64String(sha.ComputeHash(candidate));
-                    if (_candidateDigests.Add(digest)) batch.candidates.Enqueue(candidate);
+                    foreach (byte[] capturedCandidate in captured)
+                        if (capturedCandidate != null) Array.Clear(capturedCandidate, 0, capturedCandidate.Length);
+                    _logVerbose("候选校验队列无法安全淘汰旧 source，本批次已丢弃");
+                    return;
                 }
-                if (batch.candidates.Count == 0) return;
-                _candidateBatches.Enqueue(batch);
+                batch = new CandidateBatch { sourceKey = sourceKey };
+                _candidateBatches[sourceKey] = batch;
             }
-            _candidateReady.Set();
-        }
-
-        private void StartCandidateVerifier()
-        {
-            lock (_candidateLock)
+            foreach (byte[] candidate in captured)
             {
-                if (_candidateVerifier != null) return;
-                _candidateVerifier = new Thread(VerifyCandidateQueue);
-                _candidateVerifier.IsBackground = true;
-                _candidateVerifier.Name = "chatlog-wechat-key-verifier";
-                _candidateVerifier.Start();
+                if (candidate == null) continue;
+                if (candidate.Length != 32) { Array.Clear(candidate, 0, candidate.Length); continue; }
+                int nz = 0; for (int i = 0; i < candidate.Length; i++) if (candidate[i] != 0) nz++;
+                if (nz < 8) { Array.Clear(candidate, 0, candidate.Length); continue; }
+                string digest = CandidateDigest(candidate);
+                if (_candidateDigests.Contains(digest)) { Array.Clear(candidate, 0, candidate.Length); continue; }
+                if (batch.candidates.Count >= MaxCandidatesPerSource)
+                {
+                    DropCandidate(batch.candidates.Dequeue());
+                    _logVerbose("候选校验队列达到 per-source 上限，已用最新候选替换最旧值");
+                }
+                _candidateDigests.Add(digest);
+                batch.candidates.Enqueue(candidate);
+            }
+            if (!batch.scheduled && batch.candidates.Count > 0)
+            {
+                batch.scheduled = true;
+                _candidateSchedule.Enqueue(batch);
             }
         }
 
-        private void StopCandidateVerifier()
+        private byte[] TakeNextCandidate()
         {
-            Thread verifier;
-            lock (_candidateLock) { _stopCandidateVerifier = true; verifier = _candidateVerifier; }
-            _candidateReady.Set();
-            // PBKDF2 itself is not cancellable.  The background thread observes the
-            // stop before taking another candidate; do not extend the script timeout
-            // by waiting for the current derivation to finish.
-            if (verifier != null && verifier != Thread.CurrentThread) verifier.Join(100);
+            if (_candidateSchedule.Count == 0) return null;
+            CandidateBatch batch = _candidateSchedule.Dequeue();
+            batch.scheduled = false;
+            byte[] candidate = batch.candidates.Dequeue();
+            if (batch.candidates.Count > 0)
+            {
+                // Requeue before any new debug event can append work.  This makes the
+                // schedule strict round-robin even under sustained breakpoint hits.
+                batch.scheduled = true;
+                _candidateSchedule.Enqueue(batch);
+            }
+            else _candidateBatches.Remove(batch.sourceKey);
+            return candidate;
         }
 
         private string GetVerifiedKey()
         {
-            lock (_candidateLock) return _verifiedKey;
+            return _verifiedKey;
         }
 
-        private void VerifyCandidateQueue()
+        private bool HasCandidateWork()
         {
-            CandidateBatch batch = null;
-            while (true)
-            {
-                byte[] candidate = null;
-                lock (_candidateLock)
-                {
-                    if (_stopCandidateVerifier || _verifiedKey != null) return;
-                    if (_candidateBatches.Count > 0)
-                    {
-                        batch = _candidateBatches.Dequeue();
-                        candidate = batch.candidates.Dequeue();
-                    }
-                }
-                if (candidate == null) { _candidateReady.WaitOne(100); continue; }
+            return _activeVerification != null || _candidateSchedule.Count > 0;
+        }
 
-                bool verified = IsValidMasterKey(candidate, _dbPage1);
-                lock (_candidateLock)
-                {
-                    if (_stopCandidateVerifier) return;
-                    if (verified)
-                    {
-                        _verifiedKey = BytesToHex(candidate);
-                        _candidateReady.Set();
-                        return;
-                    }
-                    // Round-robin across breakpoint hits.  A large false batch from
-                    // one candidate function cannot starve the first candidates
-                    // captured at a later breakpoint.
-                    if (batch.candidates.Count > 0) _candidateBatches.Enqueue(batch);
-                }
-                batch = null;
+        private void ProcessCandidateVerificationSlice()
+        {
+            if (_verifiedKey != null) return;
+            if (_activeVerification == null)
+            {
+                byte[] next = TakeNextCandidate();
+                if (next == null) return;
+                _activeVerification = new CandidateVerification(next, _dbPage1);
             }
+            _activeVerification.Advance(VerificationIterationsPerSlice);
+            if (!_activeVerification.complete) return;
+            byte[] completedCandidate = _activeVerification.candidate;
+            if (_activeVerification.verified) _verifiedKey = BytesToHex(completedCandidate);
+            _candidateDigests.Remove(CandidateDigest(completedCandidate));
+            Array.Clear(completedCandidate, 0, completedCandidate.Length);
+            _activeVerification.Dispose();
+            _activeVerification = null;
+        }
+
+        private void ClearCandidateVerifier()
+        {
+            if (_activeVerification != null)
+            {
+                byte[] active = _activeVerification.candidate;
+                _activeVerification.Dispose();
+                _activeVerification = null;
+                _candidateDigests.Remove(CandidateDigest(active));
+                Array.Clear(active, 0, active.Length);
+            }
+            while (_candidateSchedule.Count > 0)
+            {
+                CandidateBatch batch = _candidateSchedule.Dequeue();
+                batch.scheduled = false;
+                while (batch.candidates.Count > 0) DropCandidate(batch.candidates.Dequeue());
+            }
+            _candidateBatches.Clear();
+            _candidateDigests.Clear();
         }
 
         private byte[] Read(IntPtr hProcess, ulong addr, int n)
@@ -532,17 +634,24 @@ namespace DebugApiWx
 
         private string DebugLoop()
         {
-            DEBUG_EVENT ev; bool go = true; string foundKey = null;
-            StartCandidateVerifier();
+            DEBUG_EVENT ev; bool debuggeeRunning = true; string foundKey = null;
             try
             {
-                while (go)
+                while (debuggeeRunning || HasCandidateWork())
                 {
+                    // One bounded PBKDF2 slice runs only between debug events.  No
+                    // verifier thread or disposable wait handle can outlive us.
+                    ProcessCandidateVerificationSlice();
                     foundKey = GetVerifiedKey();
-                    if (foundKey != null) { _log("master key HMAC 校验命中"); break; }
+                    if (foundKey != null && _steppingThreads.Count == 0)
+                    { _log("master key HMAC 校验命中"); break; }
                     double remainingMs = (_deadlineUtc - DateTime.UtcNow).TotalMilliseconds;
                     if (remainingMs <= 0) { _log("等待登录/密钥超时，已安全结束调试实例"); break; }
-                    uint waitMs = (uint)Math.Max(1, Math.Min(100, remainingMs));
+                    // Once the main debuggee exits, finish already-copied candidates
+                    // within the same deadline without waiting for further events.
+                    if (!debuggeeRunning) continue;
+                    uint pollCeiling = HasCandidateWork() ? 1u : 100u;
+                    uint waitMs = (uint)Math.Max(1, Math.Min(pollCeiling, remainingMs));
                     if (!Native.WaitForDebugEvent(out ev, waitMs)) { continue; }
                     uint pid = ev.dwProcessId;
                     uint cont = Native.DBG_CONTINUE;
@@ -577,7 +686,7 @@ namespace DebugApiWx
                                 if (code == Native.EXCEPTION_BREAKPOINT && known && pc.bps.ContainsKey(addr))
                                 {
                                     RestoreOriginalByte(pc, addr);
-                                    CaptureBreakpointCandidates(pc, pid, ev.dwThreadId);
+                                    CaptureBreakpointCandidates(pc, pid, ev.dwThreadId, addr);
                                     SetSingleStepForRearm(pc, ev.dwThreadId, addr);
                                 }
                                 else if (code == Native.EXCEPTION_SINGLE_STEP)
@@ -590,10 +699,13 @@ namespace DebugApiWx
                                 else if (code != Native.EXCEPTION_BREAKPOINT) { cont = Native.DBG_EXCEPTION_NOT_HANDLED; } // 交给微信自己的 SEH
                             }
                             break;
+                            case Native.EXIT_THREAD_DEBUG_EVENT:
+                                _steppingThreads.Remove(ev.dwThreadId);
+                                break;
                             case Native.EXIT_PROCESS_DEBUG_EVENT:
                             {
                                 ProcCtx pc; if (_procs.TryGetValue(pid, out pc)) { if (pc.hProcess != IntPtr.Zero) Native.CloseHandle(pc.hProcess); _procs.Remove(pid); }
-                                if (pid == _mainPid) go = false; // 主进程退出才结束
+                                if (pid == _mainPid) debuggeeRunning = false;
                             }
                             break;
                         }
@@ -607,14 +719,14 @@ namespace DebugApiWx
                 if (foundKey == null) foundKey = GetVerifiedKey();
                 return foundKey;
             }
-            finally { StopCandidateVerifier(); }
+            finally { ClearCandidateVerifier(); }
         }
 
         // Snapshot every plausible 32-byte buffer reachable from registers/stack.
-        // The background verifier applies the HMAC oracle after this debug event is
-        // continued, so an expensive false candidate cannot pause the whole client.
+        // The cooperative verifier applies the HMAC oracle in bounded slices after
+        // this debug event is continued, so a false candidate cannot pause the client.
         // No register layout is assumed; the [rdx+0x08] heuristic is tried first.
-        private void CaptureBreakpointCandidates(ProcCtx pc, uint pid, uint threadId)
+        private void CaptureBreakpointCandidates(ProcCtx pc, uint pid, uint threadId, ulong breakpointAddress)
         {
             _hitCount++;
             IntPtr hThread = Native.OpenThread(Native.THREAD_ALL_ACCESS, false, threadId);
@@ -680,8 +792,8 @@ namespace DebugApiWx
                 // 3. stack: pointers in the first 0x200 bytes from rsp
                 for (ulong off = 0; off <= 0x200; off += 8)
                     captureAddr(ReadPtr(hp, ctx.Rsp + off));
-                QueueCandidateBatch(captured);
-                _logVerbose("第" + _hitCount + "次断点已捕获 " + captured.Count + " 个候选 (PID=" + pid + "), 后台校验并继续运行…");
+                QueueCandidateBatch(pid, breakpointAddress, captured);
+                _logVerbose("第" + _hitCount + "次断点已捕获 " + captured.Count + " 个候选 (PID=" + pid + "), 分片校验并继续运行…");
             }
             finally { Native.CloseHandle(hThread); }
         }
@@ -699,7 +811,7 @@ namespace DebugApiWx
                     ctx.EFlags = ctx.EFlags | 0x100; // trap flag → 单步过被恢复的原指令
                     ctx.ContextFlags = Native.CONTEXT_CONTROL;
                     bool ok = Native.SetThreadContext(hThread, ref ctx);
-                    _steppingThreads[threadId] = addr;
+                    if (ok) _steppingThreads[threadId] = addr;
                     _logVerbose("[rearm] 设单步 T=" + threadId + " addr=0x" + addr.ToString("X") + " setctx=" + ok + " ef=0x" + ctx.EFlags.ToString("X"));
                 }
                 else { _logVerbose("[rearm] GetThreadContext 失败 T=" + threadId); }
