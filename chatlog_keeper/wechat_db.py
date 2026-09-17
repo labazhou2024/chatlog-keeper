@@ -860,7 +860,7 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
       Page 1:  [salt(16)] [AES-CBC encrypted plaintext[16:4016](4000B)] [IV(16)] [HMAC(64)]
       Page N:  [AES-CBC encrypted plaintext[0:4016](4016B)]             [IV(16)] [HMAC(64)]
 
-    enc_key is used directly as the AES key (raw-key mode, no PBKDF2).
+    Supports both raw-key mode and the password-mode master-key derivation.
     """
     PAGE_SZ = 4096
 
@@ -894,15 +894,33 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
             plain = _decrypt_wechat_page(first, page_key, first[:16], 1)
             if plain is None:
                 raise OSError("page 1 authentication failed")
+            # Native Linux WCDB may preallocate whole zero pages past the
+            # database's logical end. Only trust the size inside authenticated
+            # page 1 when SQLite's change-counter/version-valid-for rule holds.
+            # https://www.sqlite.org/fileformat2.html#in_header_database_size
+            header_pages = int.from_bytes(plain[28:32], "big")
+            logical_pages = (
+                header_pages
+                if 0 < header_pages < 0xFFFFFFFF
+                and plain[16:18] == b"\x10\x00"
+                and plain[24:28] == plain[92:96]
+                else None
+            )
             out.write(plain)
             pages = 1
+            padding_pages = 0
             while True:
                 page = f.read(PAGE_SZ)
                 if not page:
                     break
                 if len(page) != PAGE_SZ:
                     raise OSError("encrypted DB has a truncated trailing page")
-                page_no = pages + 1
+                page_no = pages + padding_pages + 1
+                if logical_pages is not None and page_no > logical_pages:
+                    if any(page):
+                        raise OSError("nonzero data beyond authenticated database size")
+                    padding_pages += 1
+                    continue
                 plain = _decrypt_wechat_page(
                     page,
                     page_key,
@@ -913,6 +931,8 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
                     raise OSError(f"page {page_no} authentication failed")
                 out.write(plain)
                 pages += 1
+            if logical_pages is not None and pages < logical_pages:
+                raise OSError("encrypted DB is shorter than authenticated database size")
 
         wal_frames = _apply_wechat_wal(
             db_path.with_name(db_path.name + "-wal"),
