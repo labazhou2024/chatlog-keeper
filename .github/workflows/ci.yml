@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-15]
+        os: [windows-latest, macos-15, ubuntu-24.04]
         python-version: ["3.9", "3.11", "3.12"]
         exclude:
           # Python 3.11 is exercised by the release-identical locked-runtime
@@ -25,6 +25,8 @@ jobs:
           - os: windows-latest
             python-version: "3.11"
           - os: macos-15
+            python-version: "3.11"
+          - os: ubuntu-24.04
             python-version: "3.11"
     steps:
       - name: Check out source
@@ -68,6 +70,38 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r packaging/release-requirements-macos.txt
+          python -m pip install --disable-pip-version-check --no-deps --no-build-isolation .
+          python -m pip check
+      - name: Test
+        run: python -m pytest -q
+      - name: Compile entry points
+        run: python -m compileall -q chatlog_keeper tests
+
+  linux-release-runtime:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up exact release Python and SQLite
+        uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5 # v4.0.1
+        with:
+          miniconda-version: "py311_26.5.3-2"
+          activate-environment: chatlog-release-linux
+          environment-file: packaging/linux-release-environment.yml
+          auto-activate: false
+          channels: defaults
+          channel-priority: strict
+      - name: Verify exact runtime
+        run: python -c "import os, platform, sqlite3, sys; assert sys.version_info[:3] == (3, 11, 15); assert sqlite3.sqlite_version == '3.53.2'; assert sys.prefix == os.environ['CONDA_PREFIX']; assert os.environ.get('CONDA_DEFAULT_ENV') == 'chatlog-release-linux'; assert platform.machine() == 'x86_64'"
+      - name: Install the release-locked dependency graph
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r packaging/release-requirements-linux.txt
           python -m pip install --disable-pip-version-check --no-deps --no-build-isolation .
           python -m pip check
       - name: Test

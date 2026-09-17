@@ -345,6 +345,15 @@ def _macos_executable() -> bytes:
     return struct.pack("<II", 0xFEEDFACF, 0x0100000C) + bytes(504)
 
 
+def _linux_executable() -> bytes:
+    payload = bytearray(512)
+    payload[:4] = b"\x7fELF"
+    payload[4] = 2
+    payload[5] = 1
+    struct.pack_into("<H", payload, 18, 62)
+    return bytes(payload)
+
+
 @pytest.mark.parametrize(
     ("platform", "arch", "name", "payload", "offset", "replacement", "message"),
     [
@@ -384,6 +393,24 @@ def _macos_executable() -> bytes:
             bytes(4),
             "Mach-O 64 arm64",
         ),
+        (
+            "linux",
+            "x86_64",
+            "chatlog-keeper-linux-x86_64",
+            _linux_executable(),
+            18,
+            struct.pack("<H", 3),
+            "ELF64 x86_64",
+        ),
+        (
+            "linux",
+            "x86_64",
+            "chatlog-keeper-linux-x86_64",
+            _linux_executable(),
+            4,
+            b"\x01",
+            "ELF64 x86_64",
+        ),
     ],
 )
 def test_executable_header_gate_rejects_architecture_or_format_spoofing(
@@ -421,12 +448,15 @@ def test_descriptor_is_canonical_and_binds_both_artifacts_to_one_source_bundle(
     source_bundle.write_bytes(b"canonical source bundle")
     windows = tmp_path / "chatlog-keeper.exe"
     macos = tmp_path / "chatlog-keeper-macos-arm64"
+    linux = tmp_path / "chatlog-keeper-linux-x86_64"
     windows.write_bytes(_windows_executable())
     macos.write_bytes(_macos_executable())
+    linux.write_bytes(_linux_executable())
     windows_descriptor = tmp_path / (
         f"chatlog-keeper-v{version}-windows-x86_64.artifact.json"
     )
     macos_descriptor = tmp_path / f"chatlog-keeper-v{version}-macos-arm64.artifact.json"
+    linux_descriptor = tmp_path / f"chatlog-keeper-v{version}-linux-x86_64.artifact.json"
 
     release_metadata.build_artifact_descriptor(
         commit=commit,
@@ -446,11 +476,22 @@ def test_descriptor_is_canonical_and_binds_both_artifacts_to_one_source_bundle(
         source_bundle=source_bundle,
         output=macos_descriptor,
     )
+    release_metadata.build_artifact_descriptor(
+        commit=commit,
+        version=version,
+        target_platform="linux",
+        target_arch="x86_64",
+        executable=linux,
+        source_bundle=source_bundle,
+        output=linux_descriptor,
+    )
 
     windows_payload = json.loads(windows_descriptor.read_text(encoding="utf-8"))
     macos_payload = json.loads(macos_descriptor.read_text(encoding="utf-8"))
+    linux_payload = json.loads(linux_descriptor.read_text(encoding="utf-8"))
     assert windows_descriptor.read_bytes() == release_metadata._canonical_json(windows_payload)
     assert macos_descriptor.read_bytes() == release_metadata._canonical_json(macos_payload)
+    assert linux_descriptor.read_bytes() == release_metadata._canonical_json(linux_payload)
     assert windows_payload == {
         "approved": True,
         "commit": commit,
@@ -475,6 +516,13 @@ def test_descriptor_is_canonical_and_binds_both_artifacts_to_one_source_bundle(
     assert macos_payload["source_bundle_sha256"] == windows_payload["source_bundle_sha256"]
     assert macos_payload["commit"] == windows_payload["commit"]
     assert macos_payload["protocol_capabilities"] == windows_payload["protocol_capabilities"]
+    assert linux_payload["source_bundle"] == windows_payload["source_bundle"]
+    assert linux_payload["source_bundle_sha256"] == windows_payload["source_bundle_sha256"]
+    assert linux_payload["commit"] == windows_payload["commit"]
+    assert linux_payload["target_platform"] == "linux"
+    assert linux_payload["target_arch"] == "x86_64"
+    assert linux_payload["executable"] == "chatlog-keeper-linux-x86_64"
+    assert linux_payload["sha256"] == hashlib.sha256(linux.read_bytes()).hexdigest()
     release_metadata.verify_sha256_sidecar(
         windows_descriptor,
         windows_descriptor.with_name(windows_descriptor.name + ".sha256"),
@@ -482,6 +530,10 @@ def test_descriptor_is_canonical_and_binds_both_artifacts_to_one_source_bundle(
     release_metadata.verify_sha256_sidecar(
         macos_descriptor,
         macos_descriptor.with_name(macos_descriptor.name + ".sha256"),
+    )
+    release_metadata.verify_sha256_sidecar(
+        linux_descriptor,
+        linux_descriptor.with_name(linux_descriptor.name + ".sha256"),
     )
 
 

@@ -8,6 +8,7 @@ Produces one self-contained executable (``.exe`` on Windows) for host apps /
 scheduled tasks to invoke. The Windows PowerShell debugger scripts plus the
 macOS scanner/capture sources are bundled under ``chatlog_keeper/scripts`` so
 the platform key helpers can find them through ``sys._MEIPASS`` when frozen.
+Linux scanner/capture sources are bundled the same way.
 """
 import os
 import sys as _sys
@@ -29,6 +30,8 @@ datas = [
     (os.path.join(SCRIPTS_SRC, "windows_wechat_get_key.ps1"), SCRIPTS_DST),
     (os.path.join(SCRIPTS_SRC, "macos_memory_scan.c"), SCRIPTS_DST),
     (os.path.join(SCRIPTS_SRC, "macos_wechat_key_capture.c"), SCRIPTS_DST),
+    (os.path.join(SCRIPTS_SRC, "linux_memory_scan.c"), SCRIPTS_DST),
+    (os.path.join(SCRIPTS_SRC, "linux_wechat_key_capture.c"), SCRIPTS_DST),
 ]
 hiddenimports = []
 
@@ -94,6 +97,59 @@ if _sys.platform == "darwin":
             + (_capture_compiled.stderr or "").strip()
         )
     datas.append((_mac_capture, SCRIPTS_DST))
+
+if _sys.platform.startswith("linux"):
+    _linux_helper_dir = os.path.join(ROOT, "build_pyi", "linux-helper")
+    os.makedirs(_linux_helper_dir, exist_ok=True)
+    _linux_helper = os.path.join(_linux_helper_dir, "linux_memory_scan")
+    _linux_compiled = _subprocess.run(
+        [
+            "cc",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            os.path.join(SCRIPTS_SRC, "linux_memory_scan.c"),
+            "-o",
+            _linux_helper,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if _linux_compiled.returncode != 0:
+        raise RuntimeError(
+            "failed to compile Linux key helper: "
+            + (_linux_compiled.stderr or "").strip()
+        )
+    datas.append((_linux_helper, SCRIPTS_DST))
+
+    _linux_capture = os.path.join(
+        _linux_helper_dir,
+        "linux_wechat_key_capture.so",
+    )
+    _linux_capture_compiled = _subprocess.run(
+        [
+            "cc",
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            os.path.join(SCRIPTS_SRC, "linux_wechat_key_capture.c"),
+            "-o",
+            _linux_capture,
+            "-ldl",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if _linux_capture_compiled.returncode != 0:
+        raise RuntimeError(
+            "failed to compile Linux WeChat startup capture helper: "
+            + (_linux_capture_compiled.stderr or "").strip()
+        )
+    datas.append((_linux_capture, SCRIPTS_DST))
 
 # ── conda-env C-extension runtime DLLs (Library/bin) ────────────────────────
 # A conda build's _ctypes.pyd / _ssl / _hashlib / lzma / bz2 / sqlite3 load their

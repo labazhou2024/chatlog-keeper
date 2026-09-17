@@ -47,6 +47,7 @@ dist_exe/
 build_pyi*/
 dist_exe*/
 dist_macos*/
+dist_linux*/
 dist_source*/
 dist_metadata*/
 
