@@ -51,4 +51,4 @@ include = ["chatlog_keeper*"]
 
 [tool.setuptools.package-data]
 # Bundle the PowerShell debugger scripts used by `extract-key --method active`.
-chatlog_keeper = ["scripts/*.ps1", "scripts/*.c", "scripts/*.so"]
+chatlog_keeper = ["scripts/*.ps1", "scripts/*.c", "scripts/*.so", "scripts/*.py"]

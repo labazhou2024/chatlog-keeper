@@ -1554,6 +1554,11 @@ def _extract_key(
                     "Linux could not compile the private WeChat startup observer; "
                     "install gcc or clang (build-essential) and retry"
                 )
+            if reason == "capture_debugger_missing":
+                return (
+                    "this Linux WeChat build uses an internal WCDB KDF; "
+                    "install gdb with Python support and retry Active Key"
+                )
             if reason == "verification_db_missing":
                 return (
                     "no local message database was found for HMAC verification; "

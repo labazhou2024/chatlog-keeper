@@ -51,7 +51,7 @@
 | Windows | QQ NTQQ 9.9.x | 每库口令 | 被动扫描或一次性调试器 |
 | macOS arm64 | 微信 4.1.11（269136）、4.1.12（269364）、4.1.13（269579） | 由 page-1 HMAC 自动选择 raw/password 模式 | 被动扫描；主动流程仅在签名预检通过时可用 |
 | macOS arm64 | QQ 6.9.95（build 36385） | 每库口令 | 被动扫描；主动流程仅在签名预检通过时可用 |
-| Linux x86_64 | 官方微信 4.x Universal（`.deb` / AppImage） | 由 page-1 HMAC 自动选择 raw/password 模式 | 子进程扫描；可选 LD_PRELOAD 观察器；`set-key` 兜底 |
+| Linux x86_64 | 官方原生微信 4.1.13.9（`.deb`，实测 ELF 身份见 [Linux 说明](docs/linux.zh.md)） | password 模式，page-1 HMAC 已验证 | 启动期内部 WCDB KDF 硬件断点；需要带 Python 支持的 GDB |
 | Linux x86_64 | 官方 QQ NT（`.deb`） | 每库口令 | spawn 后扫描子进程；Yama 下被动扫描常被拒绝 |
 
 **微信 4.1.10.31**（2026-05-27 发布）把明文 key 移出了进程堆，因此被动内存扫描
@@ -93,6 +93,7 @@ python -m pip install .
 `chatlog-keeper-linux-x86_64`。Mac / Linux 独立包已经内置只读 helper；源码安装
 会在首次取 key 时编译这段可审计的 C helper，因此 macOS 需要 Xcode Command Line
 Tools，Linux 需要 `build-essential`。
+Linux 微信的内部 KDF 捕获还需要系统安装带 Python 支持的 GDB。
 
 请从同一个 [GitHub Release](https://github.com/labazhou2024/chatlog-keeper/releases)
 下载可执行文件及其对应的 `.sha256`，保留原始文件名并在运行前校验：

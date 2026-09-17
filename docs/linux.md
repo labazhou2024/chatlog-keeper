@@ -17,8 +17,9 @@ The normal export path is read-only with respect to both chat clients. It:
 5. writes only the requested JSON/HTML export.
 
 Normal export and passive extraction do not inject code. Explicit WeChat active
-extraction may load only the fixed LD_PRELOAD observer described below into a
-child process that this tool launched. The tool itself does not send messages
+extraction uses a GDB hardware breakpoint for a recognized internal WCDB KDF,
+or may load the fixed LD_PRELOAD observer when dynamic symbols are available.
+Both paths observe only a child process launched by this tool. It does not send messages
 or call Tencent APIs, and it does not modify the package under `/opt/wechat`
 or `/opt/QQ`. The launched official client may still perform its normal session
 authentication and network activity.
@@ -58,20 +59,41 @@ Ubuntu desktop it usually fails closed with `process_access_denied`.
 - quit the daily WeChat or QQ client normally and wait for it to exit;
 - the tool launches the official binary (`/opt/wechat/wechat` or `/opt/QQ/qq`)
   as its own child, so Yama still allows the parent to read that process;
+- if paired internal WCDB KDF instruction signatures match, GDB manages the
+  child from startup and computes its hardware breakpoint from ELF mappings
+  and ASLR, then checks the loaded instructions again;
+- internal KDF candidates require a 32-byte password, 16-byte salt, 256000
+  iterations, 32-byte output, and the SHA-512 algorithm parameter; they travel
+  through a private `0600` FIFO to the existing HMAC verifier;
 - WeChat may also load a locally built observer through `LD_PRELOAD` when
   `sqlite3_key` / OpenSSL PBKDF2 are dynamically resolved; candidates go
   through a same-user `0600` FIFO and are never written to logs;
-- if those symbols are not exported, the tool scans the child heap and, if
+- if internal signatures do not match and those symbols are not exported,
+  the compatibility path for older builds scans the child heap and, if
   needed, a small compiled `process_vm_readv` / ptrace helper;
 - Python discards every candidate that fails the real database HMAC oracle.
 
 Do not run the tool as root to bypass Yama. Use Active Key or `set-key`.
 
-Official Linux WeChat is currently 4.1.x. Those builds often no longer keep the
-legacy `x'<64hex>...'` raw-key blob in the heap. If Active Key cannot observe a
-candidate that HMAC-verifies, paste a DB-verified key with `set-key`. Builds
-that have not been exercised on a real Ubuntu install are not listed as
-verified in the README.
+Official native Linux WeChat **4.1.13.9 x86_64** was tested locally: the internal
+KDF hardware breakpoint captured a 32-byte master key, and `_verify_key_v4`
+passed for the target message database and all six message shards. Password
+mode matched; raw-key mode did not. The integrated active flow also passed
+capture, verification, account-cache storage, and child-exit checks. This does
+not establish support for other 4.1.x builds.
+
+The observation point is the main ELF's SQLCipher codec calling its crypto
+provider KDF. The locator requires paired password-derivation and HMAC-key
+derivation instruction sequences in executable segments and rejects ambiguous
+matches. It does not depend on exported symbols, fixed RVAs, or legacy heap
+hex strings. The tested binary has:
+
+- ELF Build ID: `d16278a416e000526fd22aec59973e54f91291e4`
+- ELF SHA-256: `91c2e3237ba69acadb23a84bdde360c714719889756aed92e9e45785c3d97010`
+
+Untested builds are not marked verified. If signatures are incompatible or no
+candidate HMAC-verifies, use `set-key` with an independently verified key.
+The active flow exits its spawned client on completion or cancellation.
 
 Flatpak: data-root discovery and `set-key` / cached exports work. Reading a
 sandboxed process usually fails closed; install the official `.deb` for Active
@@ -103,6 +125,9 @@ chatlog-keeper qq --days 7 --out ./out
 A source install compiles the tiny C helpers on first use and therefore needs
 `gcc` or `clang` (`sudo apt install build-essential`). The standalone
 `chatlog-keeper-linux-x86_64` release already contains the compiled helpers.
+The internal KDF path additionally requires system `gdb` with Python support
+(`sudo apt install gdb`), including for standalone releases. It does not use
+Frida, change Yama, or require root.
 
 ## Troubleshooting
 
@@ -114,6 +139,11 @@ A source install compiles the tiny C helpers on first use and therefore needs
   `--data-root` and use `set-key`.
 - `helper_compile_failed` / `capture_compile_failed`: install
   `build-essential` and retry. The standalone release does not need a compiler.
+- `capture_debugger_missing`: install `gdb` with Python support and retry.
+- `capture_image_changed`: the executable changed during startup or loaded
+  instructions did not match; quit and retry without reusing old addresses.
+- `capture_timeout`: no candidate HMAC-verified before the deadline; log in
+  inside the tool-launched window instead of separately opening the daily client.
 - data root not found: pass the `xwechat_files` folder or `~/.config/QQ` with
   `--data-root`.
 - Flatpak extract-key failed: use the `.deb` client, or `set-key` against the

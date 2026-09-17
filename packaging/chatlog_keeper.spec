@@ -32,6 +32,7 @@ datas = [
     (os.path.join(SCRIPTS_SRC, "macos_wechat_key_capture.c"), SCRIPTS_DST),
     (os.path.join(SCRIPTS_SRC, "linux_memory_scan.c"), SCRIPTS_DST),
     (os.path.join(SCRIPTS_SRC, "linux_wechat_key_capture.c"), SCRIPTS_DST),
+    (os.path.join(SCRIPTS_SRC, "linux_wechat_gdb_capture.py"), SCRIPTS_DST),
 ]
 hiddenimports = []
 

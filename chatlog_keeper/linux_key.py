@@ -2,14 +2,15 @@
 
 Passive scans use ``process_vm_readv``. Active extraction launches the official
 binary as a child so Yama ``ptrace_scope=1`` still allows the parent to read
-it. WeChat may also load a locally built LD_PRELOAD observer when those
-symbols are dynamically resolved. Every candidate is HMAC-verified by the
-caller before it can be cached.
+it. Recognized internal WeChat KDFs use a startup GDB hardware breakpoint;
+dynamically resolved symbols can use the LD_PRELOAD observer. Every candidate
+is HMAC-verified before it can be cached.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import json
 import os
 import signal
 import stat
@@ -29,6 +30,11 @@ from chatlog_keeper.core._linux import (
 )
 from chatlog_keeper.core._path_resolver import data_dir
 from chatlog_keeper.core._windows_process_memory import ProcessMemoryAccessDenied
+from chatlog_keeper.linux_wechat_capture import (
+    KDFBoundary,
+    PASSWORD_KDF,
+    locate_kdf_boundary,
+)
 
 
 _LAST_ERROR = ""
@@ -574,7 +580,13 @@ def extract_wechat_key_active(
 ) -> Optional[bytes]:
     """Spawn official Linux WeChat and collect a verified master key."""
     clear_last_error()
+    executable = official_client_executable("wechat")
+    boundary = locate_kdf_boundary(executable) if executable is not None else None
     if analyze_only:
+        if boundary is not None:
+            if shutil_which("gdb") is None:
+                _set_error("capture_debugger_missing")
+            return None
         ensure_helper()
         ensure_capture_library()
         return None
@@ -588,7 +600,11 @@ def extract_wechat_key_active(
         page1 = wechat_db._read_stable_page1(resolved)
         return bool(page1 and wechat_db._verify_key_v4(candidate, page1))
 
-    executable = official_client_executable("wechat")
+    if boundary is not None:
+        return _extract_wechat_key_gdb(
+            executable, boundary, verify, timeout=timeout,
+            cancel_requested=cancel_requested,
+        )
     capture_library = None
     if executable is not None and wechat_exports_capture_symbols(executable):
         capture_library = ensure_capture_library()
@@ -636,3 +652,116 @@ def extract_wechat_key_active(
         terminate_spawned(pid)
         if channel is not None:
             channel.close()
+
+
+def _extract_wechat_key_gdb(
+    executable: Path,
+    boundary: KDFBoundary,
+    verify: Callable[[bytes], bool],
+    *,
+    timeout: int,
+    cancel_requested: Optional[Callable[[], bool]],
+) -> Optional[bytes]:
+    """Observe only a debugger-spawned child, with bounded, private IPC."""
+    if daily_client_running("wechat"):
+        _set_error("daily_client_single_instance_conflict")
+        return None
+    debugger = shutil_which("gdb")
+    if debugger is None:
+        _set_error("capture_debugger_missing")
+        return None
+    script = _scripts_dir() / "linux_wechat_gdb_capture.py"
+    if not script.is_file():
+        _set_error("capture_source_missing")
+        return None
+    if cancel_requested is not None and cancel_requested():
+        return None
+    channel = create_capture_channel()
+    if channel is None:
+        return None
+    proc = None
+    tmp = None
+    try:
+        tmp = tempfile.TemporaryDirectory(prefix="wechat-gdb-", dir=channel.path.parent)
+        status_path = Path(tmp.name) / "status.json"
+        status_path.touch(mode=0o600)
+        config = {
+            "executable": str(executable.resolve()),
+            "image_sha256": boundary.image_sha256,
+            "virtual_address": boundary.virtual_address,
+            "signature_address": boundary.signature_address,
+            "signature": PASSWORD_KDF.hex(),
+            "fifo": str(channel.path), "status_path": str(status_path),
+        }
+        env = os.environ.copy()
+        env["CHATLOG_KEEPER_GDB_CONFIG"] = json.dumps(config)
+        proc = subprocess.Popen(
+            [debugger, "--quiet", "--nx", "--batch",
+             "-iex", "set auto-load off", "-iex", "set debuginfod enabled off",
+             "-x", str(script), "--args", str(executable)],
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        deadline = time.monotonic() + max(1, timeout)
+        pending: list[bytes] = []
+        while time.monotonic() < deadline:
+            if cancel_requested is not None and cancel_requested():
+                return None
+            # Observe exit before draining the FIFO, so a final candidate
+            # written just before exit cannot be lost to a poll/read race.
+            finished = proc.poll() is not None
+            for candidate in channel.read_candidates():
+                if candidate not in pending:
+                    pending.append(candidate)
+            if channel.invalid or len(pending) > 64:
+                _set_error("capture_channel_invalid")
+                return None
+            for candidate in pending:
+                # Refresh the stable page: a transient writer may have
+                # prevented verification on the previous poll.
+                if verify(candidate) and verify(candidate):
+                    return candidate
+            if finished:
+                try:
+                    status = json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    status = {}
+                reason = status.get("error") if isinstance(status, dict) else None
+                allowed_errors = {
+                    "capture_image_changed", "capture_image_mapping_failed",
+                    "capture_channel_prepare_failed", "capture_candidate_limit",
+                    "capture_channel_write_failed", "capture_observation_failed",
+                    "capture_debugger_failed",
+                }
+                _set_error(
+                    reason if isinstance(reason, str) and reason in allowed_errors
+                    else "capture_client_exited"
+                )
+                return None
+            time.sleep(0.1)
+        _set_error("capture_timeout")
+        return None
+    except OSError:
+        _set_error("capture_debugger_launch_failed")
+        return None
+    finally:
+        if proc is not None:
+            _stop_capture_debugger(proc)
+        channel.close()
+        if tmp is not None:
+            tmp.cleanup()
+
+
+def _stop_capture_debugger(proc: subprocess.Popen) -> None:
+    """Let the GDB script kill its own inferior before escalating shutdown."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        if proc.poll() is not None:
+            return
+        try:
+            proc.send_signal(sig)
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except OSError:
+            return

@@ -49,6 +49,7 @@ def test_wechat_active_skips_preload_without_exported_symbols(monkeypatch, tmp_p
         linux_key, "official_client_executable", lambda _source: Path("/opt/wechat/wechat")
     )
     monkeypatch.setattr(linux_key, "wechat_exports_capture_symbols", lambda _exe: False)
+    monkeypatch.setattr(linux_key, "locate_kdf_boundary", lambda _exe: None)
     monkeypatch.setattr(linux_key, "ensure_capture_library", lambda: Path("/tmp/should-not-load.so"))
     monkeypatch.setattr(linux_key, "create_capture_channel", lambda: pytest.fail("no FIFO"))
     monkeypatch.setattr(linux_key, "spawn_official_client", _spawn)
