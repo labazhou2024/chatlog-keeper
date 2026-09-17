@@ -267,6 +267,9 @@ def _get_weixin_pids() -> list:
     if sys.platform == "darwin":
         from chatlog_keeper.core._macos import process_pids
         return process_pids(("WeChat", "Weixin"))
+    if sys.platform.startswith("linux"):
+        from chatlog_keeper.core._linux import process_pids
+        return process_pids(("wechat", "WeChat", "weixin"))
 
     # A 5s tasklist timeout was too tight on loaded systems (caused a false
     # "Weixin.exe not running" when many Weixin instances + concurrent Python
@@ -324,6 +327,9 @@ def find_weixin_data_root() -> Optional[Path]:
     if sys.platform == "darwin":
         from chatlog_keeper.core._macos import wechat_data_roots
         candidates.extend(wechat_data_roots())
+    elif sys.platform.startswith("linux"):
+        from chatlog_keeper.core._linux import wechat_data_roots
+        candidates.extend(wechat_data_roots())
     else:
         for drive in all_drive_roots():
             candidates.append(drive / "wechat files" / "xwechat_files")
@@ -358,6 +364,7 @@ def find_wxid_dirs(data_root: Path) -> list:
                 dirs.append(item)
     except OSError as exc:
         logger.warning("Failed to scan WeChat account directories: %s", type(exc).__name__)
+    dirs.sort(key=lambda item: item.name)
     return dirs
 
 
@@ -602,6 +609,48 @@ def _read_stable_page1(db_path: Path) -> Optional[bytes]:
         return None
 
 
+def _scan_linux_memory_for_key(
+    pid: int,
+    db_path: Path = None,
+    timeout_s: Optional[float] = None,
+) -> Optional[bytes]:
+    """Scan a Linux WeChat process with ``process_vm_readv``.
+
+    Yama denials become :class:`ProcessMemoryAccessDenied`. Candidates still
+    have to pass the page-1 HMAC oracle before they are returned.
+    """
+    from chatlog_keeper.core._linux_process_memory import iter_process_memory_chunks
+
+    db_page1 = None
+    if db_path and Path(db_path).is_file():
+        db_page1 = _read_stable_page1(Path(db_path))
+    hex_key_re = re.compile(rb"x'([0-9a-fA-F]{64,192})'")
+    hex_cstring_re = re.compile(rb"(?<![0-9a-fA-F])([0-9a-fA-F]{64})(?=\x00)")
+    try:
+        for chunk in iter_process_memory_chunks(pid, timeout_s=timeout_s):
+            for match in hex_key_re.finditer(chunk):
+                candidate = bytes.fromhex(match.group(1).decode("ascii")[:64])
+                if db_page1:
+                    if _verify_key_v4(candidate, db_page1):
+                        logger.info("Key verified from Linux WeChat process memory")
+                        return candidate
+                else:
+                    return candidate
+            if not db_page1:
+                continue
+            for match in hex_cstring_re.finditer(chunk):
+                candidate = bytes.fromhex(match.group(1).decode("ascii"))
+                if _verify_key_v4(candidate, db_page1):
+                    logger.info("Key verified from Linux WeChat passphrase candidate")
+                    return candidate
+    except ProcessMemoryAccessDenied:
+        raise
+    except Exception as exc:
+        logger.error("Linux WeChat memory scan error for PID %s: %s", pid, exc)
+        return None
+    return None
+
+
 def _scan_memory_for_key(pid: int, db_path: Path = None,
                          timeout_s: Optional[float] = None) -> Optional[bytes]:
     """
@@ -625,6 +674,8 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
             elevate=False,
             timeout=max(1, int(timeout_s or 120)),
         )
+    if sys.platform.startswith("linux"):
+        return _scan_linux_memory_for_key(pid, db_path=db_path, timeout_s=timeout_s)
 
     kernel32 = _windows_kernel32()
     PROCESS_VM_READ = 0x0010
@@ -809,7 +860,7 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
       Page 1:  [salt(16)] [AES-CBC encrypted plaintext[16:4016](4000B)] [IV(16)] [HMAC(64)]
       Page N:  [AES-CBC encrypted plaintext[0:4016](4016B)]             [IV(16)] [HMAC(64)]
 
-    enc_key is used directly as the AES key (raw-key mode, no PBKDF2).
+    Supports both raw-key mode and the password-mode master-key derivation.
     """
     PAGE_SZ = 4096
 
@@ -843,15 +894,33 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
             plain = _decrypt_wechat_page(first, page_key, first[:16], 1)
             if plain is None:
                 raise OSError("page 1 authentication failed")
+            # Native Linux WCDB may preallocate whole zero pages past the
+            # database's logical end. Only trust the size inside authenticated
+            # page 1 when SQLite's change-counter/version-valid-for rule holds.
+            # https://www.sqlite.org/fileformat2.html#in_header_database_size
+            header_pages = int.from_bytes(plain[28:32], "big")
+            logical_pages = (
+                header_pages
+                if 0 < header_pages < 0xFFFFFFFF
+                and plain[16:18] == b"\x10\x00"
+                and plain[24:28] == plain[92:96]
+                else None
+            )
             out.write(plain)
             pages = 1
+            padding_pages = 0
             while True:
                 page = f.read(PAGE_SZ)
                 if not page:
                     break
                 if len(page) != PAGE_SZ:
                     raise OSError("encrypted DB has a truncated trailing page")
-                page_no = pages + 1
+                page_no = pages + padding_pages + 1
+                if logical_pages is not None and page_no > logical_pages:
+                    if any(page):
+                        raise OSError("nonzero data beyond authenticated database size")
+                    padding_pages += 1
+                    continue
                 plain = _decrypt_wechat_page(
                     page,
                     page_key,
@@ -862,6 +931,8 @@ def _decrypt_db_v4_snapshot(db_path: Path, enc_key: bytes, output_path: Path) ->
                     raise OSError(f"page {page_no} authentication failed")
                 out.write(plain)
                 pages += 1
+            if logical_pages is not None and pages < logical_pages:
+                raise OSError("encrypted DB is shorter than authenticated database size")
 
         wal_frames = _apply_wechat_wal(
             db_path.with_name(db_path.name + "-wal"),

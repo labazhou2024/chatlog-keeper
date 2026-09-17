@@ -230,6 +230,7 @@ def test_windows_qq_transcript_key_is_rechecked_against_selected_database(
     database.write_bytes(b"encrypted")
     candidate = "0123456789abcdef"
     monkeypatch.setattr(ak, "_is_macos_host", lambda: False)
+    monkeypatch.setattr(ak, "_is_linux_host", lambda: False)
     monkeypatch.setattr(ak, "_is_windows_host", lambda: True)
     monkeypatch.setattr(ak, "qq_key_script", lambda: tmp_path / "bundled.ps1")
     monkeypatch.setattr(

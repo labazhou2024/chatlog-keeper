@@ -1185,6 +1185,11 @@ def _is_macos_host() -> bool:
     return sys.platform == "darwin"
 
 
+def _is_linux_host() -> bool:
+    """Return whether this process is running on Linux."""
+    return sys.platform.startswith("linux")
+
+
 def extract_qq_key_active(*, wrapper_node: Optional[str] = None,
                           db_path: Optional[str] = None,
                           analyze_only: bool = False,
@@ -1302,6 +1307,18 @@ def extract_qq_key_active(*, wrapper_node: Optional[str] = None,
         if not terminate_debug_copy("qq", debug_pid):
             return None
         return result
+    if _is_linux_host():
+        if analyze_only:
+            from chatlog_keeper.linux_key import ensure_helper
+            ensure_helper()
+            return None
+        from chatlog_keeper.linux_key import extract_qq_passphrase_active
+        return extract_qq_passphrase_active(
+            db_path=db_path,
+            timeout=timeout,
+            analyze_only=False,
+            cancel_requested=_cancel_requested,
+        )
     if not _is_windows_host():
         logger.warning("active QQ extraction is Windows-only")
         return None
@@ -1600,6 +1617,19 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
         if not debug_pid or not process_clean or not channel_clean:
             return None
         return result
+    if _is_linux_host():
+        if analyze_only:
+            from chatlog_keeper.linux_key import ensure_capture_library, ensure_helper
+            ensure_helper()
+            ensure_capture_library()
+            return None
+        from chatlog_keeper.linux_key import extract_wechat_key_active as linux_wechat_active
+        return linux_wechat_active(
+            db_path=db_path,
+            timeout=timeout,
+            analyze_only=False,
+            cancel_requested=_cancel_requested,
+        )
     if not _is_windows_host():
         logger.warning("active WeChat extraction is Windows-only")
         return None

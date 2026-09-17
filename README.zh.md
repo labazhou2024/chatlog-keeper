@@ -39,7 +39,8 @@
 - **QQ**：导出 NTQQ 本地聊天记录
 - **微信**：导出 WeChat 本地聊天记录
 - **微信图片**：把本地 `.dat` 加密图片还原成 `jpg` / `png`
-- **Windows + macOS**：Windows 11 与 Apple Silicon Mac 使用同一套 CLI 和导出格式
+- **Windows + macOS + Linux**：Windows 11、Apple Silicon Mac 与官方 Ubuntu/Debian
+  微信 / QQ 使用同一套 CLI 和导出格式
 
 ## 支持的版本
 
@@ -50,6 +51,8 @@
 | Windows | QQ NTQQ 9.9.x | 每库口令 | 被动扫描或一次性调试器 |
 | macOS arm64 | 微信 4.1.11（269136）、4.1.12（269364）、4.1.13（269579） | 由 page-1 HMAC 自动选择 raw/password 模式 | 被动扫描；主动流程仅在签名预检通过时可用 |
 | macOS arm64 | QQ 6.9.95（build 36385） | 每库口令 | 被动扫描；主动流程仅在签名预检通过时可用 |
+| Linux x86_64 | 官方原生微信 4.1.13.9（`.deb`，实测 ELF 身份见 [Linux 说明](docs/linux.zh.md)） | password 模式，page-1 HMAC 已验证 | 启动期内部 WCDB KDF 硬件断点；需要带 Python 支持的 GDB |
+| Linux x86_64 | 官方 QQ NT（`.deb`） | 每库口令 | spawn 后扫描子进程；Yama 下被动扫描常被拒绝 |
 
 **微信 4.1.10.31**（2026-05-27 发布）把明文 key 移出了进程堆，因此被动内存扫描
 ——多数现有工具依赖的方式——在这些版本上**取不到 key**。chatlog-keeper 会对这些
@@ -61,7 +64,7 @@
 
 | 工具 | Star | 最近更新 | 微信 | QQ | 平台 | 备注 |
 |---|---|---|---|---|---|---|
-| **chatlog-keeper**（本项目） | — | 2026-07 | ≤4.0 **+ 4.1.x** | ✅ NTQQ | Windows + macOS arm64 | 被动扫描 + 带签名门禁的主动流程 |
+| **chatlog-keeper**（本项目） | — | 2026-07 | ≤4.0 **+ 4.1.x** | ✅ NTQQ | Windows + macOS arm64 + Linux x86_64 | 被动扫描 + 带签名门禁的主动流程 |
 | [WeChatMsg / 留痕](https://github.com/LC044/WeChatMsg) | 41k+ | 2025-12 | ≤4.0 | ❌ | Windows | 功能丰富的 GUI；作者声明**不再更新** |
 | [PyWxDump](https://github.com/xaoyaoo/PyWxDump) | 9k+ | 2025-10 | 3.x–4.0 | ❌ | Windows | 仓库描述现为“删库”；已停更 |
 | [chatlog](https://github.com/sjzar/chatlog) | 9k+ | 2025-10 | ≤4.0 | ❌ | 跨平台 | Go；提供 HTTP/MCP API |
@@ -71,8 +74,9 @@ chatlog-keeper 的不同之处：它是这里唯一能处理 **微信 4.1.10.31+
 明文内存）、并且**同时导出 QQ（NTQQ）**而不只是微信的工具。
 
 它仍是一个新项目，并且刻意以 CLI 为先（JSON/HTML，无内置分析）；macOS 独立包目前
-只覆盖 Apple Silicon。本项目的定位是*在两个桌面平台兼容当前微信 + QQ，且本地与法律
-边界清晰*。
+只覆盖 Apple Silicon，Linux 独立包只覆盖官方 x86_64 客户端（不含 Wine）。详见
+[Linux 说明](docs/linux.zh.md)。本项目的定位是*在正式发布的桌面平台兼容当前微信
++ QQ，且本地与法律边界清晰*。
 
 ## 安装
 
@@ -84,9 +88,12 @@ cd chatlog-keeper
 python -m pip install .
 ```
 
-正式 tag 还提供 Windows `chatlog-keeper.exe` 和 Apple Silicon
-`chatlog-keeper-macos-arm64` 独立文件。Mac 独立包已经内置只读 Mach helper；源码安装
-会在首次取 key 时编译这段可审计的 C helper，因此需要 Xcode Command Line Tools。
+正式 tag 还提供 Windows `chatlog-keeper.exe`、Apple Silicon
+`chatlog-keeper-macos-arm64`，以及 Ubuntu/Debian 官方客户端用的
+`chatlog-keeper-linux-x86_64`。Mac / Linux 独立包已经内置只读 helper；源码安装
+会在首次取 key 时编译这段可审计的 C helper，因此 macOS 需要 Xcode Command Line
+Tools，Linux 需要 `build-essential`。
+Linux 微信的内部 KDF 捕获还需要系统安装带 Python 支持的 GDB。
 
 请从同一个 [GitHub Release](https://github.com/labazhou2024/chatlog-keeper/releases)
 下载可执行文件及其对应的 `.sha256`，保留原始文件名并在运行前校验：
@@ -114,11 +121,22 @@ chmod 755 chatlog-keeper-macos-arm64
 ./chatlog-keeper-macos-arm64 participant-directory-v1 --capabilities
 ```
 
+```bash
+# Ubuntu / Debian x86_64
+sha256sum -c chatlog-keeper-linux-x86_64.sha256
+chmod 755 chatlog-keeper-linux-x86_64
+./chatlog-keeper-linux-x86_64 --help
+./chatlog-keeper-linux-x86_64 key-identity-v1 --capabilities
+./chatlog-keeper-linux-x86_64 native-account-binding-v1 --capabilities
+./chatlog-keeper-linux-x86_64 message-stream-v1 --capabilities
+./chatlog-keeper-linux-x86_64 participant-directory-v1 --capabilities
+```
+
 每个 Release 还包含从对应 tag commit 确定性生成的
-`chatlog-keeper-v*-source.tar.gz`，以及 Windows、macOS 各自的 canonical approved
-artifact descriptor；它们旁边都有独立 `.sha256`，校验方式相同。两个 descriptor
-引用同一个 source bundle，并同时声明四项冻结的本机 IPC 协议能力，使宿主能够把
-下载的可执行文件与精确源码绑定。
+`chatlog-keeper-v*-source.tar.gz`，以及 Windows、macOS、Linux 各自的 canonical
+approved artifact descriptor；它们旁边都有独立 `.sha256`，校验方式相同。
+descriptor 引用同一个 source bundle，并同时声明四项冻结的本机 IPC 协议能力，使
+宿主能够把下载的可执行文件与精确源码绑定。
 
 ## 使用
 
@@ -166,8 +184,12 @@ python -m chatlog_keeper.cli extract-key --source wechat --method active --data-
 python -m chatlog_keeper.cli extract-key --source wechat --method active \
   --data-root "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
 
+# Linux 示例（先退出日常客户端；见 docs/linux.zh.md）
+python -m chatlog_keeper.cli extract-key --source wechat --method active \
+  --data-root "$HOME/Documents/xwechat_files"
+
 # 推荐的手动兜底：从 stdin 仅读取一行 key。运行后粘贴 key，再发送 EOF
-#（Windows 按 Ctrl+Z 后回车；macOS 按 Ctrl+D）。
+#（Windows 按 Ctrl+Z 后回车；macOS / Linux 按 Ctrl+D）。
 python -m chatlog_keeper.cli set-key --source wechat --key-stdin
 python -m chatlog_keeper.cli set-key --source qq --key-stdin
 
@@ -180,8 +202,9 @@ python -m chatlog_keeper.cli set-key --source qq --key <16位口令>
 
 - Windows：`%LOCALAPPDATA%\chatlog-keeper\data\secrets\`
 - macOS：`~/Library/Application Support/chatlog-keeper/secrets/`
+- Linux：`$XDG_DATA_HOME/chatlog-keeper/secrets/`（通常是 `~/.local/share/chatlog-keeper/secrets/`）
 
-macOS 上 secrets 目录权限为 `0700`，每个 key 文件为 `0600`。Windows 上使用
+macOS / Linux 上 secrets 目录权限为 `0700`，每个 key 文件为 `0600`。Windows 上使用
 受保护 ACL，只允许当前用户和 LocalSystem 访问；ACL 收紧或复核失败时拒绝读取。
 详细见
 [macOS 安全与排障说明](docs/macos.zh.md)。桌面宿主需要展示主动取钥阶段、支持取消与

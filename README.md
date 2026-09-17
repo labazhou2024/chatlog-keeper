@@ -40,8 +40,8 @@ grouped by conversation and day — the way you remember it).
 - **QQ** — export your local NTQQ chat history
 - **WeChat** — export your local WeChat chat history
 - **WeChat images** — restore local `.dat` images back to `jpg` / `png`
-- **Windows + macOS** — one CLI and export format on Windows 11 and Apple
-  Silicon Macs
+- **Windows + macOS + Linux** — one CLI and export format on Windows 11,
+  Apple Silicon Macs, and official Ubuntu/Debian WeChat / QQ clients
 
 ## Supported versions
 
@@ -52,6 +52,8 @@ grouped by conversation and day — the way you remember it).
 | Windows | QQ NTQQ 9.9.x | per-DB passphrase | passive scan or one-time debugger |
 | macOS arm64 | WeChat 4.1.11 (269136), 4.1.12 (269364), 4.1.13 (269579) | raw/password mode selected by page-1 HMAC | passive scan; active startup capture after exact signature preflight |
 | macOS arm64 | QQ 6.9.95 (build 36385) | per-DB passphrase | passive scan; active only when signature preflight passes |
+| Linux x86_64 | official native WeChat 4.1.13.9 (`.deb`, tested ELF identified in [Linux notes](docs/linux.md)) | password mode, page-1 HMAC verified | startup hardware breakpoint at internal WCDB KDF; requires GDB with Python support |
+| Linux x86_64 | official QQ NT (`.deb`) | per-DB passphrase | child-process scan after spawn; passive often denied by Yama |
 
 On **WeChat 4.1.10.31** (released 2026-05-27) the plaintext key was moved out of
 the process heap, so a passive memory scan — what most existing tools rely on —
@@ -65,7 +67,7 @@ and maintenance status change over time — please check each repo yourself):
 
 | Tool | Stars | Last update | WeChat | QQ | Platform | Notes |
 |---|---|---|---|---|---|---|
-| **chatlog-keeper** (this) | — | 2026-07 | ≤4.0 **+ 4.1.x** | ✅ NTQQ | Windows + macOS arm64 | passive scan + guarded active fallback |
+| **chatlog-keeper** (this) | — | 2026-07 | ≤4.0 **+ 4.1.x** | ✅ NTQQ | Windows + macOS arm64 + Linux x86_64 | passive scan + guarded active fallback |
 | [WeChatMsg / 留痕](https://github.com/LC044/WeChatMsg) | 41k+ | 2025-12 | ≤4.0 | ❌ | Windows | feature-rich GUI; author states it is **no longer updated** |
 | [PyWxDump](https://github.com/xaoyaoo/PyWxDump) | 9k+ | 2025-10 | 3.x–4.0 | ❌ | Windows | repo description now reads "删库"; inactive |
 | [chatlog](https://github.com/sjzar/chatlog) | 9k+ | 2025-10 | ≤4.0 | ❌ | cross-platform | Go; HTTP/MCP API |
@@ -77,8 +79,10 @@ Where chatlog-keeper differs: it is the one here that handles **WeChat
 
 What it is **not**: it is still a young, deliberately CLI-first project
 (JSON/HTML, no built-in analytics). The macOS release currently targets Apple
-Silicon. The niche is *current WeChat compatibility + QQ on both desktop
-platforms, with a clear legal and local-only boundary*.
+Silicon; the Linux release targets official x86_64 Tencent clients, not Wine.
+See [Linux setup](docs/linux.md). The niche is *current WeChat compatibility +
+QQ on the desktop platforms we officially ship, with a clear legal and
+local-only boundary*.
 
 ## Install
 
@@ -90,10 +94,13 @@ cd chatlog-keeper
 python -m pip install .
 ```
 
-Tagged releases also provide a standalone `chatlog-keeper.exe` for Windows and
-`chatlog-keeper-macos-arm64` for Apple Silicon. The standalone Mac build
-contains its read-only Mach helper; a source install compiles that tiny audited
-C helper on first key scan and therefore needs Xcode Command Line Tools.
+Tagged releases also provide a standalone `chatlog-keeper.exe` for Windows,
+`chatlog-keeper-macos-arm64` for Apple Silicon, and
+`chatlog-keeper-linux-x86_64` for official Ubuntu/Debian clients. The
+standalone Mac and Linux builds contain their read-only helpers; a source
+install compiles those tiny audited C helpers on first key scan and therefore
+needs Xcode Command Line Tools on macOS or `build-essential` on Linux.
+Linux WeChat's internal KDF capture also requires system GDB with Python support.
 
 Download the executable and its matching `.sha256` file from the same
 [GitHub Release](https://github.com/labazhou2024/chatlog-keeper/releases). Verify
@@ -122,9 +129,20 @@ chmod 755 chatlog-keeper-macos-arm64
 ./chatlog-keeper-macos-arm64 participant-directory-v1 --capabilities
 ```
 
+```bash
+# Ubuntu / Debian x86_64
+sha256sum -c chatlog-keeper-linux-x86_64.sha256
+chmod 755 chatlog-keeper-linux-x86_64
+./chatlog-keeper-linux-x86_64 --help
+./chatlog-keeper-linux-x86_64 key-identity-v1 --capabilities
+./chatlog-keeper-linux-x86_64 native-account-binding-v1 --capabilities
+./chatlog-keeper-linux-x86_64 message-stream-v1 --capabilities
+./chatlog-keeper-linux-x86_64 participant-directory-v1 --capabilities
+```
+
 Each release also contains a deterministic `chatlog-keeper-v*-source.tar.gz`
 made from the tagged commit and one canonical approved artifact descriptor per
-platform. Their adjacent `.sha256` files are verified in the same way. The two
+platform. Their adjacent `.sha256` files are verified in the same way. The
 descriptors identify the same source bundle and list all four frozen local IPC
 protocol capabilities, so a host can bind the downloaded executable to its exact
 source.
@@ -184,8 +202,12 @@ python -m chatlog_keeper.cli extract-key --source wechat --method active --data-
 python -m chatlog_keeper.cli extract-key --source wechat --method active \
   --data-root "$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
 
+# Linux example (quit the daily client first; see docs/linux.md):
+python -m chatlog_keeper.cli extract-key --source wechat --method active \
+  --data-root "$HOME/Documents/xwechat_files"
+
 # Preferred manual fallback: read exactly one key line from stdin. Paste the
-# key when prompted, then send EOF (Ctrl+Z then Enter on Windows; Ctrl+D on macOS).
+# key when prompted, then send EOF (Ctrl+Z then Enter on Windows; Ctrl+D on macOS/Linux).
 python -m chatlog_keeper.cli set-key --source wechat --key-stdin
 python -m chatlog_keeper.cli set-key --source qq --key-stdin
 
@@ -198,8 +220,9 @@ The key is cached locally and reused on later exports:
 
 - Windows: `%LOCALAPPDATA%\chatlog-keeper\data\secrets\`
 - macOS: `~/Library/Application Support/chatlog-keeper/secrets/`
+- Linux: `$XDG_DATA_HOME/chatlog-keeper/secrets/` (usually `~/.local/share/chatlog-keeper/secrets/`)
 
-On macOS the secrets directory is mode `0700` and each key file is `0600`.
+On macOS and Linux the secrets directory is mode `0700` and each key file is `0600`.
 On Windows, protected ACLs grant access only to the current user and
 LocalSystem; an ACL setup or verification failure rejects the secret.
 See [the macOS security and troubleshooting guide](docs/macos.md).
