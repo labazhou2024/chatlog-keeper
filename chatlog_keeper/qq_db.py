@@ -204,6 +204,9 @@ def _get_qq_pids() -> list:
     if sys.platform == "darwin":
         from chatlog_keeper.core._macos import process_pids
         return process_pids(("QQ",))
+    if sys.platform.startswith("linux"):
+        from chatlog_keeper.core._linux import process_pids
+        return _rank_qq_pids(process_pids(("qq", "QQ")))
     try:
         r = subprocess.run(
             ["tasklist", "/FO", "CSV", "/FI", "IMAGENAME eq QQ.exe"],
@@ -225,6 +228,18 @@ def _get_qq_pids() -> list:
 
 
 # ─── Data directory discovery ─────────────────────────────────────────────────
+
+def _allows_opaque_qq_account_dir() -> bool:
+    """macOS and official Linux QQ use hash-named account directories."""
+    return sys.platform == "darwin" or sys.platform.startswith("linux")
+
+
+def _qq_account_has_message_db(account_dir: Path) -> bool:
+    return (
+        (account_dir / "nt_db" / "nt_msg.db").is_file()
+        or (account_dir / "nt_qq" / "nt_db" / "nt_msg.db").is_file()
+    )
+
 
 def find_qq_data_root() -> Optional[Path]:
     """Locate the ``Tencent Files`` directory (one subdir per QQ number), neutrally.
@@ -251,6 +266,9 @@ def find_qq_data_root() -> Optional[Path]:
         from chatlog_keeper.core._macos import qq_container_roots
         for container in qq_container_roots():
             candidates.append(container / "Library" / "Application Support" / "QQ")
+    elif sys.platform.startswith("linux"):
+        from chatlog_keeper.core._linux import qq_data_roots
+        candidates.extend(qq_data_roots())
     for doc in candidate_documents_roots():
         candidates.append(doc / "Tencent Files")
     for drive in all_drive_roots():
@@ -274,7 +292,9 @@ def find_qq_data_root() -> Optional[Path]:
             for sub in c.iterdir():
                 if not sub.is_dir():
                     continue
-                if not sub.name.isdigit() and sys.platform != "darwin":
+                if not sub.name.isdigit() and not (
+                    _allows_opaque_qq_account_dir() and _qq_account_has_message_db(sub)
+                ):
                     continue
                 db = sub / "nt_qq" / "nt_db" / "nt_msg.db"
                 if not db.exists():
@@ -299,9 +319,9 @@ def find_qq_data_root() -> Optional[Path]:
 def find_qq_number_dirs(data_root: Path) -> List[Path]:
     """Return account directories inside data_root.
 
-    Windows names these folders with the numeric QQ account.  Current macOS QQ
-    uses an opaque account directory, so accept a non-numeric directory only
-    when it contains the expected ``nt_db/nt_msg.db`` layout.
+    Windows names these folders with the numeric QQ account.  Current macOS and
+    official Linux QQ use an opaque account directory, so accept a non-numeric
+    directory only when it contains the expected ``nt_db/nt_msg.db`` layout.
     """
     dirs = []
     try:
@@ -309,8 +329,7 @@ def find_qq_number_dirs(data_root: Path) -> List[Path]:
             if not item.is_dir():
                 continue
             if item.name.isdigit() or (
-                sys.platform == "darwin"
-                and (item / "nt_db" / "nt_msg.db").is_file()
+                _allows_opaque_qq_account_dir() and _qq_account_has_message_db(item)
             ):
                 dirs.append(item)
     except OSError as e:
@@ -675,6 +694,48 @@ def _is_printable_ascii(b: int) -> bool:
     return 0x20 <= b <= 0x7E
 
 
+def _scan_linux_memory_for_key(
+    pid: int,
+    db_path: Path = None,
+    timeout_s: Optional[float] = None,
+) -> Optional[bytes]:
+    """Scan a Linux QQ NT process with ``process_vm_readv``."""
+    from chatlog_keeper.core._linux_process_memory import iter_process_memory_chunks
+
+    db_raw = None
+    if db_path and Path(db_path).exists():
+        db_raw = _read_qq_verification_bytes(Path(db_path))
+    seen: set = set()
+    try:
+        for chunk in iter_process_memory_chunks(pid, timeout_s=timeout_s):
+            i = 0
+            n = len(chunk)
+            while i < n:
+                if _is_printable_ascii(chunk[i]):
+                    j = i
+                    while j < n and _is_printable_ascii(chunk[j]):
+                        j += 1
+                    run_len = j - i
+                    if j < n and chunk[j] == 0x00 and run_len in (16, 32):
+                        candidate = chunk[i:j]
+                        if candidate not in seen:
+                            seen.add(candidate)
+                            if db_raw and _verify_key_qq(candidate, db_raw):
+                                logger.info(
+                                    "Passphrase verified from Linux QQ process memory"
+                                )
+                                return candidate
+                    i = j + 1
+                else:
+                    i += 1
+    except ProcessMemoryAccessDenied:
+        raise
+    except Exception as exc:
+        logger.error("Linux QQ memory scan error for PID %s: %s", pid, exc)
+        return None
+    return None
+
+
 def _scan_memory_for_key(pid: int, db_path: Path = None,
                          timeout_s: Optional[float] = None) -> Optional[bytes]:
     """Scan QQ.exe process memory for the SQLCipher PASSPHRASE.
@@ -706,6 +767,8 @@ def _scan_memory_for_key(pid: int, db_path: Path = None,
             elevate=False,
             timeout=max(1, int(timeout_s or 120)),
         )
+    if sys.platform.startswith("linux"):
+        return _scan_linux_memory_for_key(pid, db_path=db_path, timeout_s=timeout_s)
 
     kernel32 = _windows_kernel32()
     PROCESS_VM_READ = 0x0010

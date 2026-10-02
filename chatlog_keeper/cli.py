@@ -1497,11 +1497,14 @@ def _extract_key(
     ``method="passive"`` (default) scans the live client's process memory — low
     ban risk, no debugger; works on older builds, may find nothing on newer
     WeChat. ``method="active"`` runs the platform helper — a debugger
-    breakpoint on Windows or a signature-verified isolated app copy on macOS.
-    The macOS WeChat copy loads a fixed startup observer before automatic login
-    and retains the same-user read-only Mach scan as a compatibility fallback;
-    QQ retains its Hardened Runtime signing preflight. Active is always opt-in,
-    and every candidate is DB-HMAC verified before it can be cached.
+    breakpoint on Windows, a signature-verified isolated app copy on macOS, or
+    a child-process spawn of the official Linux client. The macOS WeChat copy
+    loads a fixed startup observer before automatic login and retains the
+    same-user read-only Mach scan as a compatibility fallback; QQ retains its
+    Hardened Runtime signing preflight. On Linux the official binary is
+    launched as a child so Yama still allows the parent to read it. Active is
+    always opt-in, and every candidate is DB-HMAC verified before it can be
+    cached.
     """
     force_extract = os.environ.get("CHATLOG_FORCE_EXTRACT", "").strip().lower() in (
         "1", "true", "yes", "on",
@@ -1515,6 +1518,60 @@ def _extract_key(
         return payload
 
     def _active_failure(default: str) -> str:
+        if sys.platform.startswith("linux"):
+            try:
+                from chatlog_keeper.linux_key import last_error as linux_error
+                reason = linux_error()
+            except Exception:
+                reason = ""
+            if reason == "daily_client_single_instance_conflict":
+                client_name = "WeChat" if source == "wechat" else "QQ"
+                return (
+                    f"the daily {client_name} client is still running; quit it "
+                    "normally, wait for it to close completely, then retry Active Key"
+                )
+            if reason == "official_client_not_found":
+                return (
+                    "the official Linux client binary was not found under "
+                    "/opt/wechat/wechat or /opt/QQ/qq; install the Tencent .deb "
+                    "or pass --data-root and use set-key"
+                )
+            if reason == "official_client_launch_failed":
+                return "Linux could not start the official chat client as a child process"
+            if reason == "process_access_denied":
+                return (
+                    "Linux denied same-user process-memory access "
+                    "(Yama ptrace_scope); quit the daily client and retry Active Key "
+                    "so chatlog-keeper can launch it as a child, or use set-key"
+                )
+            if reason == "helper_compile_failed":
+                return (
+                    "Linux could not compile the private memory-scan helper; "
+                    "install gcc or clang (build-essential) and retry"
+                )
+            if reason == "capture_compile_failed":
+                return (
+                    "Linux could not compile the private WeChat startup observer; "
+                    "install gcc or clang (build-essential) and retry"
+                )
+            if reason == "capture_debugger_missing":
+                return (
+                    "this Linux WeChat build uses an internal WCDB KDF; "
+                    "install gdb with Python support and retry Active Key"
+                )
+            if reason == "verification_db_missing":
+                return (
+                    "no local message database was found for HMAC verification; "
+                    "set --data-root to the xwechat_files or ~/.config/QQ folder"
+                )
+            if reason:
+                return f"Linux key helper failed: {reason}"
+            if source == "wechat":
+                return (
+                    "the Linux WeChat session produced no DB-verified key; "
+                    "4.1+ builds may require set-key if the key is no longer in heap"
+                )
+            return "Linux memory scan produced no DB-verified key candidate"
         if sys.platform != "darwin":
             return default
         try:

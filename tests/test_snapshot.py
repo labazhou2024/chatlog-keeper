@@ -231,6 +231,16 @@ def _encrypted_page(page_key: bytes, salt: bytes, page_no: int, fill: bytes) -> 
     return prefix + cipher + iv + tag
 
 
+def _encrypted_header_page(page_key, salt, page_count, *, version_valid=7):
+    plain = bytearray(4016)
+    plain[:16] = b"SQLite format 3\x00"
+    struct.pack_into(">H", plain, 16, 4096)
+    plain[18:24] = bytes((2, 2, 80, 64, 32, 32))
+    struct.pack_into(">II", plain, 24, 7, page_count)
+    struct.pack_into(">I", plain, 92, version_valid)
+    return _encrypted_page(page_key, salt, 1, bytes(plain[16:]))
+
+
 def _wal_bytes(frames, *, salt1=0x11223344, salt2=0x55667788):
     magic = 0x377F0682
     header_24 = struct.pack(
@@ -326,6 +336,93 @@ def test_wechat_main_db_authenticates_every_page_before_atomic_publish(
     assert plain[:16] == b"SQLite format 3\x00"
     assert plain[16:4016] == b"A" * 4000
     assert plain[4096:8112] == b"B" * 4016
+
+
+@pytest.mark.parametrize("key_mode", ["raw", "password"])
+def test_wechat_main_db_omits_zero_preallocation_after_authenticated_size(
+    tmp_path, key_mode,
+):
+    master_key = bytes(range(32))
+    salt = bytes(range(16))
+    page_key = (
+        master_key if key_mode == "raw" else hashlib.pbkdf2_hmac(
+            "sha512", master_key, salt, wechat_db._WECHAT_KDF_ITER, dklen=32,
+        )
+    )
+    encrypted = tmp_path / "message.db"
+    source = (
+        _encrypted_header_page(page_key, salt, 2)
+        + _encrypted_page(page_key, salt, 2, b"B")
+        + b"\0" * (3 * 4096)
+    )
+    encrypted.write_bytes(source)
+    output = tmp_path / "plain.db"
+
+    assert wechat_db._decrypt_db_v4_snapshot(encrypted, master_key, output)
+    plain = output.read_bytes()
+    assert len(plain) == 2 * 4096
+    assert plain[4096:8112] == b"B" * 4016
+    assert encrypted.read_bytes() == source
+
+
+@pytest.mark.parametrize(
+    "page_count,version_valid,tail",
+    [
+        (3, 7, b"\0" * 4096),  # Zero inside the logical database.
+        (0, 7, b"\0" * 4096),  # Unavailable size cannot authorize padding.
+        (2, 8, b"\0" * 4096),  # Stale size cannot authorize padding.
+        (2, 7, b"\0" * 4096 + b"\0" * 4095 + b"X"),
+        (2, 7, b"\0" * 137),  # A partial page is not preallocation.
+        (3, 7, b""),  # An authenticated size cannot hide truncation.
+    ],
+    ids=["live-zero-page", "missing-size", "stale-size", "nonzero-tail",
+         "partial-tail", "missing-live-page"],
+)
+def test_wechat_preallocation_never_masks_invalid_pages(
+    tmp_path, page_count, version_valid, tail,
+):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(
+        _encrypted_header_page(key, salt, page_count, version_valid=version_valid)
+        + _encrypted_page(key, salt, 2, b"B") + tail
+    )
+    output = tmp_path / "plain.db"
+    original = b"existing-output-must-survive"
+    output.write_bytes(original)
+
+    assert not wechat_db._decrypt_db_v4_snapshot(encrypted, key, output)
+    assert output.read_bytes() == original
+    assert list(tmp_path.glob(".plain.db.*.tmp")) == []
+
+
+@pytest.mark.parametrize("corrupt_wal", [False, True])
+def test_wechat_preallocation_preserves_authenticated_wal_growth(tmp_path, corrupt_wal):
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    encrypted = tmp_path / "message.db"
+    encrypted.write_bytes(
+        _encrypted_header_page(key, salt, 2)
+        + _encrypted_page(key, salt, 2, b"B") + b"\0" * 8192
+    )
+    new_page = bytearray(_encrypted_page(key, salt, 3, b"C"))
+    if corrupt_wal:
+        new_page[100] ^= 1
+    encrypted.with_name("message.db-wal").write_bytes(_wal_bytes([
+        (1, 0, _encrypted_header_page(key, salt, 3)),
+        (3, 3, bytes(new_page)),
+    ])[0])
+    output = tmp_path / "plain.db"
+
+    assert wechat_db._decrypt_db_v4_snapshot(encrypted, key, output) is not corrupt_wal
+    if corrupt_wal:
+        assert not output.exists()
+    else:
+        plain = output.read_bytes()
+        assert len(plain) == 3 * 4096
+        assert int.from_bytes(plain[28:32], "big") == 3
+        assert plain[8192:12208] == b"C" * 4016
 
 
 @pytest.mark.parametrize(

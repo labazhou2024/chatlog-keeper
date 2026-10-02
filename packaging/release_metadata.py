@@ -110,6 +110,7 @@ _NATIVE_ACCOUNT_BINDING_CAPABILITY = {
 _SUPPORTED_TARGETS = {
     ("macos", "arm64"): "chatlog-keeper-macos-arm64",
     ("windows", "x86_64"): "chatlog-keeper.exe",
+    ("linux", "x86_64"): "chatlog-keeper-linux-x86_64",
 }
 
 
@@ -356,6 +357,16 @@ def validate_executable_header(
                     or struct.unpack_from("<H", pe_header, 24)[0] != 0x020B
                 ):
                     raise ReleaseMetadataError("Windows artifact is not PE32+ AMD64")
+            elif target_platform == "linux":
+                elf_header = handle.read(20)
+                if (
+                    len(elf_header) != 20
+                    or elf_header[:4] != b"\x7fELF"
+                    or elf_header[4] != 2
+                    or elf_header[5] != 1
+                    or struct.unpack_from("<H", elf_header, 18)[0] != 62
+                ):
+                    raise ReleaseMetadataError("Linux artifact is not ELF64 x86_64")
             else:
                 mach_header = handle.read(8)
                 if (
@@ -567,7 +578,7 @@ def _build_parser() -> argparse.ArgumentParser:
     descriptor = subparsers.add_parser("build-descriptor")
     descriptor.add_argument("--commit", required=True)
     descriptor.add_argument("--version", required=True)
-    descriptor.add_argument("--platform", choices=("macos", "windows"), required=True)
+    descriptor.add_argument("--platform", choices=("macos", "windows", "linux"), required=True)
     descriptor.add_argument("--arch", choices=("arm64", "x86_64"), required=True)
     descriptor.add_argument("--executable", type=Path, required=True)
     descriptor.add_argument("--source-bundle", type=Path, required=True)

@@ -42,6 +42,12 @@ _WINDOWS_RELEASE_LOCK = {
     "pywin32-ctypes": "0.2.3",
 }
 
+_LINUX_RELEASE_LOCK = {
+    **_COMMON_RELEASE_LOCK,
+    "pygments": "2.21.0",
+    "pyinstaller-hooks-contrib": "2026.7",
+}
+
 
 def _parse_hashed_lock(path: Path) -> tuple[str, dict[str, str]]:
     text = path.read_text(encoding="utf-8")
@@ -95,6 +101,9 @@ def test_pyinstaller_spec_bundles_every_platform_key_helper():
         "macos_memory_scan.c",
         "macos_wechat_key_capture.c",
         "macos_wechat_key_capture.dylib",
+        "linux_memory_scan.c",
+        "linux_wechat_key_capture.c",
+        "linux_wechat_key_capture.so",
     ):
         assert helper in spec
     assert '"-arch",\n            "arm64"' in spec
@@ -116,20 +125,22 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
         encoding="utf-8"
     )
 
-    assert workflow.count("release_metadata.py verify-version") == 2
-    assert workflow.count("release_metadata.py validate-capabilities") == 2
+    assert workflow.count("release_metadata.py verify-version") == 3
+    assert workflow.count("release_metadata.py validate-capabilities") == 3
     assert "build-source-bundle" in workflow
     assert '--commit "${RELEASE_COMMIT}"' in workflow
-    assert workflow.count('--commit "$env:RELEASE_COMMIT"') == 2
+    assert workflow.count('--commit "$env:RELEASE_COMMIT"') == 3
     assert workflow.count("ref: ${{ github.sha }}") == 1
-    assert workflow.count("release_metadata.py build-descriptor") == 2
+    assert workflow.count("release_metadata.py build-descriptor") == 3
     assert "--platform windows" in workflow
     assert "--arch x86_64" in workflow
     assert "--platform macos" in workflow
     assert "--arch arm64" in workflow
+    assert "--platform linux" in workflow
     assert "chatlog-keeper-v${version}-source.tar.gz.sha256" in workflow
     assert "windows-x86_64.artifact.json.sha256" in workflow
     assert "macos-arm64.artifact.json.sha256" in workflow
+    assert "linux-x86_64.artifact.json.sha256" in workflow
     assert "verify-checksum" in workflow
     assert (
         "python -I chatlog_keeper/_qq_sqlite_helper.py --runtime-probe"
@@ -170,7 +181,7 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert "cancel-in-progress: false" in workflow
     assert workflow.count(
         "ref: ${{ needs.release-ref-gate.outputs.release_commit }}"
-    ) == 2
+    ) == 3
     assert "release_commit: ${{ steps.freeze.outputs.release_commit }}" in workflow
     assert "release_tag: ${{ steps.freeze.outputs.release_tag }}" in workflow
     assert "release_tag_object: ${{ steps.freeze.outputs.release_tag_object }}" in workflow
@@ -197,6 +208,7 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert 'test "$GITHUB_REF" = "refs/heads/main"' in workflow
     assert 'git merge-base --is-ancestor "$tag_commit" "$GITHUB_SHA"' in workflow
     assert "build-windows:" in workflow
+    assert "build-linux:" in workflow
     assert "publish-release:" in workflow
     publisher = workflow.split("  publish-release:\n", maxsplit=1)[1]
     assert "actions/checkout@" not in publisher
@@ -204,8 +216,8 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert "python -m pytest" not in publisher
     assert "PyInstaller" not in publisher
     assert "chatlog-keeper-release-inputs" in publisher
-    assert 'test "$(find release_inputs -type f | wc -l | tr -d \' \')" = "10"' in publisher
-    assert publisher.count("sha256sum -c") == 5
+    assert 'test "$(find release_inputs -type f | wc -l | tr -d \' \')" = "14"' in publisher
+    assert publisher.count("sha256sum -c") == 7
     assert publisher.count("GH_TOKEN: ${{ github.token }}") == 1
     assert 'git/ref/tags/$RELEASE_TAG" --jq .object.sha' in publisher
     assert 'test "$current_tag_object" = "$RELEASE_TAG_OBJECT"' in publisher
@@ -216,11 +228,11 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert "Publish immutable GitHub Release" not in workflow
     assert workflow.count(
         "RELEASE_TAG: ${{ needs.release-ref-gate.outputs.release_tag }}"
-    ) == 7
+    ) == 8
     assert workflow.count(
         "RELEASE_COMMIT: ${{ needs.release-ref-gate.outputs.release_commit }}"
-    ) == 5
-    assert workflow.count("Verify the frozen source commit") == 2
+    ) == 6
+    assert workflow.count("Verify the frozen source commit") == 3
     for line in workflow.splitlines():
         if "${{ github.ref_name }}" in line:
             assert line.strip() in {
@@ -240,7 +252,7 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
         + "\n          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
         in workflow
     )
-    assert workflow.count("sys.version_info[:3] == (3, 11, 15)") == 2
+    assert workflow.count("sys.version_info[:3] == (3, 11, 15)") == 3
     assert workflow.count("sys.prefix == sys.base_prefix") == 1
     assert workflow.count(
         "os.path.samefile(os.path.dirname(sys.executable), os.environ['CONDA_PREFIX'])"
@@ -248,18 +260,21 @@ def test_release_workflow_freezes_source_capabilities_and_descriptors():
     assert workflow.count(
         "os.path.isdir(os.path.join(sys.prefix, 'Library', 'bin'))"
     ) == 1
-    assert workflow.count("CONDA_DEFAULT_ENV") == 2
+    assert workflow.count("CONDA_DEFAULT_ENV") == 3
     assert workflow.count("platform.machine() == 'arm64'") == 1
+    assert workflow.count("platform.machine() == 'x86_64'") == 1
     assert workflow.count("platform.machine().lower() in {'amd64', 'x86_64'}") == 1
     assert "packaging/macos-release-environment.yml" in workflow
-    assert workflow.count("--require-hashes --only-binary=:all:") == 2
+    assert "packaging/linux-release-environment.yml" in workflow
+    assert workflow.count("--require-hashes --only-binary=:all:") == 3
     assert workflow.count("packaging/release-requirements-macos.txt") == 1
     assert workflow.count("packaging/release-requirements-windows.txt") == 1
-    assert workflow.count("--no-deps --no-build-isolation .") == 2
-    assert workflow.count("python -m pip check") == 2
+    assert workflow.count("packaging/release-requirements-linux.txt") == 1
+    assert workflow.count("--no-deps --no-build-isolation .") == 3
+    assert workflow.count("python -m pip check") == 3
     assert ". pytest pyinstaller==" not in workflow
-    assert workflow.count("shell: bash -el {0}") == 1
-    assert workflow.count("set -euo pipefail") == 7
+    assert workflow.count("shell: bash -el {0}") == 2
+    assert workflow.count("set -euo pipefail") == 10
     assert "Verify standalone executable outside the build environment" in workflow
     assert '$ErrorActionPreference = "Stop"' in workflow
     assert "$originalPath = $env:PATH" in workflow
@@ -296,17 +311,20 @@ def test_ci_covers_release_python_and_runs_the_runtime_probe_on_windows():
     assert "packaging/windows-release-environment.yml" in workflow
     assert "_qq_sqlite_helper.py --runtime-probe" in workflow
     assert "macos-release-runtime:" in workflow
-    assert workflow.count("sys.version_info[:3] == (3, 11, 15)") == 2
+    assert "linux-release-runtime:" in workflow
+    assert workflow.count("sys.version_info[:3] == (3, 11, 15)") == 3
     assert "packaging/macos-release-environment.yml" in workflow
+    assert "packaging/linux-release-environment.yml" in workflow
     assert workflow.count("persist-credentials: false") == workflow.count(
         "actions/checkout@"
     )
-    assert workflow.count("--require-hashes --only-binary=:all:") == 2
-    assert workflow.count("--no-deps --no-build-isolation .") == 2
-    assert workflow.count("python -m pip check") == 2
+    assert workflow.count("--require-hashes --only-binary=:all:") == 3
+    assert workflow.count("--no-deps --no-build-isolation .") == 3
+    assert workflow.count("python -m pip check") == 3
     assert "packaging/release-requirements-macos.txt" in workflow
     assert "packaging/release-requirements-windows.txt" in workflow
-    assert workflow.count("shell: bash -el {0}") == 1
+    assert "packaging/release-requirements-linux.txt" in workflow
+    assert workflow.count("shell: bash -el {0}") == 2
     assert (
         "run: |\n"
         "          set -euo pipefail\n"
@@ -331,8 +349,9 @@ def test_ci_covers_release_python_and_runs_the_runtime_probe_on_windows():
     assert workflow.count(
         "os.path.isdir(os.path.join(sys.prefix, 'Library', 'bin'))"
     ) == 1
-    assert workflow.count("CONDA_DEFAULT_ENV") == 2
+    assert workflow.count("CONDA_DEFAULT_ENV") == 3
     assert workflow.count("platform.machine() == 'arm64'") == 1
+    assert workflow.count("platform.machine() == 'x86_64'") == 1
     assert workflow.count("platform.machine().lower() in {'amd64', 'x86_64'}") == 1
     assert "python -m PyInstaller packaging/chatlog_keeper.spec" in workflow
     assert "Verify standalone executable outside the build environment" in workflow
@@ -382,6 +401,18 @@ def test_windows_release_environment_pins_the_validated_python_and_sqlite_builds
     assert "pip=26.1.2=pyhc872135_0" in environment
 
 
+def test_linux_release_environment_pins_the_validated_python_and_sqlite_builds():
+    root = Path(__file__).resolve().parents[1]
+    environment = (
+        root / "packaging" / "linux-release-environment.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "name: chatlog-release-linux" in environment
+    assert "python=3.11.15=h741d88c_0" in environment
+    assert "sqlite=3.53.2=h795bf6d_0" in environment
+    assert "pip=26.1.2=pyhc872135_0" in environment
+
+
 def test_macos_release_environment_pins_the_validated_python_and_sqlite_builds():
     root = Path(__file__).resolve().parents[1]
     environment = (
@@ -411,20 +442,33 @@ def test_release_dependency_inputs_and_platform_locks_are_complete_and_hashed():
     windows_text, windows_versions = _parse_hashed_lock(
         root / "packaging" / "release-requirements-windows.txt"
     )
+    linux_text, linux_versions = _parse_hashed_lock(
+        root / "packaging" / "release-requirements-linux.txt"
+    )
     assert mac_versions == _MACOS_RELEASE_LOCK
     assert windows_versions == _WINDOWS_RELEASE_LOCK
+    assert linux_versions == _LINUX_RELEASE_LOCK
     assert "--generate-hashes --only-binary :all:" in mac_text
     assert "--generate-hashes --only-binary :all:" in windows_text
+    assert "--generate-hashes --only-binary :all:" in linux_text
     assert "--python-platform aarch64-apple-darwin" in mac_text
     assert "--python-platform x86_64-pc-windows-msvc" in windows_text
+    assert "--python-platform x86_64-unknown-linux-gnu" in linux_text
     assert "--python-version 3.11.15" in mac_text
     assert "--python-version 3.11.15" in windows_text
+    assert "--python-version 3.11.15" in linux_text
 
 
 def test_release_output_directories_are_ignored():
     root = Path(__file__).resolve().parents[1]
     ignore = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
-    assert {"dist_exe*/", "dist_macos*/", "dist_source*/", "dist_metadata*/"} <= set(ignore)
+    assert {
+        "dist_exe*/",
+        "dist_macos*/",
+        "dist_linux*/",
+        "dist_source*/",
+        "dist_metadata*/",
+    } <= set(ignore)
 
 
 def test_readmes_document_standalone_verification_and_both_protocol_probes():
@@ -433,8 +477,10 @@ def test_readmes_document_standalone_verification_and_both_protocol_probes():
         readme = (root / name).read_text(encoding="utf-8")
         assert "chatlog-keeper.exe.sha256" in readme
         assert "chatlog-keeper-macos-arm64.sha256" in readme
+        assert "chatlog-keeper-linux-x86_64.sha256" in readme
         assert "shasum -a 256 -c" in readme
         assert "chmod 755 chatlog-keeper-macos-arm64" in readme
+        assert "chmod 755 chatlog-keeper-linux-x86_64" in readme
         assert "message-stream-v1 --capabilities" in readme
         assert "participant-directory-v1 --capabilities" in readme
         assert "native-account-binding-v1 --capabilities" in readme

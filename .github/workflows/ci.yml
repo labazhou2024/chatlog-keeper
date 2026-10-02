@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-15]
+        os: [windows-latest, macos-15, ubuntu-24.04]
         python-version: ["3.9", "3.11", "3.12"]
         exclude:
           # Python 3.11 is exercised by the release-identical locked-runtime
@@ -25,6 +25,8 @@ jobs:
           - os: windows-latest
             python-version: "3.11"
           - os: macos-15
+            python-version: "3.11"
+          - os: ubuntu-24.04
             python-version: "3.11"
     steps:
       - name: Check out source
@@ -74,6 +76,99 @@ jobs:
         run: python -m pytest -q
       - name: Compile entry points
         run: python -m compileall -q chatlog_keeper tests
+
+  linux-release-runtime:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up exact release Python and SQLite
+        uses: conda-incubator/setup-miniconda@8ee1f361103df19b6f8c8655fd3967a8ecb162d5 # v4.0.1
+        with:
+          miniconda-version: "py311_26.5.3-2"
+          activate-environment: chatlog-release-linux
+          environment-file: packaging/linux-release-environment.yml
+          auto-activate: false
+          channels: defaults
+          channel-priority: strict
+      - name: Verify exact runtime
+        run: python -c "import os, platform, sqlite3, sys; assert sys.version_info[:3] == (3, 11, 15); assert sqlite3.sqlite_version == '3.53.2'; assert sys.prefix == os.environ['CONDA_PREFIX']; assert os.environ.get('CONDA_DEFAULT_ENV') == 'chatlog-release-linux'; assert platform.machine() == 'x86_64'"
+      - name: Install the release-locked dependency graph
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary=:all: -r packaging/release-requirements-linux.txt
+          python -m pip install --disable-pip-version-check --no-deps --no-build-isolation .
+          python -m pip check
+      - name: Test
+        run: python -m pytest -q
+      - name: Compile entry points
+        run: python -m compileall -q chatlog_keeper tests
+      - name: Build Linux standalone executable
+        run: |
+          set -euo pipefail
+          python -m PyInstaller packaging/chatlog_keeper.spec --noconfirm --clean --distpath dist_exe
+          mv dist_exe/chatlog-keeper dist_exe/chatlog-keeper-linux-x86_64
+          chmod 755 dist_exe/chatlog-keeper-linux-x86_64
+      - name: Verify Linux standalone bundle and isolated runtime
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import runpy
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          from PyInstaller.archive.readers import CArchiveReader
+
+          root = Path.cwd().resolve()
+          executable = root / "dist_exe/chatlog-keeper-linux-x86_64"
+          metadata_path = root / "packaging/release_metadata.py"
+          metadata = runpy.run_path(str(metadata_path))
+          metadata["validate_executable_header"](
+              executable, target_platform="linux", target_arch="x86_64"
+          )
+          archive = CArchiveReader(str(executable))
+          for helper in (
+              "linux_memory_scan.c",
+              "linux_memory_scan",
+              "linux_wechat_key_capture.c",
+              "linux_wechat_key_capture.so",
+              "linux_wechat_gdb_capture.py",
+          ):
+              assert archive.extract("chatlog_keeper/scripts/" + helper), helper
+
+          # No source checkout, conda PATH/libraries, or real client data may
+          # satisfy this frozen smoke test. The temporary root is mode 0700.
+          with tempfile.TemporaryDirectory(prefix="chatlog-keeper-smoke-") as temporary:
+              isolated = Path(temporary)
+              env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+              for name, directory in (
+                  ("HOME", "home"),
+                  ("CHATLOG_KEEPER_DATA_DIR", "keeper-data"),
+                  ("XDG_CONFIG_HOME", "config"),
+                  ("XDG_DATA_HOME", "data"),
+                  ("XDG_CACHE_HOME", "cache"),
+                  ("TMPDIR", "tmp"),
+              ):
+                  private = isolated / directory
+                  private.mkdir(mode=0o700)
+                  env[name] = str(private)
+              for command in (
+                  [str(executable), "--help"],
+                  [sys.executable, str(metadata_path), "validate-capabilities",
+                   "--executable", str(executable)],
+              ):
+                  subprocess.run(
+                      command, cwd=isolated, env=env, stdin=subprocess.DEVNULL,
+                      check=True, timeout=120,
+                  )
+          PY
 
   windows-release-runtime:
     runs-on: windows-latest

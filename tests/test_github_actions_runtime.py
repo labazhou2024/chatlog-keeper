@@ -55,4 +55,7 @@ def test_setup_miniconda_v4_uses_current_auto_activate_input() -> None:
     )
 
     assert "auto-activate-base:" not in workflow_text
-    assert workflow_text.count("auto-activate: false") == 4
+    assert workflow_text.count("auto-activate: false") == 6
+    assert workflow_text.count("persist-credentials: false") == workflow_text.count(
+        "actions/checkout@"
+    )
