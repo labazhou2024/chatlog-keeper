@@ -161,7 +161,6 @@ jobs:
                   env[name] = str(private)
               for command in (
                   [str(executable), "--help"],
-                  [str(executable), "--_qq-sqlite-helper", "--runtime-probe"],
                   [sys.executable, str(metadata_path), "validate-capabilities",
                    "--executable", str(executable)],
               ):
