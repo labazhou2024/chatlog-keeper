@@ -47,7 +47,7 @@ def test_linux_exact_executable_pid_match(monkeypatch):
     monkeypatch.setattr(_linux, "is_linux", lambda: True)
     expected = Path("/opt/wechat/wechat")
     monkeypatch.setattr(_linux.os, "path", _linux.os.path)
-    monkeypatch.setattr(_linux.os.path, "realpath", lambda value: str(expected))
+    monkeypatch.setattr(_linux.os.path, "realpath", lambda value: expected.as_posix())
     monkeypatch.setattr(_linux.os, "listdir", lambda _path: ["1", "42", "self"])
     monkeypatch.setattr(
         _linux,

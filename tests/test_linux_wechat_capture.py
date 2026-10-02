@@ -19,6 +19,12 @@ from chatlog_keeper.linux_wechat_capture import (
 )
 
 
+requires_posix_capture = pytest.mark.skipif(
+    not hasattr(os, "mkfifo") or not hasattr(os, "geteuid"),
+    reason="capture channel requires POSIX FIFO and user ownership semantics",
+)
+
+
 def elf_image(*, text_va=0x5000, text_flags=5, copies=1, companion=True):
     image = bytearray(0x2000)
     image[:7] = b'\x7fELF\x02\x01\x01'
@@ -102,6 +108,7 @@ def setup_runner(monkeypatch, tmp_path, *, records=(), error='', exited=False):
     return exe, boundary, observations
 
 
+@requires_posix_capture
 def test_runner_verifies_twice_and_keeps_key_out_of_command_or_environment(monkeypatch, tmp_path):
     candidate = bytes(range(32))
     exe, boundary, obs = setup_runner(monkeypatch, tmp_path, records=[b'WXK1' + candidate])
@@ -117,6 +124,7 @@ def test_runner_verifies_twice_and_keeps_key_out_of_command_or_environment(monke
     assert not list((tmp_path / 'bin').iterdir())
 
 
+@requires_posix_capture
 def test_runner_never_accepts_unverified_candidate(monkeypatch, tmp_path):
     exe, boundary, obs = setup_runner(monkeypatch, tmp_path, records=[b'WXK1' + b'a' * 32], exited=True)
     assert linux_key._extract_wechat_key_gdb(
@@ -126,6 +134,7 @@ def test_runner_never_accepts_unverified_candidate(monkeypatch, tmp_path):
     assert not list((tmp_path / 'bin').iterdir())
 
 
+@requires_posix_capture
 def test_runner_accepts_final_verified_record_from_exited_helper(monkeypatch, tmp_path):
     exe, boundary, _ = setup_runner(
         monkeypatch, tmp_path, records=[b'WXK1' + b'a' * 32], exited=True,
@@ -135,6 +144,7 @@ def test_runner_accepts_final_verified_record_from_exited_helper(monkeypatch, tm
     ) == b'a' * 32
 
 
+@requires_posix_capture
 def test_runner_rejects_malformed_record_and_stops_helper(monkeypatch, tmp_path):
     exe, boundary, obs = setup_runner(monkeypatch, tmp_path, records=[b'BAD!' + b'a' * 32])
     assert linux_key._extract_wechat_key_gdb(
@@ -145,6 +155,7 @@ def test_runner_rejects_malformed_record_and_stops_helper(monkeypatch, tmp_path)
     assert not list((tmp_path / 'bin').iterdir())
 
 
+@requires_posix_capture
 def test_runner_cleans_up_if_debugger_cannot_start(monkeypatch, tmp_path):
     exe, boundary, _ = setup_runner(monkeypatch, tmp_path)
     def fail(*a, **kw):
@@ -157,6 +168,7 @@ def test_runner_cleans_up_if_debugger_cannot_start(monkeypatch, tmp_path):
     assert not list((tmp_path / 'bin').iterdir())
 
 
+@requires_posix_capture
 def test_runner_rechecks_when_page_changes(monkeypatch, tmp_path):
     exe, boundary, _ = setup_runner(monkeypatch, tmp_path, records=[b'WXK1' + b'a' * 32], exited=True)
     answers = iter([True, False])
@@ -165,6 +177,7 @@ def test_runner_rechecks_when_page_changes(monkeypatch, tmp_path):
     ) is None
 
 
+@requires_posix_capture
 @pytest.mark.parametrize('error,expected', [
     ('capture_image_changed', 'capture_image_changed'),
     ('untrusted diagnostic content', 'capture_client_exited'),
@@ -177,6 +190,7 @@ def test_runner_limits_error_output(monkeypatch, tmp_path, error, expected):
     assert linux_key.last_error() == expected
 
 
+@requires_posix_capture
 def test_runner_cancels_and_cleans_up(monkeypatch, tmp_path):
     exe, boundary, obs = setup_runner(monkeypatch, tmp_path)
     cancelled = iter([False, True])
@@ -188,6 +202,7 @@ def test_runner_cancels_and_cleans_up(monkeypatch, tmp_path):
     assert not list((tmp_path / 'bin').iterdir())
 
 
+@requires_posix_capture
 def test_runner_times_out_and_cleans_up(monkeypatch, tmp_path):
     exe, boundary, obs = setup_runner(monkeypatch, tmp_path)
     times = iter([0, 2])
@@ -199,6 +214,7 @@ def test_runner_times_out_and_cleans_up(monkeypatch, tmp_path):
     assert obs['signal'] == signal.SIGINT
 
 
+@requires_posix_capture
 def test_router_uses_native_boundary_and_existing_hmac(monkeypatch, tmp_path):
     exe, boundary, _ = setup_runner(monkeypatch, tmp_path, records=[b'WXK1' + b'a' * 32])
     db = tmp_path / 'message_0.db'
@@ -225,6 +241,7 @@ def test_runner_preflight_never_launches_when_unavailable(monkeypatch, tmp_path,
     assert linux_key.last_error() == expected
 
 
+@requires_posix_capture
 @pytest.mark.parametrize('wrong_field', [
     None, 'passlen', 'saltlen', 'iterations', 'outlen', 'algorithm',
     'signature', 'image_hash', 'interrupt',

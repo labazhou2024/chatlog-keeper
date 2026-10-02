@@ -100,6 +100,10 @@ def test_active_key_router_uses_linux_host(monkeypatch, tmp_path):
     assert observed["timeout"] == 12
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "mkfifo") or not hasattr(os, "geteuid"),
+    reason="capture channel requires POSIX FIFO and user ownership semantics",
+)
 def test_capture_channel_accepts_only_wxk1(tmp_path, monkeypatch):
     monkeypatch.setattr(linux_key, "data_dir", lambda: tmp_path)
     channel = linux_key.create_capture_channel()
