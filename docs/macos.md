@@ -31,17 +31,19 @@ access. Modern hardened clients usually deny that request.
   `~/Library/Application Support/chatlog-keeper/debug-apps/`;
 - QQ preserves its original entitlements and adds
   `com.apple.security.get-task-allow`;
-- only the verified WeChat 4.1.11 (269136), 4.1.12 (269364), 4.1.13 (269579),
-  and 4.1.15 (270100) policies may remove Tencent signing-identity claims that
+- only the inspected WeChat 4.1.11 (269136), 4.1.12 (269340/269364), 4.1.13
+  (269579), and 4.1.15 (270100/270102) policies may remove Tencent signing-identity claims that
   an ad-hoc signature cannot assert; they require the exact Tencent
   application identifier/group allowlist and sandbox before preserving
   unrelated entitlements and adding the scoped Mach-registration exception
-  required by PID-suffixed rendezvous services; 4.1.11 and 4.1.12 must carry
-  the exact Tencent Team ID, while 4.1.13 and 4.1.15 may omit that
+  required by PID-suffixed rendezvous services; 4.1.11/269136 and 4.1.12/269364
+  must carry the exact Tencent Team ID, while 4.1.12/269340, 4.1.13/269579,
+  and the listed 4.1.15 builds may omit that
   entitlement; other client builds and unknown developer, private, or keychain
   identity claims fail closed;
-- the exact 4.1.15 (270100) policy also permits the PID-suffixed XPlayer
-  rendezvous service observed in that build, so its media thread can initialize
+- the exact 4.1.15 (270100/270102) policies also permit the PID-suffixed XPlayer
+  rendezvous service observed in 270100; 270102 has the same unsigned XPlayer
+  payload, so its media thread can initialize
   without a sandbox registration denial terminating the private copy;
 - QQ keeps Hardened Runtime and is launched only after its signature, exact
   entitlement delta, and direct-library Team-ID relation are verified;
@@ -123,6 +125,14 @@ asks for a system password.
 
 ## Troubleshooting
 
+- `debug_copy_unsupported_client`: this exact bundle version/build has no
+  inspected policy. Update chatlog-keeper and compare the bundle pair with the
+  list above. The official 270102 feed says `4.1.15.22`, but its signed bundle
+  says `4.1.15`; the bundle's `Info.plist` determines support. Do not normalize
+  versions or add builds manually.
+- `debug_copy_entitlements_rejected`: the build is listed, but its signing
+  entitlements failed the identity/sandbox checks. Use an unmodified official
+  client; report the bundle pair and signing entitlements for review.
 - `daily_client_single_instance_conflict`: quit the daily WeChat client normally
   from its menu, wait for it to close completely, and retry. Do not force-quit
   it.
@@ -150,6 +160,36 @@ asks for a system password.
   Tools. The standalone arm64 release already contains the compiled helper.
 - container access denied: give the invoking host application (Terminal or the
   desktop host) Full Disk Access in System Settings, then relaunch it.
+
+### Inspected builds and login-time failures
+
+The 269340 and 270102 policies were derived from Tencent's official DMGs,
+verified with `codesign --verify --deep --strict`, and checked against their
+real bundle metadata and entitlements. Provenance checking normalizes signature
+layout only on temporary executable copies; this handles the `__LINKEDIT`
+virtual-size drift seen in 269340 after re-signing while still hashing client
+code and nested signatures. Bundle inspection and private-copy preparation
+do not verify login or DB-HMAC key capture. A matching
+policy does not guarantee that recovery succeeds on every macOS/client pair.
+
+If a prepared copy exits or returns no verified key, leave the saved-session
+"Enter WeChat" button untouched while capture waits. A `crashpad_handler`
+SIGTRAP alone does not identify why the main WeChat process exited. For a
+report, include the exact attempt time, the CLI error, macOS version and the
+following metadata from the original app:
+
+```bash
+/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/WeChat.app/Contents/Info.plist
+/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' /Applications/WeChat.app/Contents/Info.plist
+codesign -d --verbose=4 /Applications/WeChat.app 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)='
+codesign -d --entitlements :- /Applications/WeChat.app
+```
+
+If available, add only the exception type and crashed thread's module/function
+names from the main WeChat crash report, or the matching sandbox `mach-register`
+denial. Redact home paths and PID suffixes; do not post full system logs, keys,
+account identifiers or chat databases. This distinguishes an unsupported build,
+a source-entitlement mismatch and a separate login-time failure.
 
 ## Current release boundary
 

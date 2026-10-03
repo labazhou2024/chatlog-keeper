@@ -26,15 +26,17 @@ JSON/HTML 导出格式与 Windows 完全一致。
 
 - 在 `~/Library/Application Support/chatlog-keeper/debug-apps/` 创建隔离副本；
 - QQ 保留原 entitlements，并增加 `com.apple.security.get-task-allow`；
-- 只有验证通过的微信 4.1.11（269136）、4.1.12（269364）、4.1.13（269579）和
-  4.1.15（270100）策略会移除 ad-hoc 副本无权声明的腾讯签名身份；这些策略要求
+- 只有已检查的微信 4.1.11（269136）、4.1.12（269340/269364）、4.1.13（269579）和
+  4.1.15（270100/270102）策略会移除 ad-hoc 副本无权声明的腾讯签名身份；这些策略要求
   application identifier、application group 与 sandbox 严格匹配 allowlist，再保留其他
   无关 entitlements，并为 PID 后缀的 rendezvous 服务增加限定的 Mach 注册例外；
-  4.1.11 与 4.1.12 必须携带精确的腾讯 Team ID，4.1.13 与 4.1.15 可以缺少该
+  4.1.11/269136 与 4.1.12/269364 必须携带精确的腾讯 Team ID，4.1.12/269340、
+  4.1.13/269579 与上述 4.1.15 构建可以缺少该
   entitlement；其他客户端版本以及未知 developer、private 或 keychain 身份声明均
   安全失败；
-- 精确的 4.1.15（270100）策略还允许该构建实机观察到的 PID 后缀 XPlayer
-  rendezvous 服务，避免媒体线程初始化时因沙盒拒绝注册端口而终止隔离副本；
+- 精确的 4.1.15（270100/270102）策略还允许在 270100 实机观察到的 PID 后缀 XPlayer
+  rendezvous 服务；270102 的 XPlayer 去除签名后内容相同，沿用该限定权限，避免媒体
+  线程初始化时因沙盒拒绝注册端口而终止隔离副本；
 - QQ 副本保留 Hardened Runtime，并在验证签名、精确 entitlement 差异以及直接依赖的
   Team-ID 关系后才启动；
 - 微信采用上游 v0.2 的兼容签名：私有副本不启用 Hardened Runtime，因为 ad-hoc 主程序
@@ -94,6 +96,12 @@ macOS 流程不会索取管理员凭据；若出现任何要求把系统密码�
 
 ## 常见问题
 
+- `debug_copy_unsupported_client`：这个精确版本/构建尚无已检查的策略。更新
+  chatlog-keeper，并对照上面的应用包版本列表。官方 270102 更新源写作 `4.1.15.22`，
+  但签名应用包实际写作 `4.1.15`；以应用包 `Info.plist` 为准，不做版本归一化，也不要
+  手动扩大允许列表。
+- `debug_copy_entitlements_rejected`：构建已在列表内，但签名权限未通过身份/沙盒检查。
+  使用未修改的官方客户端，并提供应用包版本、构建与签名权限供核查。
 - `daily_client_single_instance_conflict`：从微信菜单正常退出日常客户端，等待进程完全关闭
   后重试；不要强制退出。
 - `debug_copy_busy`：已有一个主动流程在运行，等待它结束后重试。
@@ -115,6 +123,29 @@ macOS 流程不会索取管理员凭据；若出现任何要求把系统密码�
   内置编译后的 helper。
 - container 拒绝访问：在系统设置中给实际调用者（Terminal 或桌面宿主）开启“完全磁盘
   访问权限”，然后重启调用者。
+
+### 已检查构建与登录阶段故障
+
+269340 与 270102 策略来自腾讯官方 DMG，原包通过 `codesign --verify --deep --strict`，
+并核对了真实应用包版本和 entitlements。隔离副本准备验证、登录和数据库 HMAC 取钥
+验证是不同步骤；策略匹配不能证明所有 macOS/客户端组合均能成功取钥。
+来源校验仅在临时可执行文件副本上统一签名布局，处理 269340 重签后 `__LINKEDIT`
+虚拟大小的变化；仍对客户端代码和内嵌签名计算摘要。
+
+若副本准备成功但退出或没有验证过的 key，请在捕获等待期间保持“进入微信”按钮不动。
+仅有 `crashpad_handler` 的 SIGTRAP 不能确定微信主进程退出的原因。报告时提供运行的
+精确时间、CLI 错误、macOS 版本，以及原应用的以下元数据：
+
+```bash
+/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/WeChat.app/Contents/Info.plist
+/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' /Applications/WeChat.app/Contents/Info.plist
+codesign -d --verbose=4 /Applications/WeChat.app 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)='
+codesign -d --entitlements :- /Applications/WeChat.app
+```
+
+若存在微信主进程崩溃报告，补充异常类型、崩溃线程中的模块/函数名；或提供同次运行的
+沙盒 `mach-register` 拒绝项。隐藏用户目录和 PID 后缀，不上传完整系统日志、key、账号
+标识或聊天数据库。这些证据能区分未支持构建、原包权限不匹配与独立的登录阶段故障。
 
 ## 当前发布边界
 

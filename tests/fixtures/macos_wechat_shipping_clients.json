@@ -1,0 +1,76 @@
+[
+  {
+    "client_version": [
+      "4.1.12",
+      "269340"
+    ],
+    "source_url": "https://dldir1.qq.com/weixin/Universal/Mac/xWeChatMac_universal_4.1.12.28_269340.dmg",
+    "dmg_sha256": "ef5335b6986082107889caeb77667ee3f082130f8d9c46fc42748b8dca1b762a",
+    "dmg_bytes": 509675192,
+    "bundle_identifier": "com.tencent.xinWeChat",
+    "signing_team": "5A4RE8SF68",
+    "entitlements": {
+      "com.apple.application-identifier": "5A4RE8SF68.com.tencent.xinWeChat",
+      "com.apple.security.app-sandbox": true,
+      "com.apple.security.application-groups": [
+        "5A4RE8SF68.com.tencent.xinWeChat"
+      ],
+      "com.apple.security.cs.allow-jit": true,
+      "com.apple.security.device.audio-input": true,
+      "com.apple.security.device.camera": true,
+      "com.apple.security.device.usb": true,
+      "com.apple.security.files.bookmarks.app-scope": true,
+      "com.apple.security.files.downloads.read-write": true,
+      "com.apple.security.files.user-selected.read-write": true,
+      "com.apple.security.network.client": true,
+      "com.apple.security.network.server": true,
+      "com.apple.security.personal-information.location": true,
+      "com.apple.security.personal-information.photos-library": true,
+      "com.apple.security.print": true,
+      "com.apple.security.temporary-exception.mach-lookup.global-name": [
+        "com.tencent.xinWeChat-spks",
+        "com.tencent.xinWeChat-spki"
+      ],
+      "com.apple.security.temporary-exception.sbpl": [
+        "(allow network-outbound (literal \"/private/var/run/usbmuxd\"))"
+      ]
+    }
+  },
+  {
+    "client_version": [
+      "4.1.15",
+      "270102"
+    ],
+    "source_url": "https://dldir1.qq.com/weixin/Universal/Mac/xWeChatMac_universal_4.1.15.22_270102.dmg",
+    "dmg_sha256": "d87de447a43cd2d59aef441d3a8b32aad255427289581afcffc90aee0735dfc2",
+    "dmg_bytes": 530673215,
+    "bundle_identifier": "com.tencent.xinWeChat",
+    "signing_team": "5A4RE8SF68",
+    "entitlements": {
+      "com.apple.application-identifier": "5A4RE8SF68.com.tencent.xinWeChat",
+      "com.apple.security.app-sandbox": true,
+      "com.apple.security.application-groups": [
+        "5A4RE8SF68.com.tencent.xinWeChat"
+      ],
+      "com.apple.security.cs.allow-jit": true,
+      "com.apple.security.device.audio-input": true,
+      "com.apple.security.device.camera": true,
+      "com.apple.security.device.usb": true,
+      "com.apple.security.files.bookmarks.app-scope": true,
+      "com.apple.security.files.downloads.read-write": true,
+      "com.apple.security.files.user-selected.read-write": true,
+      "com.apple.security.network.client": true,
+      "com.apple.security.network.server": true,
+      "com.apple.security.personal-information.location": true,
+      "com.apple.security.personal-information.photos-library": true,
+      "com.apple.security.print": true,
+      "com.apple.security.temporary-exception.mach-lookup.global-name": [
+        "com.tencent.xinWeChat-spks",
+        "com.tencent.xinWeChat-spki"
+      ],
+      "com.apple.security.temporary-exception.sbpl": [
+        "(allow network-outbound (literal \"/private/var/run/usbmuxd\"))"
+      ]
+    }
+  }
+]

@@ -1610,6 +1610,18 @@ def _extract_key(
                 "embedded-library signing relationship, so it was not launched; update "
                 "the connector/client or use a DB-verified manual master key"
             )
+        if reason == "debug_copy_unsupported_client":
+            return (
+                f"the installed {client_name} version/build has no verified macOS "
+                "isolated-copy policy; update chatlog-keeper and check the supported "
+                "bundle versions in docs/macos.md; do not edit the allowlist manually"
+            )
+        if reason == "debug_copy_entitlements_rejected":
+            return (
+                f"the installed {client_name} entitlements do not match its verified "
+                "macOS isolated-copy policy; use an unmodified official client and "
+                "report its bundle version/build and signing entitlements"
+            )
         if reason == "debug_copy_prepare_failed":
             return f"macOS could not prepare a verified isolated {client_name} copy"
         if reason == "debug_copy_already_running":

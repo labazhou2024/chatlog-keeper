@@ -39,8 +39,8 @@ _DEBUG_COPY_FORMATS = {
     # entitlement decision must not invalidate an unrelated QQ private copy.
     "qq": b"preserve-nested-signatures-v7-wechat-compat-exact-entitlements-kernel-pid",
     "wechat": (
-        b"preserve-nested-signatures-v14-wechat-exact-build-"
-        b"optional-team-entitlement-root-seal-xplayer-270100"
+        b"preserve-nested-signatures-v15-wechat-exact-build-"
+        b"per-build-policy-root-seal-xplayer-270102"
     ),
 }
 _GET_TASK_ALLOW_ENTITLEMENT = "com.apple.security.get-task-allow"
@@ -53,19 +53,26 @@ _WECHAT_APPLICATION_IDENTIFIER_ENTITLEMENTS = (
 )
 _WECHAT_APPLICATION_GROUPS_ENTITLEMENT = "com.apple.security.application-groups"
 _WECHAT_APPLICATION_GROUP_ALLOWLIST = frozenset({_WECHAT_APPLICATION_IDENTIFIER})
-_WECHAT_AD_HOC_SUPPORTED_CLIENTS = frozenset(
-    {
-        ("4.1.11", "269136"),
-        ("4.1.12", "269364"),
-        # 4.1.13 drops the developer team-identifier entitlement that
-        # 4.1.11 carried; see _debug_copy_entitlements for why absence
-        # is accepted while a wrong claim is still refused.
-        ("4.1.13", "269579"),
-        # 4.1.15 (270100) inspected: same entitlement shape as 4.1.13
-        # (no developer team-identifier claim, single application group).
-        ("4.1.15", "270100"),
-    }
-)
+
+
+@dataclass(frozen=True)
+class _WeChatAdHocPolicy:
+    may_omit_team_identifier: bool = False
+    allow_xplayer_registration: bool = False
+
+
+# Keys are the signed bundle's Info.plist pair, not the Sparkle feed version.
+# Keep support and its compatibility decisions together so a hotfix cannot
+# enter the allowlist while missing its entitlement policy.
+_WECHAT_AD_HOC_POLICIES = {
+    ("4.1.11", "269136"): _WeChatAdHocPolicy(),
+    ("4.1.12", "269340"): _WeChatAdHocPolicy(may_omit_team_identifier=True),
+    ("4.1.12", "269364"): _WeChatAdHocPolicy(),
+    ("4.1.13", "269579"): _WeChatAdHocPolicy(may_omit_team_identifier=True),
+    ("4.1.15", "270100"): _WeChatAdHocPolicy(True, True),
+    ("4.1.15", "270102"): _WeChatAdHocPolicy(True, True),
+}
+_WECHAT_AD_HOC_SUPPORTED_CLIENTS = frozenset(_WECHAT_AD_HOC_POLICIES)
 _WECHAT_MACH_REGISTER_ENTITLEMENT = (
     "com.apple.security.temporary-exception.mach-register.global-name"
 )
@@ -244,7 +251,13 @@ def _stable_regular_file_digest(path: Path) -> Optional[bytes]:
 
 
 def _unsigned_executable_digest(executable: Path) -> Optional[bytes]:
-    """Hash Mach-O content after stripping only its mutable code signature."""
+    """Hash Mach-O content with deterministic signature-owned layout metadata.
+
+    Removing a signature alone can retain its size in __LINKEDIT.vmsize.
+    Strip, apply a fixed empty ad-hoc signature, then strip again so source
+    and private-copy signature sizes cannot affect the provenance digest.
+    Every operation touches only a temporary copy; no client code is patched.
+    """
     try:
         with tempfile.TemporaryDirectory(prefix="chatlog_unsigned_macho_") as raw:
             candidate = Path(raw) / "executable"
@@ -255,8 +268,26 @@ def _unsigned_executable_digest(executable: Path) -> Optional[bytes]:
             )
             if removed.returncode != 0:
                 return None
+            entitlements = Path(raw) / "entitlements.plist"
+            entitlements.write_bytes(plistlib.dumps({}))
+            canonical = _run(
+                [
+                    "codesign", "--force", "--sign", "-",
+                    "--identifier", "chatlog-keeper.provenance",
+                    "--options", "0", "--entitlements", str(entitlements),
+                    str(candidate),
+                ],
+                timeout=60,
+            )
+            if canonical.returncode != 0:
+                return None
+            removed = _run(
+                ["codesign", "--remove-signature", str(candidate)], timeout=60,
+            )
+            if removed.returncode != 0:
+                return None
             return _stable_regular_file_digest(candidate)
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
 
 
@@ -411,15 +442,16 @@ def _debug_copy_entitlements(
     preserving them under an ad-hoc signature passes ``codesign --verify`` but
     is rejected by AMFI at exec time.  Remove only the known identity-bound
     values.  WeChat 4.1.13 no longer carries the developer team-identifier
-    claim at all, and 4.1.15 keeps that shape; an absent claim is accepted for
-    these verified clients because it is strictly weaker than a present one,
-    while a present-but-wrong team is still refused.  The
+    claim at all; inspected 4.1.12/269340 and 4.1.15 builds share that shape.
+    An absent claim is accepted for these verified clients because it is
+    strictly weaker than a present one, while a present-but-wrong team is
+    still refused.  The
     team remains pinned twice over by the application identifier and the
-    application-group allowlist.  Older allowlisted builds must retain their
-    exact team claim.  The sandboxed WeChat process also registers
+    application-group allowlist.  Builds whose policy requires the claim must
+    retain it.  The sandboxed WeChat process also registers
     PID-suffixed Mach rendezvous services under its original application
-    identifier; after the signing identity is removed, preserve only that
-    exact capabilities through Apple's scoped temporary-exception entitlement.
+    identifier; after the signing identity is removed, preserve only
+    those capabilities through Apple's scoped temporary-exception entitlement.
     Fail closed if a future client introduces another developer, private, or
     keychain identity claim that needs a separate compatibility decision.
     """
@@ -428,7 +460,8 @@ def _debug_copy_entitlements(
         return None
     expected = dict(original_entitlements)
     if source == "wechat":
-        if client_version not in _WECHAT_AD_HOC_SUPPORTED_CLIENTS:
+        policy = _WECHAT_AD_HOC_POLICIES.get(client_version)
+        if policy is None:
             return None
         identifier_values = [
             original_entitlements[key]
@@ -438,10 +471,6 @@ def _debug_copy_entitlements(
         team_identifier_key = "com.apple.developer.team-identifier"
         has_team_identifier = team_identifier_key in original_entitlements
         team_identifier = original_entitlements.get(team_identifier_key)
-        may_omit_team_identifier = client_version in {
-            ("4.1.13", "269579"),
-            ("4.1.15", "270100"),
-        }
         application_groups = original_entitlements.get(
             _WECHAT_APPLICATION_GROUPS_ENTITLEMENT
         )
@@ -450,7 +479,7 @@ def _debug_copy_entitlements(
             or any(not isinstance(value, str) for value in identifier_values)
             or set(identifier_values) != {_WECHAT_APPLICATION_IDENTIFIER}
             or (
-                (has_team_identifier or not may_omit_team_identifier)
+                (has_team_identifier or not policy.may_omit_team_identifier)
                 and team_identifier != _WECHAT_TEAM_IDENTIFIER
             )
             or original_entitlements.get(_APP_SANDBOX_ENTITLEMENT) is not True
@@ -474,11 +503,12 @@ def _debug_copy_entitlements(
             f"{_WECHAT_APPLICATION_IDENTIFIER}.MachPortRendezvousServer.*",
             f"{_WECHAT_APPLICATION_IDENTIFIER}.MMMojo.MachPortRendezvousServer.*",
         ]
-        if client_version == ("4.1.15", "270100"):
+        if policy.allow_xplayer_registration:
             # Native 270100 sandbox diagnostics show libxplayer registering
             # this additional PID-suffixed service. Without the exact grant,
             # XPlayerMojomThread may trap during login before key verification.
-            # Keep older builds and unrelated Mach service names unchanged.
+            # 270102 has the identical unsigned libxplayer payload; preserve
+            # the same scoped capability without adding unrelated Mach names.
             expected[_WECHAT_MACH_REGISTER_ENTITLEMENT].append(
                 f"{_WECHAT_APPLICATION_IDENTIFIER}.XPlayerMachPortRendezvousServer.*"
             )
@@ -814,6 +844,8 @@ def _validate_prepared_debug_copy(source: str, target: Path) -> bool:
 
 def prepare_debug_copy(source: str) -> Optional[Path]:
     """Return a verified debug-enabled app copy, or ``None`` on failure."""
+    global _LAST_ERROR
+    _LAST_ERROR = ""
     if sys.platform != "darwin" or source not in _APPS:
         return None
     original, _ = _APPS[source]
@@ -825,6 +857,9 @@ def prepare_debug_copy(source: str) -> Optional[Path]:
             _app_client_version(original) if source == "wechat" else None
         )
     except OSError:
+        return None
+    if source == "wechat" and client_version not in _WECHAT_AD_HOC_POLICIES:
+        _LAST_ERROR = "debug_copy_unsupported_client"
         return None
     root = data_dir() / "debug-apps"
     if not _private_directory(root):
@@ -839,6 +874,7 @@ def prepare_debug_copy(source: str) -> Optional[Path]:
         client_version=client_version,
     )
     if expected_entitlements is None:
+        _LAST_ERROR = "debug_copy_entitlements_rejected"
         return None
     hardened_runtime = _copy_uses_hardened_runtime(source)
 
@@ -1716,7 +1752,7 @@ def launch_debug_copy(
 
     target = prepare_debug_copy(source)
     if not target:
-        _LAST_ERROR = "debug_copy_prepare_failed"
+        _LAST_ERROR = _LAST_ERROR or "debug_copy_prepare_failed"
         return None
     if not _validate_prepared_debug_copy(source, target):
         _LAST_ERROR = "debug_copy_validation_failed"
