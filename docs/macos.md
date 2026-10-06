@@ -72,12 +72,13 @@ The original app remains unchanged. A client update creates a new
 content-addressed isolated copy rather than silently reusing the previous one.
 WeChat remains single-instance: quit the daily client normally from its menu
 and wait for it to close before starting the active flow. The tool does not
-force-quit the daily client. The private copy reuses the current login session
-and captures the key automatically; no account switching is required. If the
-saved-session "Enter WeChat" window appears, do not click it while the command
-is waiting: the button may hand control back to the installed signed client
-before the private observer captures the key. Only an expired session requires
-scanning WeChat's official login QR code while the command waits. The command
+force-quit the daily client. The private copy reuses the current login session;
+no account switching is required. If the saved-session "Enter WeChat" window
+appears, click it in the private copy and complete any phone confirmation while
+the command waits. Remaining at that window may never open the message database
+or produce a key. If macOS asks the isolated `WeChat-…` app to access other apps'
+data, allow that system prompt; it can block startup before the observer loads.
+An expired session requires WeChat's official QR login. The command
 verifies the candidate against the database, closes every frozen process
 generation executing inside its private bundle (including nested helpers,
 never the installed client), and removes the exact FIFO and staged dylib
@@ -118,8 +119,9 @@ chatlog-keeper qq --days 7 --out ./out
 ```
 
 The active flow may open a separate WeChat or QQ window. WeChat first reuses the
-existing session and never requires account switching. Only an expired session
-requires its official QR login while the command waits. The macOS flow never
+existing session and never requires account switching. Complete any "Enter
+WeChat", phone confirmation, or macOS app-data access prompt while it waits.
+An expired session requires its official QR login. The macOS flow never
 asks for administrator credentials. Stop if any terminal or third-party prompt
 asks for a system password.
 
@@ -145,6 +147,20 @@ asks for a system password.
 - `capture_channel_*` / `capture_library_*`: the temporary channel failed a
   permission, signature, hash, or cleanup check; update or reinstall the
   connector and retry.
+- `capture_library_not_loaded`: no startup acknowledgement arrived. Check for
+  a macOS app-data access prompt for the isolated copy before retrying; a blocked
+  launch and a missing observer can both cause this observation.
+- `capture_environment_missing`: the observer reported missing FIFO environment.
+- `capture_no_kdf_calls`: the observer loaded but saw no PBKDF2 calls. Complete
+  login in the private copy; an unsupported native boundary is another possible
+  cause, not a conclusion from this status alone.
+- `capture_symbol_unresolved` / `capture_kdf_shape_unmatched`: the observer could
+  not resolve system CommonCrypto or saw only unmatched PBKDF2 parameters.
+  Report the error and client bundle version/build. Every candidate still
+  requires local DB HMAC verification.
+- `capture_native_write_failed`: the native observer could not write its private
+  FIFO; retry after closing the isolated copy and check the container's Full
+  Disk Access grant.
 - `debug_copy_library_validation_incompatible`: a Hardened Runtime copy's required
   embedded libraries do not share a launch-compatible Team ID with the isolated
   main executable. The tool does not launch it; use a DB-verified manual key.
@@ -172,8 +188,15 @@ code and nested signatures. Bundle inspection and private-copy preparation
 do not verify login or DB-HMAC key capture. A matching
 policy does not guarantee that recovery succeeds on every macOS/client pair.
 
-If a prepared copy exits or returns no verified key, leave the saved-session
-"Enter WeChat" button untouched while capture waits. A `crashpad_handler`
+One arm64 live run on the official `4.1.15 / 270102` bundle completed app-data
+authorization and login, captured 24 candidates, and returned a 32-byte key
+that passed an independent database HMAC check, without using the key cache.
+Cleanup removed the private process and capture files; the installed app still
+passed strict signature verification. This validates that scenario, not every
+macOS permission or account state.
+
+If a prepared copy exits or returns no verified key, first check that app-data
+authorization and login completed in the private copy. A `crashpad_handler`
 SIGTRAP alone does not identify why the main WeChat process exited. For a
 report, include the exact attempt time, the CLI error, macOS version and the
 following metadata from the original app:

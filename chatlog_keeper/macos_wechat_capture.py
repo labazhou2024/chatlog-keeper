@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,10 +25,26 @@ from typing import Callable, Optional
 from chatlog_keeper.core._path_resolver import data_dir
 
 _LAST_ERROR = ""
-_CAPTURE_FORMAT = b"wechat-pbkdf2-startup-interpose-v5-concrete-image-hard-fail"
+_CAPTURE_FORMAT = b"wechat-pbkdf2-startup-interpose-v6-status"
 _RECORD_MAGIC = b"WXK1"
 _RECORD_SIZE = len(_RECORD_MAGIC) + 32
-_MAX_BUFFER_BYTES = _RECORD_SIZE * 1024
+_STATUS_MAGIC = b"WXS1"
+# Status frames never contain pointers, paths, counters larger than uint32, or
+# candidate bytes.  They are intentionally a different size from WXK1 so the
+# parser can safely interleave them on one FIFO.
+_STATUS_SIZE = 16
+_MAX_BUFFER_BYTES = max(_RECORD_SIZE, _STATUS_SIZE) * 2048
+_STATUS_EVENTS = {
+    1: "constructor",
+    2: "load",
+    3: "resolve_attempt",
+    4: "resolve_ok",
+    5: "resolve_failed",
+    6: "call",
+    7: "match",
+    8: "write_ok",
+    9: "write_failed",
+}
 _TEAM_IDENTIFIER_RE = re.compile(
     r"^TeamIdentifier=(?P<team>[^\r\n]+)$",
     re.MULTILINE,
@@ -44,6 +61,13 @@ def last_error() -> str:
 def clear_last_error() -> None:
     global _LAST_ERROR
     _LAST_ERROR = ""
+
+
+def set_last_error(reason: str) -> None:
+    """Set an internal reason after the channel has been closed safely."""
+    global _LAST_ERROR
+    if reason:
+        _LAST_ERROR = reason
 
 
 def _source_path() -> Path:
@@ -443,6 +467,15 @@ def _container_tmp_for_database(db_path: Path) -> Optional[Path]:
 
 
 @dataclass
+class CaptureDiagnostic:
+    """A key-free status frame emitted by the native observer."""
+
+    event: str
+    code: int
+    detail: int = 0
+
+
+@dataclass
 class CaptureChannel:
     path: Path
     read_fd: int
@@ -454,6 +487,9 @@ class CaptureChannel:
     library_path: Optional[Path] = None
     library_device: Optional[int] = None
     library_inode: Optional[int] = None
+    diagnostics: list[CaptureDiagnostic] = field(default_factory=list)
+    _diagnostic_counts: dict[str, int] = field(default_factory=dict)
+    _diagnostic_details: dict[str, int] = field(default_factory=dict)
 
     @property
     def identity(self) -> tuple[int, int]:
@@ -464,6 +500,47 @@ class CaptureChannel:
         if self.library_device is None or self.library_inode is None:
             return None
         return self.library_device, self.library_inode
+
+    def diagnostic_snapshot(self) -> dict[str, object]:
+        """Return bounded, non-secret native capture state for troubleshooting."""
+        return {
+            "events": [
+                {"event": event.event, "code": event.code, "detail": event.detail}
+                for event in self.diagnostics
+            ],
+            "counts": dict(self._diagnostic_counts),
+            "invalid": self.invalid,
+            "closed": self.closed,
+        }
+
+    def diagnostic_failure(self) -> Optional[str]:
+        """Map key-free native observations to a stable internal reason."""
+        counts = self._diagnostic_counts
+        if self.invalid:
+            return _LAST_ERROR or "capture_channel_invalid_record"
+        if counts.get("write_failed") and not counts.get("write_ok"):
+            return "capture_native_write_failed"
+        if not counts.get("constructor"):
+            return "capture_library_not_loaded"
+        if self._diagnostic_details.get("load") == 0:
+            return "capture_environment_missing"
+        if counts.get("resolve_failed"):
+            return "capture_symbol_unresolved"
+        if counts.get("call") and not counts.get("match"):
+            return "capture_kdf_shape_unmatched"
+        if counts.get("call"):
+            return None
+        return "capture_no_kdf_calls"
+
+    def _record_diagnostic(self, code: int, detail: int) -> None:
+        event = _STATUS_EVENTS.get(code, "unknown")
+        self._diagnostic_counts[event] = self._diagnostic_counts.get(event, 0) + 1
+        self._diagnostic_details[event] = detail
+        # Keep the parser bounded even if a compromised process floods status
+        # frames. Counts remain complete while the human-readable event list is
+        # capped to the same limit as candidate buffering.
+        if len(self.diagnostics) < 2048:
+            self.diagnostics.append(CaptureDiagnostic(event, code, detail))
 
     def read_candidates(self) -> list[bytes]:
         """Drain complete fixed-size records without blocking or logging bytes."""
@@ -488,14 +565,30 @@ class CaptureChannel:
                 return []
 
         candidates: list[bytes] = []
-        while len(self._buffer) >= _RECORD_SIZE:
-            record = bytes(self._buffer[:_RECORD_SIZE])
-            del self._buffer[:_RECORD_SIZE]
-            if not record.startswith(_RECORD_MAGIC):
+        while len(self._buffer) >= 4:
+            if self._buffer.startswith(_RECORD_MAGIC):
+                record_size = _RECORD_SIZE
+            elif self._buffer.startswith(_STATUS_MAGIC):
+                record_size = _STATUS_SIZE
+            else:
                 self.invalid = True
                 _LAST_ERROR = "capture_channel_invalid_record"
                 return []
-            candidates.append(record[len(_RECORD_MAGIC):])
+            if len(self._buffer) < record_size:
+                break
+            record = bytes(self._buffer[:record_size])
+            del self._buffer[:record_size]
+            if record.startswith(_RECORD_MAGIC):
+                candidates.append(record[len(_RECORD_MAGIC):])
+            else:
+                # WXS1 + one-byte event + uint32 detail + seven reserved bytes.
+                code = record[4]
+                detail = struct.unpack_from("<I", record, 5)[0]
+                if code not in _STATUS_EVENTS or any(record[9:]):
+                    self.invalid = True
+                    _LAST_ERROR = "capture_channel_invalid_status"
+                    return []
+                self._record_diagnostic(code, detail)
         return candidates
 
     def close(self) -> bool:
