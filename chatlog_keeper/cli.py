@@ -1610,6 +1610,18 @@ def _extract_key(
                 "embedded-library signing relationship, so it was not launched; update "
                 "the connector/client or use a DB-verified manual master key"
             )
+        if reason == "debug_copy_unsupported_client":
+            return (
+                f"the installed {client_name} version/build has no verified macOS "
+                "isolated-copy policy; update chatlog-keeper and check the supported "
+                "bundle versions in docs/macos.md; do not edit the allowlist manually"
+            )
+        if reason == "debug_copy_entitlements_rejected":
+            return (
+                f"the installed {client_name} entitlements do not match its verified "
+                "macOS isolated-copy policy; use an unmodified official client and "
+                "report its bundle version/build and signing entitlements"
+            )
         if reason == "debug_copy_prepare_failed":
             return f"macOS could not prepare a verified isolated {client_name} copy"
         if reason == "debug_copy_already_running":
@@ -1665,6 +1677,35 @@ def _extract_key(
                 "the private WeChat startup capture channel failed its security or "
                 "cleanup checks; retry Active Key"
             )
+        if capture_reason == "capture_library_not_loaded":
+            return (
+                "no startup acknowledgement arrived from the private WeChat capture "
+                "library; check for a macOS permission prompt for the isolated copy "
+                "and allow access to other apps data before retrying"
+            )
+        if capture_reason == "capture_environment_missing":
+            return (
+                "the private WeChat copy started without the startup capture channel "
+                "environment; repair the isolated launch path before retrying Active Key"
+            )
+        if capture_reason == "capture_symbol_unresolved":
+            return (
+                "the private WeChat copy reached the capture hook but its CommonCrypto "
+                "symbol could not be resolved; update the macOS capture helper"
+            )
+        if capture_reason == "capture_kdf_shape_unmatched":
+            return (
+                "WeChat called a different key-derivation shape than the verified "
+                "capture policy; report this error and the client bundle version/build"
+            )
+        if capture_reason == "capture_no_kdf_calls":
+            return (
+                "the private WeChat copy loaded the capture library but did not call "
+                "a recognized key-derivation boundary; complete Enter WeChat and any "
+                "phone confirmation in the private copy while the command waits"
+            )
+        if capture_reason == "capture_native_write_failed":
+            return "the native capture hook could not write to its private channel; retry Active Key"
         if capture_reason:
             return f"macOS WeChat startup capture failed: {capture_reason}"
         try:
@@ -1681,8 +1722,9 @@ def _extract_key(
             return f"macOS key helper failed: {reason}"
         if source == "wechat":
             return (
-                "the private WeChat session produced no DB-verified key before the "
-                "authentication window expired; no account switching is required"
+                "the private WeChat session ended without a DB-verified key; "
+                "complete login and any macOS app-data access prompt while the "
+                "command waits; no account switching is required"
             )
         return "macOS memory scan produced no DB-verified key candidate"
     if method == "auto":

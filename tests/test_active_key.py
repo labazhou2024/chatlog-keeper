@@ -484,6 +484,75 @@ def test_macos_wechat_never_returns_unverified_startup_candidate(
     assert ak.extract_wechat_key_active(db_path=str(db), timeout=1) is None
 
 
+@pytest.mark.parametrize(
+    "cleanup_ok, channel_ok, cancelled, expected_key",
+    [(True, True, False, True), (False, True, False, False),
+     (True, False, False, False), (True, True, True, False)],
+)
+def test_macos_wechat_drains_candidate_after_process_invalidation(
+    monkeypatch, tmp_path, cleanup_ok, channel_ok, cancelled, expected_key
+):
+    """A launchd exit must not strand a candidate already written to the FIFO."""
+    db = tmp_path / "message_0.db"
+    db.write_bytes(b"x" * 4096)
+    key = bytes(range(32))
+    clock = {"now": 0.0}
+
+    class FinalDrainChannel(_EmptyCaptureChannel):
+        def __init__(self, path):
+            super().__init__(path)
+            self.reads = 0
+
+        def read_candidates(self):
+            self.reads += 1
+            # First loop: no startup candidate.  The process then disappears;
+            # the candidate is what remains buffered in the final drain.
+            return [key] if self.reads == 3 else []
+
+        def close(self):
+            self.closed = True
+            return channel_ok
+
+    channel = FinalDrainChannel(tmp_path / "capture.fifo")
+    monkeypatch.setattr(ak.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        macos_wechat_capture,
+        "create_capture_channel",
+        lambda db_path, **kwargs: channel,
+    )
+    monkeypatch.setattr(macos_debug_app, "launch_debug_copy", lambda source, **kwargs: 42)
+    validity = iter([True, False])
+    monkeypatch.setattr(
+        macos_debug_app,
+        "validate_debug_copy_process",
+        lambda source, pid: next(validity, False),
+    )
+    monkeypatch.setattr(
+        macos_debug_app,
+        "debug_copy_process_identity",
+        lambda source, pid: (b"/tmp/isolated-wechat", 100, 200),
+    )
+    # Natural exit counts as clean only when exact-generation and bundle
+    # cleanup both succeed. Never bypass a failed cleanup verdict.
+    monkeypatch.setattr(macos_debug_app, "terminate_debug_copy", lambda source, pid: cleanup_ok)
+    monkeypatch.setattr(macos_key, "extract_verified", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wechat_db, "_read_stable_page1", lambda path: b"A" * 4096)
+    monkeypatch.setattr(wechat_db, "_verify_key_v4", lambda candidate, page: candidate == key)
+    monkeypatch.setattr(ak.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        ak.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+
+    result = ak.extract_wechat_key_active(
+        db_path=str(db), timeout=5,
+        _cancel_requested=lambda: cancelled and channel.reads >= 3,
+    )
+    assert result == (key if expected_key else None)
+    assert channel.closed
+
+
 def test_macos_wechat_fifo_cleanup_failure_rejects_captured_key(
     monkeypatch, tmp_path
 ):

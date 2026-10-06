@@ -62,6 +62,78 @@ def test_capture_channel_reads_fixed_records_and_removes_fifo(tmp_path):
     assert not path.exists()
 
 
+def test_capture_channel_parses_key_free_status_frames(tmp_path):
+    database, _ = _database_in_container(tmp_path)
+    channel = macos_wechat_capture.create_capture_channel(database)
+    assert channel is not None
+    key = bytes(range(32))
+    status = bytearray(16)
+    status[:4] = b"WXS1"
+    status[4] = 4  # resolve_ok
+    status[5:9] = (1).to_bytes(4, "little")
+    write_fd = os.open(channel.path, os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        os.write(write_fd, bytes(status) + b"WXK1" + key)
+    finally:
+        os.close(write_fd)
+
+    assert channel.read_candidates() == [key]
+    assert channel.diagnostic_snapshot()["counts"] == {"resolve_ok": 1}
+    assert channel.diagnostic_snapshot()["events"] == [
+        {"event": "resolve_ok", "code": 4, "detail": 1}
+    ]
+    assert channel.close() is True
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        ([], "capture_library_not_loaded"),
+        ([1, 6], "capture_kdf_shape_unmatched"),
+        ([1, 6, 7], None),
+        ([1, 5], "capture_symbol_unresolved"),
+    ],
+)
+def test_capture_channel_diagnostic_failure_is_key_free(
+    tmp_path, events, expected
+):
+    database, _ = _database_in_container(tmp_path)
+    channel = macos_wechat_capture.create_capture_channel(database)
+    assert channel is not None
+    write_fd = os.open(channel.path, os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        payload = bytearray()
+        for code in events:
+            frame = bytearray(16)
+            frame[:4] = b"WXS1"
+            frame[4] = code
+            payload.extend(frame)
+        os.write(write_fd, payload)
+    finally:
+        os.close(write_fd)
+    assert channel.read_candidates() == []
+    assert channel.diagnostic_failure() == expected
+    channel.close()
+
+
+def test_capture_channel_rejects_unknown_status_event(tmp_path):
+    database, _ = _database_in_container(tmp_path)
+    channel = macos_wechat_capture.create_capture_channel(database)
+    assert channel is not None
+    write_fd = os.open(channel.path, os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        malformed = bytearray(16)
+        malformed[:4] = b"WXS1"
+        malformed[4] = 255
+        os.write(write_fd, malformed)
+    finally:
+        os.close(write_fd)
+    assert channel.read_candidates() == []
+    assert channel.invalid is True
+    assert macos_wechat_capture.last_error() == "capture_channel_invalid_status"
+    assert channel.close() is True
+
+
 def test_capture_channel_rejects_invalid_record(tmp_path):
     database, _ = _database_in_container(tmp_path)
     channel = macos_wechat_capture.create_capture_channel(database)
@@ -344,8 +416,22 @@ def test_real_interposer_forwards_concurrent_calls_without_recursing(
     fifo = tmp_path / "capture.fifo"
     executed, records = _run_capture_host(host, library, fifo)
     assert executed.returncode == 0
-    assert len(records) == 16 * 36
-    captured = [records[index:index + 36] for index in range(0, len(records), 36)]
+    captured = []
+    statuses = []
+    offset = 0
+    while offset < len(records):
+        if records[offset:offset + 4] == b"WXK1":
+            captured.append(records[offset:offset + 36])
+            offset += 36
+        elif records[offset:offset + 4] == b"WXS1":
+            assert len(records[offset:offset + 16]) == 16
+            assert not any(records[offset + 9:offset + 16])
+            statuses.append(records[offset + 4])
+            offset += 16
+        else:
+            pytest.fail("unknown native capture frame")
+    assert sorted(statuses) == [1, 2, 3, 4, 6, 7, 8]
+    assert len(captured) == 16
     assert all(record[:4] == b"WXK1" for record in captured)
     assert sorted(record[4:] for record in captured) == [
         bytes([index]) + bytes(31) for index in range(1, 17)

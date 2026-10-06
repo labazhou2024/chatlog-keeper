@@ -49,7 +49,7 @@
 | Windows | 微信 ≤ 4.0.x | raw-key（`enc_key` 直接用） | 被动内存扫描 |
 | Windows | 微信 4.1.10.31+ | password 模式 —— `PBKDF2-HMAC-SHA512(enc_key, salt, 256000)` | 一次性调试器 |
 | Windows | QQ NTQQ 9.9.x | 每库口令 | 被动扫描或一次性调试器 |
-| macOS arm64 | 微信 4.1.11（269136）、4.1.12（269364）、4.1.13（269579）、4.1.15（270100） | 由 page-1 HMAC 自动选择 raw/password 模式 | 被动扫描；主动流程仅在签名预检通过时可用 |
+| macOS arm64 | 微信 4.1.11（269136）、4.1.12（269364）、4.1.13（269579）、4.1.15（270100/270102） | 由 page-1 HMAC 自动选择 raw/password 模式 | 被动扫描；主动流程仅在签名预检通过时可用 |
 | macOS arm64 | QQ 6.9.95（build 36385） | 每库口令 | 被动扫描；主动流程仅在签名预检通过时可用 |
 | Linux x86_64 | 官方原生微信 4.1.13.9（`.deb`，实测 ELF 身份见 [Linux 说明](docs/linux.zh.md)） | password 模式，page-1 HMAC 已验证 | 启动期内部 WCDB KDF 硬件断点；需要带 Python 支持的 GDB |
 | Linux x86_64 | 官方 QQ NT（`.deb`） | 每库口令 | spawn 后扫描子进程；Yama 下被动扫描常被拒绝 |

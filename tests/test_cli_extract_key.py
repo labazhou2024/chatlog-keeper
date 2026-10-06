@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from chatlog_keeper import (
     cli,
     macos_debug_app,
@@ -226,6 +228,25 @@ def test_wechat_active_reports_unverifiable_library_validation_without_new_field
     assert "not launched" in result["error"]
 
 
+@pytest.mark.parametrize("reason, expected", [
+    ("debug_copy_unsupported_client", "version/build has no verified macOS"),
+    ("debug_copy_entitlements_rejected", "entitlements do not match"),
+])
+def test_wechat_active_reports_build_policy_failure_without_new_fields(
+    monkeypatch, tmp_path, reason, expected,
+):
+    _mk_message_db(tmp_path / "xwechat_files")
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    monkeypatch.setattr(cli.active_key, "extract_wechat_key_active", lambda **kwargs: None)
+    monkeypatch.setattr(macos_debug_app, "last_error", lambda: reason)
+    result = cli._extract_key("wechat", "active", data_root=str(tmp_path / "xwechat_files"))
+    assert set(result) == {
+        "source", "method", "ok", "error", "db_path", "key_recovery_flow",
+    }
+    assert result["ok"] is False
+    assert expected in result["error"]
+
+
 def test_wechat_active_reports_capture_preflight_without_contract_drift(
     monkeypatch, tmp_path
 ):
@@ -267,3 +288,26 @@ def test_wechat_data_root_discovers_root_level_relocation(monkeypatch, tmp_path)
     monkeypatch.setattr(_paths, "candidate_documents_roots", lambda: [])
 
     assert wechat_db.find_weixin_data_root() == relocated
+
+
+@pytest.mark.parametrize("reason, expected", [
+    ("capture_library_not_loaded", "macOS permission prompt"),
+    ("capture_no_kdf_calls", "complete Enter WeChat"),
+    ("capture_kdf_shape_unmatched", "key-derivation shape"),
+    ("capture_symbol_unresolved", "could not be resolved"),
+    ("capture_native_write_failed", "could not write"),
+])
+def test_wechat_capture_diagnostics_preserve_cli_contract(
+    monkeypatch, tmp_path, reason, expected,
+):
+    _mk_message_db(tmp_path / "xwechat_files")
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    monkeypatch.setattr(cli.active_key, "extract_wechat_key_active", lambda **kwargs: None)
+    monkeypatch.setattr(macos_debug_app, "last_error", lambda: "")
+    monkeypatch.setattr(macos_wechat_capture, "last_error", lambda: reason)
+    result = cli._extract_key("wechat", "active", data_root=str(tmp_path / "xwechat_files"))
+    assert set(result) == {
+        "source", "method", "ok", "error", "db_path", "key_recovery_flow",
+    }
+    assert result["ok"] is False
+    assert expected in result["error"]

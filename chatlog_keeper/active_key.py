@@ -1473,6 +1473,9 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
         result = None
         process_clean = True
         channel_clean = False
+        process_seen_valid = False
+        capture_failure = None
+        pending_candidates: List[bytes] = []
         try:
             launch_options = {
                 "capture_library": capture_channel.library_path,
@@ -1494,7 +1497,6 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
                 # the stable PID.  Keep candidates in bounded process memory
                 # until the matching DB page exists; login may create/replace
                 # that page just after the KDF call.
-                pending_candidates: List[bytes] = []
                 deadline = time.monotonic() + max(1, int(timeout))
                 while True:
                     if _cancel_requested is not None and _cancel_requested():
@@ -1504,6 +1506,7 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
                         break
                     if not validate_debug_copy_process("wechat", debug_pid):
                         break
+                    process_seen_valid = True
 
                     for candidate in capture_channel.read_candidates():
                         if candidate not in pending_candidates:
@@ -1607,15 +1610,56 @@ def extract_wechat_key_active(*, weixin_dll: Optional[str] = None,
                     if remaining <= 0:
                         break
                     time.sleep(min(_MACOS_WECHAT_LOGIN_POLL_SECONDS, remaining))
+
         finally:
             try:
                 if debug_pid is not None:
                     process_clean = terminate_debug_copy("wechat", debug_pid)
             finally:
-                channel_clean = capture_channel.close()
+                # Drain after cleanup: the last native write may race process
+                # exit or the deadline. Verification happens below, outside
+                # finally, so cancellation and exceptions cannot return a key.
+                try:
+                    if process_seen_valid and not capture_channel.invalid:
+                        for candidate in capture_channel.read_candidates():
+                            if candidate not in pending_candidates:
+                                pending_candidates.append(candidate)
+                    diagnostic_failure = getattr(
+                        capture_channel, "diagnostic_failure", None
+                    )
+                    capture_failure = (
+                        diagnostic_failure() if callable(diagnostic_failure) else None
+                    )
+                finally:
+                    channel_clean = capture_channel.close()
 
-        if not debug_pid or not process_clean or not channel_clean:
+        if (
+            not debug_pid or not process_clean or not channel_clean
+            or capture_channel.invalid
+        ):
             return None
+        if _cancel_requested is not None and _cancel_requested():
+            return None
+        if result is None and process_seen_valid:
+            # A naturally exited process is already handled by exact-generation
+            # cleanup. Preserve its buffered record only after cleanup succeeds
+            # and two current stable-page HMAC checks prove the database key.
+            for oracle_path in _wechat_active_oracle_paths(resolved, wechat_db):
+                page1 = wechat_db._read_stable_page1(oracle_path)
+                if not page1:
+                    continue
+                for candidate in pending_candidates:
+                    if not wechat_db._verify_key_v4(candidate, page1):
+                        continue
+                    latest_page1 = wechat_db._read_stable_page1(oracle_path)
+                    if latest_page1 and wechat_db._verify_key_v4(candidate, latest_page1):
+                        result = candidate
+                        break
+                if result is not None:
+                    break
+        if result is None and capture_failure:
+            from chatlog_keeper.macos_wechat_capture import set_last_error
+            set_last_error(capture_failure)
         return result
     if _is_linux_host():
         if analyze_only:

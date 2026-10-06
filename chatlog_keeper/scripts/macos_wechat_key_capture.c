@@ -2,11 +2,11 @@
  * Startup-time WeChat key candidate capture for macOS.
  *
  * This library is loaded only into chatlog-keeper's private, ad-hoc-signed
- * WeChat copy.  It interposes CommonCrypto's PBKDF2 boundary before any app
- * code runs, copies only the narrowly-shaped WeChat database password
- * candidate, and forwards it through a caller-created FIFO.  The Python caller
- * still HMAC-verifies every candidate against the user's local message DB
- * before it can be cached.
+ * WeChat copy. It interposes CommonCrypto's PBKDF2 boundary before app code runs,
+ * copies only bounded 32-byte password candidates, and forwards them through
+ * a caller-created FIFO. Key-free WXS1 status frames share that FIFO with WXK1
+ * candidates, so load/resolve/match/write failures are visible without
+ * exposing candidate bytes.
  */
 #include <CommonCrypto/CommonKeyDerivation.h>
 #include <CommonCrypto/CommonCryptor.h>
@@ -23,6 +23,8 @@
 
 #define CAPTURE_ENV "CHATLOG_KEEPER_WECHAT_KEY_FIFO"
 #define CAPTURE_MAGIC "WXK1"
+#define STATUS_MAGIC "WXS1"
+#define STATUS_RECORD_BYTES 16u
 #define WECHAT_MASTER_KEY_BYTES 32u
 #define WECHAT_SALT_BYTES 16u
 #define WECHAT_KDF_ROUNDS 256000u
@@ -54,6 +56,28 @@ static int capture_pbkdf(
 
 static pthread_once_t original_once = PTHREAD_ONCE_INIT;
 static pbkdf_fn original_pbkdf = NULL;
+static int emit_status(unsigned char event, uint32_t detail);
+static volatile uint32_t candidate_count = 0;
+static volatile uint32_t status_flags = 0;
+
+enum capture_status {
+    STATUS_CONSTRUCTOR = 1,
+    STATUS_LOAD = 2,
+    STATUS_RESOLVE_ATTEMPT = 3,
+    STATUS_RESOLVE_OK = 4,
+    STATUS_RESOLVE_FAILED = 5,
+    STATUS_CALL = 6,
+    STATUS_MATCH = 7,
+    STATUS_WRITE_OK = 8,
+    STATUS_WRITE_FAILED = 9,
+};
+
+static void emit_status_once(unsigned char event, uint32_t detail) {
+    if (event == 0 || event > 31) return;
+    uint32_t bit = (uint32_t)1u << (event - 1u);
+    if ((__sync_fetch_and_or(&status_flags, bit) & bit) == 0)
+        (void)emit_status(event, detail);
+}
 
 static void *common_crypto_symbol_address(void) {
     uint32_t image_count = _dyld_image_count();
@@ -93,10 +117,16 @@ static void resolve_original_once(void) {
      * is deliberately no RTLD_NEXT fallback.
      */
     void *symbol = common_crypto_symbol_address();
-    if (symbol != NULL) memcpy(&original_pbkdf, &symbol, sizeof(original_pbkdf));
+    if (symbol != NULL) {
+        memcpy(&original_pbkdf, &symbol, sizeof(original_pbkdf));
+        emit_status_once(STATUS_RESOLVE_OK, 1);
+    } else {
+        emit_status_once(STATUS_RESOLVE_FAILED, 1);
+    }
 }
 
 static pbkdf_fn resolve_original(void) {
+    emit_status_once(STATUS_RESOLVE_ATTEMPT, 0);
     if (pthread_once(&original_once, resolve_original_once) != 0 ||
         original_pbkdf == NULL) {
         _exit(127);
@@ -104,17 +134,49 @@ static pbkdf_fn resolve_original(void) {
     return original_pbkdf;
 }
 
-static void emit_candidate(const char *password) {
+/* Details are fixed outcome classes or counters; no pointer/path/key bytes. */
+static int emit_status(unsigned char event, uint32_t detail) {
     const char *path = getenv(CAPTURE_ENV);
-    if (path == NULL || path[0] != '/') return;
+    if (path == NULL || path[0] != '/') return 0;
 
     int fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return;
+    if (fd < 0) return 0;
 
     struct stat info;
     if (fstat(fd, &info) != 0 || !S_ISFIFO(info.st_mode) ||
         info.st_uid != getuid() || (info.st_mode & 0777) != 0600) {
         close(fd);
+        return 0;
+    }
+
+    unsigned char record[STATUS_RECORD_BYTES] = {0};
+    memcpy(record, STATUS_MAGIC, 4);
+    record[4] = event;
+    memcpy(record + 5, &detail, sizeof(detail));
+    ssize_t written;
+    do {
+        written = write(fd, record, sizeof(record));
+    } while (written < 0 && errno == EINTR);
+    close(fd);
+    return written == (ssize_t)sizeof(record);
+}
+
+static void emit_candidate(const char *password) {
+    const char *path = getenv(CAPTURE_ENV);
+    if (path == NULL || path[0] != '/') return;
+    if (__sync_fetch_and_add(&candidate_count, 1) >= 1024u) return;
+
+    int fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        emit_status_once(STATUS_WRITE_FAILED, 1);
+        return;
+    }
+
+    struct stat info;
+    if (fstat(fd, &info) != 0 || !S_ISFIFO(info.st_mode) ||
+        info.st_uid != getuid() || (info.st_mode & 0777) != 0600) {
+        close(fd);
+        emit_status_once(STATUS_WRITE_FAILED, 2);
         return;
     }
 
@@ -125,8 +187,10 @@ static void emit_candidate(const char *password) {
     do {
         written = write(fd, record, sizeof(record));
     } while (written < 0 && errno == EINTR);
-    (void)written;
     close(fd);
+    emit_status_once(
+        written == (ssize_t)sizeof(record) ? STATUS_WRITE_OK : STATUS_WRITE_FAILED,
+        written == (ssize_t)sizeof(record) ? 0u : 3u);
 }
 
 static int capture_pbkdf(
@@ -139,11 +203,14 @@ static int capture_pbkdf(
     uint rounds,
     uint8_t *derived_key,
     size_t derived_key_len) {
-    if (algorithm == kCCPBKDF2 && password != NULL && salt != NULL &&
-        derived_key != NULL && password_len == WECHAT_MASTER_KEY_BYTES &&
-        salt_len == WECHAT_SALT_BYTES && prf == kCCPRFHmacAlgSHA512 &&
-        rounds == WECHAT_KDF_ROUNDS &&
-        derived_key_len == WECHAT_MASTER_KEY_BYTES) {
+    emit_status_once(STATUS_CALL, 0);
+    int matches = algorithm == kCCPBKDF2 && password != NULL && salt != NULL &&
+                  derived_key != NULL && password_len == WECHAT_MASTER_KEY_BYTES &&
+                  salt_len == WECHAT_SALT_BYTES && prf == kCCPRFHmacAlgSHA512 &&
+                  rounds == WECHAT_KDF_ROUNDS &&
+                  derived_key_len == WECHAT_MASTER_KEY_BYTES;
+    if (matches) {
+        emit_status_once(STATUS_MATCH, 1u);
         emit_candidate(password);
     }
 
@@ -158,6 +225,12 @@ static int capture_pbkdf(
         rounds,
         derived_key,
         derived_key_len);
+}
+
+__attribute__((constructor)) static void capture_constructor(void) {
+    emit_status_once(STATUS_CONSTRUCTOR, 0);
+    const char *path = getenv(CAPTURE_ENV);
+    emit_status_once(STATUS_LOAD, path != NULL && path[0] == '/' ? 1u : 0u);
 }
 
 #define DYLD_INTERPOSE(replacement, replacee)                                  \

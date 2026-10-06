@@ -2,6 +2,7 @@ import os
 import plistlib
 import shutil
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -87,9 +88,99 @@ def _stub_launch_watchdog(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("client_version, entitlements, expected", [
+    (("4.1.15", "270103"), _wechat_4_1_11_entitlements(), "debug_copy_unsupported_client"),
+    (("4.1.15", "270102"), {"com.apple.security.app-sandbox": False}, "debug_copy_entitlements_rejected"),
+])
+def test_prepare_reports_build_and_entitlement_refusals(
+    monkeypatch, tmp_path, client_version, entitlements, expected,
+):
+    original = tmp_path / "WeChat.app"
+    original.mkdir()
+    monkeypatch.setitem(macos_debug_app._APPS, "wechat", (original, "WeChat"))
+    monkeypatch.setattr(macos_debug_app, "_app_identity", lambda *a, **kw: "identity")
+    monkeypatch.setattr(macos_debug_app, "_app_client_version", lambda app: client_version)
+    monkeypatch.setattr(macos_debug_app, "data_dir", lambda: tmp_path / "runtime")
+    monkeypatch.setattr(macos_debug_app, "_entitlements", lambda app: entitlements)
+    monkeypatch.setattr(macos_debug_app, "_bundle_source_digest", lambda app: b"digest")
+    monkeypatch.setattr(macos_debug_app, "_LAST_ERROR", "stale_error")
+    assert macos_debug_app.prepare_debug_copy("wechat") is None
+    assert macos_debug_app.last_error() == expected
+
+
+@pytest.mark.parametrize("prepare_reason, expected", [
+    ("debug_copy_unsupported_client", "debug_copy_unsupported_client"),
+    ("debug_copy_entitlements_rejected", "debug_copy_entitlements_rejected"),
+    ("", "debug_copy_prepare_failed"),
+])
+def test_launch_preserves_specific_prepare_failure(monkeypatch, prepare_reason, expected):
+    monkeypatch.setattr(macos_debug_app, "_exact_process_pids", lambda executable: ())
+
+    def refuse(source):
+        macos_debug_app._LAST_ERROR = prepare_reason
+        return None
+
+    monkeypatch.setattr(macos_debug_app, "prepare_debug_copy", refuse)
+    monkeypatch.setattr(macos_debug_app, "_LAST_ERROR", "stale_error")
+    assert macos_debug_app.launch_debug_copy("wechat") is None
+    assert macos_debug_app.last_error() == expected
+
+
 def test_prepare_debug_copy_is_macos_only(monkeypatch):
     monkeypatch.setattr(macos_debug_app.sys, "platform", "win32")
+    monkeypatch.setattr(macos_debug_app, "_LAST_ERROR", "stale_error")
     assert macos_debug_app.prepare_debug_copy("wechat") is None
+    assert macos_debug_app.last_error() == ""
+
+
+def test_macho_provenance_ignores_signature_layout_but_detects_code_changes(tmp_path):
+    if shutil.which("clang") is None:
+        pytest.skip("native Mach-O regression requires clang")
+    source = tmp_path / "program.c"
+    original = tmp_path / "original"
+    resigned = tmp_path / "resigned"
+    changed = tmp_path / "changed"
+    entitlements = tmp_path / "entitlements.plist"
+
+    def compile_program(target, value):
+        source.write_text(f"int main(void) {{ return {value}; }}\n", encoding="ascii")
+        subprocess.run(
+            ["clang", "-arch", "arm64", "-arch", "x86_64", str(source), "-o", str(target)],
+            check=True, capture_output=True,
+        )
+
+    def sign(target, values):
+        entitlements.write_bytes(plistlib.dumps(values))
+        subprocess.run(
+            ["codesign", "--force", "--sign", "-", "--entitlements", str(entitlements), str(target)],
+            check=True, capture_output=True,
+        )
+
+    compile_program(original, 7)
+    # A large signature reproduces the stale __LINKEDIT virtual-size fields
+    # observed in 269340 after replacing Tencent's signature with our smaller one.
+    sign(original, {"com.example.signature-padding": "x" * 131072})
+    shutil.copyfile(original, resigned)
+    sign(resigned, {})
+    original_before = original.read_bytes()
+    resigned_before = resigned.read_bytes()
+    stripped_digests = []
+    for i, binary in enumerate((original, resigned)):
+        stripped = tmp_path / f"stripped-{i}"
+        shutil.copyfile(binary, stripped)
+        subprocess.run(["codesign", "--remove-signature", str(stripped)], check=True, capture_output=True)
+        stripped_digests.append(macos_debug_app._stable_regular_file_digest(stripped))
+    assert stripped_digests[0] != stripped_digests[1], "fixture must reproduce signature-layout drift"
+    expected = macos_debug_app._unsigned_executable_digest(original)
+    assert expected is not None
+    assert macos_debug_app._unsigned_executable_digest(resigned) == expected
+    compile_program(changed, 8)
+    sign(changed, {})
+    changed_digest = macos_debug_app._unsigned_executable_digest(changed)
+    assert changed_digest is not None
+    assert changed_digest != expected
+    assert original.read_bytes() == original_before
+    assert resigned.read_bytes() == resigned_before
 
 
 def test_bundle_digest_allows_only_regenerated_root_signature_seals(
@@ -1267,7 +1358,11 @@ def test_prepare_debug_copy_does_not_deep_resign_nested_helpers(
 
     target = macos_debug_app.prepare_debug_copy("qq")
     assert target is not None
-    assert len(signing_calls) == 1
+    # Provenance normalization also signs a temporary standalone executable.
+    # Only bundle-signing calls determine the nested-helper signing policy.
+    bundle_signing_calls = [call for call in signing_calls if Path(call[-1]).suffix == ".app"]
+    assert len(bundle_signing_calls) == 1
+    signing_calls = bundle_signing_calls
     assert "--deep" not in signing_calls[0]
     assert "--entitlements" in signing_calls[0]
     assert signing_calls[0][signing_calls[0].index("--options") + 1] == "runtime"
@@ -1335,7 +1430,9 @@ def test_prepare_wechat_debug_copy_uses_upstream_compatibility_signature(
 
     target = macos_debug_app.prepare_debug_copy("wechat")
     assert target is not None
-    assert len(signing_calls) == 1
+    bundle_signing_calls = [call for call in signing_calls if Path(call[-1]).suffix == ".app"]
+    assert len(bundle_signing_calls) == 1
+    signing_calls = bundle_signing_calls
     assert "--deep" not in signing_calls[0]
     assert "--options" not in signing_calls[0]
     assert "--entitlements" in signing_calls[0]
@@ -1481,7 +1578,7 @@ def test_ad_hoc_resigned_debug_cache_is_rebuilt_from_installed_bundle(
     assert rebuilt == target
     assert cached_executable.read_bytes() == b"trusted-main"
     assert not (target / "Contents" / "Resources" / "injected.py").exists()
-    assert len(signing_calls) == 2
+    assert len([call for call in signing_calls if Path(call[-1]).suffix == ".app"]) == 2
 
 
 def test_verified_debug_copy_rejects_non_ad_hoc_team_id(
@@ -2148,10 +2245,6 @@ def test_installed_wechat_bundle_is_allowlisted_and_accepted():
     entitlements = macos_debug_app._entitlements(app)
     assert entitlements is not None, "could not read installed entitlements"
 
-    assert client_version in (_WECHAT_4_1_13, _WECHAT_4_1_15), (
-        f"installed WeChat {client_version} does not match a verified bundle "
-        f"{_WECHAT_4_1_13} / {_WECHAT_4_1_15}"
-    )
     assert client_version in macos_debug_app._WECHAT_AD_HOC_SUPPORTED_CLIENTS, (
         f"installed WeChat {client_version} is not allowlisted; re-verify its "
         "entitlements against _debug_copy_entitlements before adding it"
