@@ -75,8 +75,8 @@ chatlog-keeper 的不同之处：它是这里唯一能处理 **微信 4.1.10.31+
 
 它仍是一个新项目，并且刻意以 CLI 为先（JSON/HTML，无内置分析）；macOS 独立包目前
 只覆盖 Apple Silicon，Linux 独立包只覆盖官方 x86_64 客户端（不含 Wine）。详见
-[Linux 说明](docs/linux.zh.md)。本项目的定位是*在正式发布的桌面平台兼容当前微信
-+ QQ，且本地与法律边界清晰*。
+[Linux 说明](docs/linux.zh.md)和[Linux QQ 导出指南](docs/linux-qq-export.zh.md)。
+本项目的定位是*在正式发布的桌面平台兼容当前微信 + QQ，且本地与法律边界清晰*。
 
 ## 安装
 

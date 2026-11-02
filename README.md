@@ -80,9 +80,9 @@ Where chatlog-keeper differs: it is the one here that handles **WeChat
 What it is **not**: it is still a young, deliberately CLI-first project
 (JSON/HTML, no built-in analytics). The macOS release currently targets Apple
 Silicon; the Linux release targets official x86_64 Tencent clients, not Wine.
-See [Linux setup](docs/linux.md). The niche is *current WeChat compatibility +
-QQ on the desktop platforms we officially ship, with a clear legal and
-local-only boundary*.
+See [Linux setup](docs/linux.md) and the [Linux QQ export guide](docs/linux-qq-export.zh.md).
+The niche is *current WeChat compatibility + QQ on the desktop platforms we
+officially ship, with a clear legal and local-only boundary*.
 
 ## Install
 
