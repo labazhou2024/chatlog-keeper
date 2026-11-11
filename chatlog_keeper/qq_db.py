@@ -1085,6 +1085,23 @@ def _decrypt_qq_page(
     return plain + page[4096 - reserve:]
 
 
+def _qq_authenticated_page_count(page_one: bytes) -> Optional[int]:
+    """Read SQLite's size field only when its validity fence is current.
+
+    SQLite falls back to the file length for old/invalid size headers.  Do not
+    use an unauthenticated or stale count to discard physical input pages.
+    The caller must have authenticated this entire page before calling.
+    """
+    if (len(page_one) != _NTQQ_PAGE_SIZE
+            or page_one[:16] != b"SQLite format 3\0"
+            or struct.unpack_from(">H", page_one, 16)[0] != _NTQQ_PAGE_SIZE):
+        return None
+    count = struct.unpack_from(">I", page_one, 28)[0]
+    if not count or page_one[24:28] != page_one[92:96]:
+        return None
+    return count
+
+
 def _decrypt_db_qq_result(
     db_path: Path,
     key,
@@ -1096,8 +1113,9 @@ def _decrypt_db_qq_result(
     """Decrypt NTQQ nt_msg.db (post-1024-header-strip) to plain SQLite.
 
     Resolves the DB's HMAC-verified current/legacy cipher tuple from page 1,
-    authenticates every main page, then validates and applies committed WAL
-    frames through the copied WAL-index ``mxFrame``.
+    authenticates every committed WAL frame and each main page that remains
+    in the committed view. Physical preallocation outside that view and main
+    images superseded by authenticated WAL frames are not database content.
 
     NTQQ 9.9.x parameters (confirmed by passphrase verify):
       - Key:       16-char ASCII passphrase ({XXXXX...) — wrapper.node sqlite3_key_v2
@@ -1119,11 +1137,12 @@ def _decrypt_db_qq_result(
     shifted_pending_byte = False
     effective_platform = os.name if platform_name is None else platform_name
     try:
-        # Decrypt page-by-page so peak memory stays at a single 4 KB page.
-        # Reading a whole (potentially multi-GB) DB into memory at once can
-        # exhaust RAM; streaming keeps the footprint constant.
-        pages = 0
-        with open(db_path, "rb") as f, open(output_path, "wb") as out:
+        # Page images remain streamed. Only WAL page numbers are retained.
+        physical_size = db_path.stat().st_size
+        if physical_size % PAGE_SZ:
+            raise OSError("encrypted DB has a truncated trailing page")
+        physical_pages = physical_size // PAGE_SZ
+        with open(db_path, "rb") as f:
             first = f.read(PAGE_SZ)
             if len(first) < PAGE_SZ:
                 raise OSError("encrypted DB is too small to decrypt")
@@ -1150,16 +1169,15 @@ def _decrypt_db_qq_result(
             )
             if plain is None:
                 raise OSError("page 1 authentication failed")
-            out.write(plain)
-            pages = 1
-            while True:
-                page = f.read(PAGE_SZ)
-                if not page:
-                    break
-                if len(page) != PAGE_SZ:
-                    raise OSError("encrypted DB has a truncated trailing page")
-                page_no = pages + 1
-                plain = _decrypt_qq_page(
+            main_pages = _qq_authenticated_page_count(plain)
+            with open(output_path, "wb") as out:
+                out.write(plain)
+
+            from chatlog_keeper.core._wal import apply_wal
+            wal_pages = set()
+
+            def decrypt_wal(page, page_no):
+                decoded = _decrypt_qq_page(
                     page,
                     page_no=page_no,
                     salt=salt,
@@ -1168,42 +1186,54 @@ def _decrypt_db_qq_result(
                     hmac_algo=hmac_algo,
                     reserve=reserve,
                 )
-                if plain is None:
-                    if _is_wrapped_windows_lock_placeholder(
-                        page,
-                        page_no=page_no,
-                        source_wrapper_size=source_wrapper_size,
-                        platform_name=effective_platform,
-                    ):
-                        # The original Windows VFS reserved this whole page
-                        # because its 512 lock bytes overlap the page after the
-                        # NTQQ wrapper shift.  It is the only unauthenticated
-                        # main-page exception we accept.
-                        plain = b"\0" * PAGE_SZ
-                        shifted_pending_byte = True
-                    else:
-                        raise OSError(f"page {page_no} authentication failed")
-                out.write(plain)
-                pages += 1
+                if decoded is not None:
+                    wal_pages.add(page_no)
+                return decoded
 
-        from chatlog_keeper.core._wal import apply_wal
-        wal_path = db_path.with_name(db_path.name + "-wal")
-        shm_path = db_path.with_name(db_path.name + "-shm")
-        wal_frames = apply_wal(
-            wal_path,
-            output_path,
-            lambda page, page_no: _decrypt_qq_page(
-                page,
-                page_no=page_no,
-                salt=salt,
-                aes_key=aes_key,
-                mac_key=mac_key,
-                hmac_algo=hmac_algo,
-                reserve=reserve,
-            ),
-            shm_path=shm_path,
-            expected_page_size=PAGE_SZ,
-        )
+            wal_frames = apply_wal(
+                db_path.with_name(db_path.name + "-wal"),
+                output_path,
+                decrypt_wal,
+                shm_path=db_path.with_name(db_path.name + "-shm"),
+                expected_page_size=PAGE_SZ,
+            )
+            final_pages = (output_path.stat().st_size // PAGE_SZ if wal_frames
+                           else main_pages or physical_pages)
+            pages = 1
+            with open(output_path, "r+b") as out:
+                committed_header = out.read(PAGE_SZ)
+                header_pages = _qq_authenticated_page_count(committed_header)
+                if wal_frames and header_pages is None and final_pages < physical_pages:
+                    raise OSError("WAL shrink requires an authenticated current page count")
+                if wal_frames and header_pages is not None and header_pages != final_pages:
+                    raise OSError("WAL commit size disagrees with authenticated page 1")
+                for page_no in range(2, final_pages + 1):
+                    if page_no in wal_pages:
+                        continue
+                    f.seek((page_no - 1) * PAGE_SZ)
+                    page = f.read(PAGE_SZ)
+                    if len(page) != PAGE_SZ:
+                        raise OSError("committed QQ database page is missing")
+                    plain = _decrypt_qq_page(
+                        page, page_no=page_no, salt=salt, aes_key=aes_key,
+                        mac_key=mac_key, hmac_algo=hmac_algo, reserve=reserve,
+                    )
+                    if plain is None:
+                        if _is_wrapped_windows_lock_placeholder(
+                            page, page_no=page_no,
+                            source_wrapper_size=source_wrapper_size,
+                            platform_name=effective_platform,
+                        ):
+                            # This exact Windows VFS lock page remains the
+                            # only unauthenticated page inside the final DB.
+                            plain = b"\0" * PAGE_SZ
+                            shifted_pending_byte = True
+                        else:
+                            raise OSError(f"page {page_no} authentication failed")
+                    out.seek((page_no - 1) * PAGE_SZ)
+                    out.write(plain)
+                    pages += 1
+                out.truncate(final_pages * PAGE_SZ)
         logger.info(
             "Decrypted %d main pages + %d committed WAL frames "
             "kdf=%s hmac=%s reserve=%d (streaming)",

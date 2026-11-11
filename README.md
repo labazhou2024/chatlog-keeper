@@ -38,6 +38,7 @@ grouped by conversation and day — the way you remember it).
 ## Features
 
 - **QQ** — export your local NTQQ chat history
+  ([database snapshot and authentication notes](docs/qq-snapshots.md))
 - **WeChat** — export your local WeChat chat history
 - **WeChat images** — restore local `.dat` images back to `jpg` / `png`
 - **Windows + macOS + Linux** — one CLI and export format on Windows 11,

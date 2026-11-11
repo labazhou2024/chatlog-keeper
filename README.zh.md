@@ -37,6 +37,7 @@
 ## 功能
 
 - **QQ**：导出 NTQQ 本地聊天记录
+  （[数据库快照与认证错误说明](docs/qq-snapshots.md)）
 - **微信**：导出 WeChat 本地聊天记录
 - **微信图片**：把本地 `.dat` 加密图片还原成 `jpg` / `png`
 - **Windows + macOS + Linux**：Windows 11、Apple Silicon Mac 与官方 Ubuntu/Debian
