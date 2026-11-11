@@ -1470,6 +1470,17 @@ def _decode_sticker_desc(desc_b64: str) -> Optional[str]:
     return out.get("zh_cn") or out.get("default") or next(iter(out.values()), None)
 
 
+_GROUP_XML_PREFIX = re.compile(
+    r"^[A-Za-z0-9_.\-]{1,64}(?:@[A-Za-z0-9_.\-]{1,32})?:\n(?=\s*<)"
+)
+
+
+def _without_group_xml_prefix(content: str) -> str:
+    """Remove a sender envelope only when its remainder is XML markup."""
+    match = _GROUP_XML_PREFIX.match(content)
+    return content[match.end():] if match is not None else content
+
+
 def _extract_wechat_xml(content: str, msg_type: int) -> str:
     """Extract human-readable text from WeChat 4.x non-text message_content.
 
@@ -1486,6 +1497,7 @@ def _extract_wechat_xml(content: str, msg_type: int) -> str:
     """
     if not content:
         return ""
+    content = _without_group_xml_prefix(content)
     if msg_type == _WX_MSG_TYPE_SYSTEM:
         s = content.strip()
         # XML system message — extract human-readable content
@@ -1622,7 +1634,7 @@ def _extract_attachment_meta(content: str, msg_type: int) -> Optional[dict]:
     if not content or msg_type not in (_WX_MSG_TYPE_VOICE, _WX_MSG_TYPE_APPMSG,
                                         _WX_MSG_TYPE_IMAGE, _WX_MSG_TYPE_VIDEO):
         return None
-    root = _parse_xml_strict(content)
+    root = _parse_xml_strict(_without_group_xml_prefix(content))
     if root is None:
         return None
     if msg_type == _WX_MSG_TYPE_VOICE:
