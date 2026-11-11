@@ -305,6 +305,43 @@ def _get_weixin_pids() -> list:
 
 # ─── Data directory discovery ──────────────────────────────────────────────────
 
+def _configured_windows_data_root() -> Optional[Path]:
+    """Read WeChat 4.x's existing path records, without creating any files."""
+    appdata = os.environ.get("APPDATA", "").strip()
+    if not appdata:
+        return None
+    try:
+        records = sorted((Path(appdata) / "Tencent" / "xwechat" / "config").glob("*.ini"))
+    except OSError:
+        return None
+    for record in records:
+        try:
+            with record.open("rb") as handle:
+                raw = handle.read(4097)
+        except OSError:
+            continue
+        if len(raw) > 4096:
+            continue
+        for encoding in ("utf-8-sig", "mbcs"):
+            try:
+                value = raw.decode(encoding).strip().strip("\x00").strip()
+            except (UnicodeError, LookupError):
+                continue
+            if not value or any(char in value for char in "\r\n\x00"):
+                break
+            base = Path(value)
+            if not base.is_absolute():
+                break
+            try:
+                store = base if base.name.lower() == "xwechat_files" else base / "xwechat_files"
+                if store.is_dir():
+                    return store
+            except (OSError, ValueError):
+                pass
+            break
+    return None
+
+
 def find_weixin_data_root() -> Optional[Path]:
     """Locate the Weixin/WeChat user-data root, machine-neutrally.
 
@@ -314,9 +351,10 @@ def find_weixin_data_root() -> Optional[Path]:
 
     Discovery order (nothing hardcoded):
       1. ``CHATLOG_WECHAT_DATA_ROOT`` env var (explicit override)
-      2. every logical drive root: ``<drive>/wechat files/xwechat_files`` +
+      2. Windows WeChat 4.x config path records (when present)
+      3. every logical drive root: ``<drive>/wechat files/xwechat_files`` +
          ``<drive>/xwechat_files`` + ``<drive>/WeChat Files``
-      3. real Documents + OneDrive variants
+      4. real Documents + OneDrive variants
     """
     from chatlog_keeper.core._paths import all_drive_roots, candidate_documents_roots
 
@@ -324,6 +362,10 @@ def find_weixin_data_root() -> Optional[Path]:
     env = os.environ.get("CHATLOG_WECHAT_DATA_ROOT", "").strip()
     if env:
         candidates.append(Path(env))
+    if sys.platform == "win32":
+        configured = _configured_windows_data_root()
+        if configured is not None:
+            candidates.append(configured)
     if sys.platform == "darwin":
         from chatlog_keeper.core._macos import wechat_data_roots
         candidates.extend(wechat_data_roots())
