@@ -250,7 +250,9 @@ def _decrypt_v1v2(data: bytes, aes_key: bytes, xor_key: int = _DEFAULT_XOR_KEY) 
 
     aligned = _aligned_aes_size(aes_size)
     offset = 15
-    if offset + aligned > len(data):
+    # Both sections must fit together: checking AES alone allows a truncated
+    # XOR tail to overlap ciphertext and silently return corrupted bytes.
+    if offset + aligned + xor_size > len(data):
         return None
 
     aes_chunk = data[offset:offset + aligned]
